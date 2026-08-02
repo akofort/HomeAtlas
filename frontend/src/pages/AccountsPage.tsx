@@ -165,6 +165,19 @@ export default function AccountsPage() {
       {error && <div className="notice error">{error}</div>}
       {notice && <div className="notice ok">{notice}</div>}
 
+      <div className="notice info">
+        <strong>HomeAtlas ist kein Passwort-Manager.</strong> Was hier steht, gehört zur
+        Dokumentation der Technik: Router-Zugang, NAS-Login, Kundennummer beim Anbieter — damit man
+        im Störungsfall schnell drankommt. Für persönliche Passwörter, Bankzugänge und alles, was
+        über einzelne Geräte hinausgeht, gehört ein echter Passwort-Safe her:{" "}
+        <a href="https://bitwarden.com/" target="_blank" rel="noreferrer">Bitwarden</a> (auch
+        selbst gehostet als{" "}
+        <a href="https://github.com/dani-garcia/vaultwarden" target="_blank" rel="noreferrer">Vaultwarden</a>),{" "}
+        <a href="https://keepassxc.org/" target="_blank" rel="noreferrer">KeePassXC</a> oder{" "}
+        <a href="https://1password.com/" target="_blank" rel="noreferrer">1Password</a>. Die bieten
+        Browser-Integration, Freigaben und Notfallzugriff — Dinge, die diese App bewusst nicht macht.
+      </div>
+
       {draft && (
         <div className="card">
           <h2>{draft.id ? "Zugang bearbeiten" : "Neuer Zugang"}</h2>

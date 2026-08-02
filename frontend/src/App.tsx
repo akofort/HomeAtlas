@@ -6,8 +6,10 @@ import SetupPage from "./pages/SetupPage";
 import DashboardPage from "./pages/DashboardPage";
 import InventoryPage from "./pages/InventoryPage";
 import SystemDetailPage from "./pages/SystemDetailPage";
+import AccessLogPage from "./pages/AccessLogPage";
 import AccountsPage from "./pages/AccountsPage";
 import DocsPage from "./pages/DocsPage";
+import PlanPage from "./pages/PlanPage";
 import ChatPage from "./pages/ChatPage";
 import ScanPage from "./pages/ScanPage";
 import SettingsPage from "./pages/SettingsPage";
@@ -32,11 +34,13 @@ export const useAuth = () => useContext(AuthContext);
 const NAV = [
   { to: "/", label: "Übersicht", icon: "🏠", end: true },
   { to: "/geraete", label: "Geräte", icon: "🖧" },
+  { to: "/plan", label: "Netzplan", icon: "🗺️" },
   { to: "/zugaenge", label: "Zugänge", icon: "🔑", adminOnly: true },
   { to: "/dokumentation", label: "Dokumentation", icon: "📘" },
   { to: "/assistent", label: "KI-Assistent", icon: "💬" },
   { to: "/scan", label: "Netzwerk-Scan", icon: "🔍", adminOnly: true },
   { to: "/benutzer", label: "Benutzer", icon: "👥", adminOnly: true },
+  { to: "/protokoll", label: "Protokoll", icon: "📋", adminOnly: true },
   { to: "/einstellungen", label: "Einstellungen", icon: "⚙️" },
 ];
 
@@ -128,7 +132,9 @@ export default function App() {
             <Route path="/dokumentation/:slug" element={<DocsPage />} />
             <Route path="/assistent" element={<ChatPage />} />
             {isAdmin && <Route path="/scan" element={<ScanPage />} />}
+            <Route path="/plan" element={<PlanPage />} />
             {isAdmin && <Route path="/benutzer" element={<UsersPage />} />}
+            {isAdmin && <Route path="/protokoll" element={<AccessLogPage />} />}
             <Route path="/einstellungen" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>

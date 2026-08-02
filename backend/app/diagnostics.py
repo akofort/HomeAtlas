@@ -190,6 +190,60 @@ async def traceroute(host: str, max_hops: int = 15) -> dict:
                             if hops else f"Zu {host} ließ sich kein Weg ermitteln.")}
 
 
+async def dns_check(names: list[str] | None = None) -> dict:
+    """Tests name resolution end to end and says where it breaks.
+
+    Uses external names on purpose: resolving only local hostnames succeeds even when the router's
+    forwarder to the internet is dead, which is the failure people actually hit. Timing is
+    reported because a resolver that answers after four seconds is broken in practice even though
+    every single lookup technically succeeds.
+    """
+    from . import discovery
+
+    names = [n.strip() for n in (names or ["www.google.com", "heise.de", "github.com"]) if n.strip()]
+    servers = discovery.dns_servers()
+
+    results = []
+    for name in names[:8]:
+        started = time.monotonic()
+        outcome = await dns_lookup(name)
+        outcome["elapsedMs"] = round((time.monotonic() - started) * 1000)
+        results.append(outcome)
+
+    resolved = [r for r in results if r["resolved"]]
+    slow = [r for r in resolved if r["elapsedMs"] > 1500]
+
+    if not results:
+        verdict = "Es wurden keine Namen zum Prüfen angegeben."
+    elif not resolved:
+        verdict = ("Kein einziger Name ließ sich auflösen. Die Namensauflösung im Netz ist gestört — "
+                   "meist liegt das am Router oder an einem Filter wie Pi-hole, der nicht mehr antwortet. "
+                   "Internetseiten sind dann nicht erreichbar, obwohl die Verbindung selbst steht.")
+    elif len(resolved) < len(results):
+        failed = ", ".join(r["name"] for r in results if not r["resolved"])
+        verdict = (f"Die Namensauflösung funktioniert grundsätzlich, aber nicht für: {failed}. "
+                   "Das deutet eher auf einen Filter oder eine Sperre für einzelne Adressen hin als "
+                   "auf einen allgemeinen Ausfall.")
+    elif slow:
+        verdict = (f"Alle Namen ließen sich auflösen, aber {len(slow)} davon auffällig langsam "
+                   f"(über 1,5 Sekunden). Das bremst jeden Seitenaufruf spürbar aus.")
+    else:
+        verdict = "Die Namensauflösung funktioniert einwandfrei."
+
+    return {
+        "servers": servers,
+        "results": results,
+        "resolvedCount": len(resolved),
+        "totalCount": len(results),
+        "explanation": verdict,
+        "serversExplanation": (
+            f"Angefragt werden die Server: {', '.join(servers)}."
+            if servers else
+            "Es ist kein DNS-Server eingetragen — das ist bereits die Ursache."
+        ),
+    }
+
+
 async def internet_check() -> dict:
     """The check a layperson actually wants: is it the internet, the router, or just one service?
     Split into three independent layers so the answer says *where* it breaks."""

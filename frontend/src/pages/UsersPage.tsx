@@ -24,6 +24,10 @@ export default function UsersPage() {
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [editing, setEditing] = useState<User | null>(null);
+  const [editName, setEditName] = useState("");
+  const [editRole, setEditRole] = useState<Role>("MEMBER");
+  const [editPassword, setEditPassword] = useState("");
 
   async function reload() {
     setUsers((await api.listUsers()).users);
@@ -51,6 +55,41 @@ export default function UsersPage() {
       await reload();
       setNotice(`Benutzer „${username.trim()}“ angelegt.`);
       resetForm();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function startEdit(user: User) {
+    setNotice("");
+    setError("");
+    setCreating(false);
+    setEditing(user);
+    setEditName(user.displayName);
+    setEditRole(user.role);
+    setEditPassword("");
+  }
+
+  async function saveEdit() {
+    if (!editing) return;
+    setBusy(true);
+    setError("");
+    try {
+      const body: { displayName?: string; role?: Role; newPassword?: string } = {
+        displayName: editName,
+        role: editRole,
+      };
+      if (editPassword) body.newPassword = editPassword;
+      const r = await api.updateUser(editing.id, body);
+      await reload();
+      setNotice(
+        r.changes.length > 0
+          ? `„${editing.username}“: ${r.changes.join(", ")}.`
+          : "Es gab nichts zu ändern.",
+      );
+      setEditing(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -127,6 +166,42 @@ export default function UsersPage() {
         </div>
       )}
 
+      {editing && (
+        <div className="card">
+          <h2>„{editing.username}" bearbeiten</h2>
+          <div className="grid cols-2">
+            <div className="field">
+              <label>Anzeigename</label>
+              <input autoFocus value={editName} onChange={(e) => setEditName(e.target.value)} />
+            </div>
+            <div className="field">
+              <label>Rolle</label>
+              <select value={editRole} onChange={(e) => setEditRole(e.target.value as Role)}>
+                <option value="MEMBER">{ROLE_LABEL.MEMBER}</option>
+                <option value="ADMIN">{ROLE_LABEL.ADMIN}</option>
+              </select>
+              <div className="field-hint">{ROLE_HELP[editRole]}</div>
+            </div>
+            <div className="field" style={{ gridColumn: "1 / -1" }}>
+              <label>Neues Passwort setzen (optional)</label>
+              <input type="password" autoComplete="new-password" value={editPassword}
+                     placeholder="leer lassen, um es nicht zu ändern"
+                     onChange={(e) => setEditPassword(e.target.value)} />
+              <div className="field-hint">
+                Beim Zurücksetzen werden alle offenen Sitzungen dieses Benutzers beendet — er muss
+                sich danach neu anmelden.
+              </div>
+            </div>
+          </div>
+          <div className="row">
+            <button onClick={() => void saveEdit()} disabled={busy}>
+              {busy ? "Speichere…" : "Speichern"}
+            </button>
+            <button className="secondary" onClick={() => setEditing(null)}>Abbrechen</button>
+          </div>
+        </div>
+      )}
+
       <div className="card">
         {loading ? (
           <span className="spinner" />
@@ -137,6 +212,7 @@ export default function UsersPage() {
                 <tr>
                   <th>Benutzer</th>
                   <th>Rolle</th>
+                  <th>Zwei-Faktor</th>
                   <th>Angelegt</th>
                   <th />
                 </tr>
@@ -157,8 +233,16 @@ export default function UsersPage() {
                       <td>
                         <span className={`badge ${u.role === "ADMIN" ? "warn" : ""}`}>{ROLE_LABEL[u.role]}</span>
                       </td>
+                      <td>
+                        {u.totpEnabled ? (
+                          <span className="badge ok">aktiv</span>
+                        ) : (
+                          <span className="muted">aus</span>
+                        )}
+                      </td>
                       <td className="muted">{new Date(u.createdAt).toLocaleDateString("de-DE")}</td>
                       <td style={{ width: 1, whiteSpace: "nowrap" }}>
+                        <button className="secondary small" onClick={() => startEdit(u)}>Bearbeiten</button>{" "}
                         <button
                           className="danger small"
                           disabled={isMe || isLastAdmin}

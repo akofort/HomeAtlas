@@ -18,11 +18,12 @@ import os
 import secrets as _secrets
 from contextlib import asynccontextmanager
 
-from fastapi import Body, Cookie, Depends, FastAPI, HTTPException, Response, status
+from fastapi import Body, Cookie, Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 from . import (auth, crypto, db, diagnostics, docker_probe, docs, llm_providers, model_catalog,
-               oui, pipeline, probe_auth, tools)
+               monitor as monitor_module, oui, pipeline, probe_auth, security, topology, tools)
 
 logger = logging.getLogger("homeatlas")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -45,7 +46,11 @@ async def lifespan(_app: FastAPI):
             "unter Einstellungen -> Konto aendern.\n" + "=" * 72,
             os.environ.get("ADMIN_USERNAME", "admin"), generated,
         )
-    yield
+    monitor_module.monitor.start()
+    try:
+        yield
+    finally:
+        await monitor_module.monitor.stop()
 
 
 app = FastAPI(title="HomeAtlas", version="1.0.0", lifespan=lifespan)
@@ -69,9 +74,17 @@ def require_admin(user: dict = Depends(current_user)) -> dict:
     return user
 
 
+def _client(request: Request) -> tuple[str, str]:
+    """Best-effort client identity for the access log. `X-Real-IP` comes from the nginx in front;
+    without it every entry would read 127.0.0.1 and the log would be useless."""
+    ip = request.headers.get("x-real-ip") or (request.client.host if request.client else "")
+    return ip, request.headers.get("user-agent", "")
+
+
 class LoginBody(BaseModel):
     username: str
     password: str
+    totpCode: str = ""
 
 
 @app.get("/api/health")
@@ -81,11 +94,27 @@ async def health() -> dict:
 
 
 @app.post("/api/auth/login")
-async def login(body: LoginBody, response: Response) -> dict:
-    user = auth.verify_login(body.username, body.password)
+async def login(body: LoginBody, response: Response, request: Request) -> dict:
+    ip, agent = _client(request)
+    try:
+        user = auth.verify_login(body.username, body.password, body.totpCode)
+    except auth.MfaRequired as exc:
+        db.log_access("login.mfa", username=body.username, ip=ip, user_agent=agent, ok=False,
+                      detail="falscher Code" if exc.wrong_code else "Code angefordert")
+        # 401 + a flag rather than 200: the credentials alone did not authenticate anything yet.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=("Der Code stimmt nicht oder ist abgelaufen. Bitte den aktuellen aus der App eingeben."
+                    if exc.wrong_code else "Bitte zusätzlich den 6-stelligen Code aus deiner Authenticator-App eingeben."),
+            headers={"X-HomeAtlas-MFA": "required"},
+        ) from exc
     if user is None:
+        db.log_access("login", username=body.username, ip=ip, user_agent=agent, ok=False,
+                      detail="Benutzername oder Passwort falsch")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                             detail="Benutzername oder Passwort stimmt nicht.")
+    db.log_access("login", user=user, ip=ip, user_agent=agent,
+                  detail="mit zweitem Faktor" if user.get("totpEnabled") else "")
     token = auth.create_session(user["id"])
     response.set_cookie(
         auth.SESSION_COOKIE_NAME, token, max_age=auth.SESSION_TTL_SECONDS,
@@ -109,13 +138,75 @@ async def me(user: dict = Depends(current_user)) -> dict:
 
 class PasswordBody(BaseModel):
     currentPassword: str
-    newPassword: str = Field(min_length=8)
+    # No length constraint here on purpose: `security.check_password` owns the policy and returns a
+    # sentence the user can act on. A pydantic `min_length` would short-circuit that with a raw 422.
+    newPassword: str
 
 
 @app.post("/api/auth/password")
-async def change_password(body: PasswordBody, user: dict = Depends(current_user)) -> dict:
-    if not auth.change_password(user["id"], body.currentPassword, body.newPassword):
+async def change_password(body: PasswordBody, request: Request, user: dict = Depends(current_user)) -> dict:
+    ip, agent = _client(request)
+    try:
+        changed = auth.change_password(user["id"], body.currentPassword, body.newPassword)
+    except security.PasswordError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not changed:
+        db.log_access("password.change", user=user, ip=ip, user_agent=agent, ok=False,
+                      detail="aktuelles Passwort falsch")
         raise HTTPException(status_code=400, detail="Das aktuelle Passwort stimmt nicht.")
+    db.log_access("password.change", user=user, ip=ip, user_agent=agent)
+    return {"ok": True}
+
+
+@app.get("/api/auth/password-policy")
+async def password_policy(_: dict = Depends(current_user)) -> dict:
+    return security.describe_policy()
+
+
+# ---------------------------------------------------------------------------------------------
+# Second factor (TOTP)
+# ---------------------------------------------------------------------------------------------
+
+class TotpBody(BaseModel):
+    code: str = ""
+    password: str = ""
+
+
+@app.post("/api/auth/mfa/setup")
+async def mfa_setup(user: dict = Depends(current_user)) -> dict:
+    """Creates a fresh secret and hands back the QR. Not yet active -- `totpEnabled` only flips
+    after `/confirm` proves a working code, so a half-finished setup can't lock anyone out."""
+    if user.get("totpEnabled"):
+        raise HTTPException(status_code=400, detail="Die Zwei-Faktor-Anmeldung ist bereits aktiv.")
+    secret = security.generate_totp_secret()
+    db.update_user(user["id"], {"totpSecretEnc": crypto.encrypt(secret), "totpEnabled": False})
+    uri = security.provisioning_uri(secret, user["username"])
+    return {"secret": secret, "uri": uri, "qrSvg": security.qr_svg(uri)}
+
+
+@app.post("/api/auth/mfa/confirm")
+async def mfa_confirm(body: TotpBody, request: Request, user: dict = Depends(current_user)) -> dict:
+    raw = db.get_user_raw(user["id"]) or {}
+    secret = crypto.decrypt(raw.get("totpSecretEnc") or "")
+    if not secret:
+        raise HTTPException(status_code=400, detail="Bitte zuerst die Einrichtung starten.")
+    if not security.verify_totp(secret, body.code):
+        raise HTTPException(status_code=400, detail="Der Code stimmt nicht. Bitte den aktuellen aus der App eingeben.")
+    db.update_user(user["id"], {"totpEnabled": True})
+    ip, agent = _client(request)
+    db.log_access("mfa.enable", user=user, ip=ip, user_agent=agent)
+    return {"ok": True}
+
+
+@app.post("/api/auth/mfa/disable")
+async def mfa_disable(body: TotpBody, request: Request, user: dict = Depends(current_user)) -> dict:
+    """Requires the account password again -- otherwise anyone at an unlocked browser could strip
+    the second factor off, which defeats the point of having one."""
+    if not auth.verify_password(user["id"], body.password):
+        raise HTTPException(status_code=400, detail="Das Passwort stimmt nicht.")
+    db.update_user(user["id"], {"totpSecretEnc": "", "totpEnabled": False})
+    ip, agent = _client(request)
+    db.log_access("mfa.disable", user=user, ip=ip, user_agent=agent)
     return {"ok": True}
 
 
@@ -126,19 +217,76 @@ async def list_users(_: dict = Depends(require_admin)) -> dict:
 
 class UserBody(BaseModel):
     username: str = Field(min_length=1)
-    password: str = Field(min_length=8)
+    password: str  # policy enforced in the route, see PasswordBody
     role: str = auth.ROLE_MEMBER
     displayName: str = ""
 
 
 @app.post("/api/users")
-async def create_user(body: UserBody, _: dict = Depends(require_admin)) -> dict:
+async def create_user(body: UserBody, request: Request, admin: dict = Depends(require_admin)) -> dict:
     if db.get_user_by_username_raw(body.username) is not None:
         raise HTTPException(status_code=409, detail="Diesen Benutzernamen gibt es schon.")
+    try:
+        security.check_password(body.password, body.username)
+    except security.PasswordError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     role = body.role if body.role in (auth.ROLE_ADMIN, auth.ROLE_MEMBER) else auth.ROLE_MEMBER
     salt = _secrets.token_hex(16)
     user_id = db.create_user(body.username, auth.hash_password(body.password, salt), salt, role, body.displayName)
+    ip, agent = _client(request)
+    db.log_access("user.create", user=admin, ip=ip, user_agent=agent,
+                  detail=f"{body.username} als {role}")
     return {"user": db.get_user(user_id)}
+
+
+class UserPatchBody(BaseModel):
+    displayName: str | None = None
+    role: str | None = None
+    newPassword: str | None = None
+
+
+@app.patch("/api/users/{user_id}")
+async def update_user(user_id: str, body: UserPatchBody, request: Request,
+                      admin: dict = Depends(require_admin)) -> dict:
+    target = db.get_user(user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Benutzer nicht gefunden.")
+
+    patch: dict = {}
+    changes: list[str] = []
+    if body.displayName is not None and body.displayName != target["displayName"]:
+        patch["displayName"] = body.displayName
+        changes.append("Anzeigename")
+    if body.role is not None and body.role != target["role"]:
+        if body.role not in (auth.ROLE_ADMIN, auth.ROLE_MEMBER):
+            raise HTTPException(status_code=400, detail="Unbekannte Rolle.")
+        # Demoting the last admin would leave nobody able to reach settings or secrets, with no
+        # recovery path short of editing the database by hand.
+        admins = [u for u in db.list_users() if u["role"] == auth.ROLE_ADMIN]
+        if target["role"] == auth.ROLE_ADMIN and body.role != auth.ROLE_ADMIN and len(admins) <= 1:
+            raise HTTPException(status_code=400,
+                                detail="Der letzte Administrator kann die Rolle nicht abgeben.")
+        patch["role"] = body.role
+        changes.append(f"Rolle → {body.role}")
+    if patch:
+        db.update_user(user_id, patch)
+
+    if body.newPassword:
+        try:
+            security.check_password(body.newPassword, target["username"])
+        except security.PasswordError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        auth.set_password(user_id, body.newPassword)
+        # An open session would otherwise keep working with the replaced credential, which is not
+        # what anyone means by "reset the password".
+        db.invalidate_user_sessions(user_id)
+        changes.append("Passwort zurückgesetzt, offene Sitzungen beendet")
+
+    if changes:
+        ip, agent = _client(request)
+        db.log_access("user.update", user=admin, ip=ip, user_agent=agent,
+                      detail=f"{target['username']}: {', '.join(changes)}")
+    return {"user": db.get_user(user_id), "changes": changes}
 
 
 @app.delete("/api/users/{user_id}")
@@ -334,10 +482,14 @@ async def update_account(account_id: str, body: AccountBody, _: dict = Depends(r
 
 
 @app.get("/api/accounts/{account_id}/secret")
-async def reveal_secret(account_id: str, _: dict = Depends(require_admin)) -> dict:
+async def reveal_secret(account_id: str, request: Request, user: dict = Depends(require_admin)) -> dict:
     account = db.get_account(account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="Zugang nicht gefunden.")
+    ip, agent = _client(request)
+    # Logged deliberately: for a credential store, "who looked at the router password, and when"
+    # is the single most useful entry the log can hold.
+    db.log_access("secret.reveal", user=user, ip=ip, user_agent=agent, detail=account["label"])
     return {"secret": crypto.decrypt(account["secretEnc"])}
 
 
@@ -449,9 +601,11 @@ async def probe_system(system_id: str, _: dict = Depends(require_admin)) -> dict
 # ---------------------------------------------------------------------------------------------
 
 @app.post("/api/scans")
-async def start_scan(_: dict = Depends(require_admin)) -> dict:
+async def start_scan(request: Request, user: dict = Depends(require_admin)) -> dict:
     if db.running_scan() is not None:
         raise HTTPException(status_code=409, detail="Es läuft bereits ein Scan.")
+    ip, agent = _client(request)
+    db.log_access("scan.start", user=user, ip=ip, user_agent=agent)
     settings = db.get_settings()
     scan_id = db.create_scan(", ".join(settings.get("scanSubnets") or []) or "automatisch")
     task = asyncio.create_task(pipeline.run_full_scan(scan_id))
@@ -559,6 +713,55 @@ async def delete_chat(chat_id: str, _: dict = Depends(current_user)) -> dict:
 # ---------------------------------------------------------------------------------------------
 # Dashboard + first-run setup
 # ---------------------------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------------------------
+# Access log, monitoring, overview plan
+# ---------------------------------------------------------------------------------------------
+
+@app.get("/api/access-log")
+async def access_log(limit: int = 200, action: str | None = None, onlyFailures: bool = False,
+                     _: dict = Depends(require_admin)) -> dict:
+    return {"entries": db.list_access_log(limit, action, onlyFailures),
+            "actions": db.access_log_actions()}
+
+
+@app.get("/api/monitor")
+async def monitor_status(_: dict = Depends(current_user)) -> dict:
+    settings = db.get_settings()
+    systems = db.list_monitored_systems()
+    return {
+        "enabled": settings.get("monitorEnabled", True),
+        "intervalSeconds": settings.get("monitorIntervalSeconds", 10),
+        "status": monitor_module.monitor.status(),
+        "systems": [
+            {"id": s["id"], "name": s["name"], "ip": s["ip"], "kind": s["kind"],
+             "status": s["status"], "importance": s["importance"], "lastSeen": s["lastSeen"],
+             "ports": monitor_module.effective_ports(s)}
+            for s in systems
+        ],
+        "events": db.list_monitor_events(limit=50),
+    }
+
+
+@app.post("/api/monitor/run")
+async def monitor_run_now(_: dict = Depends(require_admin)) -> dict:
+    """Forces one round immediately instead of waiting for the next tick."""
+    changes = await monitor_module.monitor.run_once()
+    return {"changes": changes}
+
+
+@app.get("/api/topology.svg", response_class=PlainTextResponse)
+async def topology_svg(_: dict = Depends(current_user)) -> Response:
+    return Response(content=topology.render(), media_type="image/svg+xml",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/diagnostics/dns")
+async def dns_diagnostic(body: dict = Body(default={}), _: dict = Depends(current_user)) -> dict:
+    settings = db.get_settings()
+    names = body.get("names") or settings.get("dnsTestNames") or []
+    return {"result": await diagnostics.dns_check(names)}
+
 
 @app.get("/api/dashboard")
 async def dashboard(_: dict = Depends(current_user)) -> dict:

@@ -2,7 +2,7 @@
 // and error-message handling exists in exactly one place.
 
 export class ApiError extends Error {
-  constructor(public status: number, message: string) {
+  constructor(public status: number, message: string, public mfaRequired = false) {
     super(message);
   }
 }
@@ -25,7 +25,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     } catch {
       /* keep the status line */
     }
-    throw new ApiError(response.status, detail);
+    throw new ApiError(response.status, detail, response.headers.get("X-HomeAtlas-MFA") === "required");
   }
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
@@ -51,7 +51,63 @@ export interface User {
   username: string;
   role: Role;
   displayName: string;
+  totpEnabled: number;
   createdAt: string;
+}
+
+export interface AccessLogEntry {
+  id: string;
+  at: string;
+  userId: string | null;
+  username: string;
+  action: string;
+  detail: string;
+  ip: string;
+  userAgent: string;
+  ok: number;
+}
+
+export interface MonitorEvent {
+  id: string;
+  systemId: string;
+  systemName: string | null;
+  at: string;
+  status: string;
+  detail: string;
+}
+
+export interface MonitorSystem {
+  id: string;
+  name: string;
+  ip: string;
+  kind: string;
+  status: string;
+  importance: string;
+  lastSeen: string;
+  ports: number[];
+}
+
+export interface MonitorState {
+  enabled: boolean;
+  intervalSeconds: number;
+  status: { running: boolean; lastRun: number; lastError: string };
+  systems: MonitorSystem[];
+  events: MonitorEvent[];
+}
+
+export interface DnsResult {
+  servers: string[];
+  results: { name: string; resolved: boolean; addresses: string[]; elapsedMs: number; explanation: string }[];
+  resolvedCount: number;
+  totalCount: number;
+  explanation: string;
+  serversExplanation: string;
+}
+
+export interface PasswordPolicy {
+  minLength: number;
+  passphraseLength: number;
+  rules: string[];
 }
 
 export interface ServiceInfo {
@@ -82,6 +138,8 @@ export interface System {
   discovered: number;
   confirmed: number;
   discoverySource: string;
+  monitored: number;
+  monitorPorts: number[] | null;
   openPorts: number[] | null;
   services: ServiceInfo[] | null;
   extra: Record<string, any> | null;
@@ -223,7 +281,12 @@ export interface DiagnosticResult {
 export const api = {
   health: () => get<{ status: string; setupCompleted: boolean; userCount: number }>("/health"),
 
-  login: (username: string, password: string) => post<{ user: User }>("/auth/login", { username, password }),
+  login: (username: string, password: string, totpCode = "") =>
+    post<{ user: User }>("/auth/login", { username, password, totpCode }),
+  passwordPolicy: () => get<PasswordPolicy>("/auth/password-policy"),
+  mfaSetup: () => post<{ secret: string; uri: string; qrSvg: string }>("/auth/mfa/setup"),
+  mfaConfirm: (code: string) => post<{ ok: boolean }>("/auth/mfa/confirm", { code }),
+  mfaDisable: (password: string) => post<{ ok: boolean }>("/auth/mfa/disable", { password }),
   logout: () => post<{ ok: boolean }>("/auth/logout"),
   me: () => get<{ user: User }>("/auth/me"),
   changePassword: (currentPassword: string, newPassword: string) =>
@@ -232,7 +295,21 @@ export const api = {
   listUsers: () => get<{ users: User[] }>("/users"),
   createUser: (body: { username: string; password: string; role: Role; displayName: string }) =>
     post<{ user: User }>("/users", body),
+  updateUser: (id: string, body: { displayName?: string; role?: Role; newPassword?: string }) =>
+    patch<{ user: User; changes: string[] }>(`/users/${id}`, body),
   deleteUser: (id: string) => del<{ ok: boolean }>(`/users/${id}`),
+
+  accessLog: (params: { limit?: number; action?: string; onlyFailures?: boolean } = {}) => {
+    const query = new URLSearchParams();
+    if (params.limit) query.set("limit", String(params.limit));
+    if (params.action) query.set("action", params.action);
+    if (params.onlyFailures) query.set("onlyFailures", "true");
+    return get<{ entries: AccessLogEntry[]; actions: string[] }>(`/access-log?${query}`);
+  },
+
+  monitor: () => get<MonitorState>("/monitor"),
+  monitorRunNow: () => post<{ changes: { systemId: string; name: string; status: string }[] }>("/monitor/run"),
+  dnsCheck: (names?: string[]) => post<{ result: DnsResult }>("/diagnostics/dns", names ? { names } : {}),
 
   getSettings: () => get<SettingsResponse>("/settings"),
   updateSettings: (patchBody: Record<string, any>) =>

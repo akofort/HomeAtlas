@@ -19,7 +19,8 @@ from typing import Any, Iterator
 DB_PATH = os.environ.get("HOMEATLAS_DB_PATH", "/data/homeatlas.db")
 
 # Columns stored as JSON text. Kept in one place so `_row` and the writers can't drift apart.
-_JSON_COLUMNS = {"openPorts", "services", "extra", "summary", "toolCalls", "tags", "answers", "providerRaw"}
+_JSON_COLUMNS = {"openPorts", "services", "extra", "summary", "toolCalls", "tags", "answers",
+                 "providerRaw", "monitorPorts"}
 
 
 def _now() -> str:
@@ -78,8 +79,39 @@ CREATE TABLE IF NOT EXISTS users (
     salt TEXT NOT NULL,
     role TEXT NOT NULL,
     displayName TEXT NOT NULL DEFAULT '',
+    -- Second factor: the shared TOTP secret, encrypted like every other secret. `totpEnabled`
+    -- only flips to 1 after the user has proved a working code, so a half-finished setup can
+    -- never lock anyone out.
+    totpSecretEnc TEXT NOT NULL DEFAULT '',
+    totpEnabled INTEGER NOT NULL DEFAULT 0,
     createdAt TEXT NOT NULL
 );
+
+-- Who did what, when. Deliberately includes reads of stored passwords: for a credential store,
+-- "someone looked at the router password at 03:12" is exactly the event worth having later.
+CREATE TABLE IF NOT EXISTS accessLog (
+    id TEXT PRIMARY KEY,
+    at TEXT NOT NULL,
+    userId TEXT,
+    username TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    ip TEXT NOT NULL DEFAULT '',
+    userAgent TEXT NOT NULL DEFAULT '',
+    ok INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_accesslog_at ON accessLog(at DESC);
+
+-- Only status *changes* from the live monitor. Writing every poll would add ~8600 rows per device
+-- per day and say nothing; an up/down transition is the thing anyone ever looks for.
+CREATE TABLE IF NOT EXISTS monitorEvents (
+    id TEXT PRIMARY KEY,
+    systemId TEXT NOT NULL,
+    at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_monitorevents_system ON monitorEvents(systemId, at DESC);
 
 CREATE TABLE IF NOT EXISTS sessions (
     token TEXT PRIMARY KEY,
@@ -122,6 +154,9 @@ CREATE TABLE IF NOT EXISTS systems (
     -- 'ip:<addr>' for hosts off the local L2 segment, 'docker:<container-id>'. Empty for
     -- hand-created entries, which fall back to their row id below so they never collide.
     discoveryKey TEXT NOT NULL DEFAULT '',
+    -- Live monitoring: polled every few seconds rather than once per scan.
+    monitored INTEGER NOT NULL DEFAULT 0,
+    monitorPorts TEXT,
     identityKey TEXT GENERATED ALWAYS AS
         (CASE WHEN discoveryKey != '' THEN discoveryKey ELSE 'id:' || id END) VIRTUAL,
     openPorts TEXT,
@@ -232,6 +267,10 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("accounts", "port", "INTEGER NOT NULL DEFAULT 0"),
     ("docPages", "manualMd", "TEXT NOT NULL DEFAULT ''"),
     ("docPageVersions", "manualMd", "TEXT NOT NULL DEFAULT ''"),
+    ("users", "totpSecretEnc", "TEXT NOT NULL DEFAULT ''"),
+    ("users", "totpEnabled", "INTEGER NOT NULL DEFAULT 0"),
+    ("systems", "monitored", "INTEGER NOT NULL DEFAULT 0"),
+    ("systems", "monitorPorts", "TEXT"),
 )
 
 
@@ -274,6 +313,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # bridge. Addresses of hand-created devices are added automatically (see pipeline).
     "scanExtraTargets": [],
     "scanUseCredentials": True,
+    # Live monitoring
+    "monitorEnabled": True,
+    "monitorIntervalSeconds": 10,
+    "monitorTimeoutMs": 1500,
+    # Names resolved by the DNS self-test. External by design -- resolving only local names would
+    # pass even when the forwarder to the internet is broken, which is the common failure.
+    "dnsTestNames": ["www.google.com", "heise.de", "github.com"],
 }
 
 _SETTINGS_KEY = "app"
@@ -305,7 +351,26 @@ def update_settings(patch: dict) -> dict:
 # Users / sessions
 # --------------------------------------------------------------------------------------------
 
-_PUBLIC_USER_COLUMNS = "id, username, role, displayName, createdAt"
+_PUBLIC_USER_COLUMNS = "id, username, role, displayName, totpEnabled, createdAt"
+
+
+def update_user(user_id: str, patch: dict) -> dict | None:
+    allowed = ("displayName", "role", "totpSecretEnc", "totpEnabled")
+    fields = [f for f in allowed if f in patch]
+    if not fields:
+        return get_user(user_id)
+    assignments = ", ".join(f"{f} = ?" for f in fields)
+    values = [(1 if patch[f] else 0) if f == "totpEnabled" else patch[f] for f in fields]
+    with _conn() as conn:
+        conn.execute(f"UPDATE users SET {assignments} WHERE id = ?", (*values, user_id))
+    return get_user(user_id)
+
+
+def invalidate_user_sessions(user_id: str) -> None:
+    """Forces re-login. Used after an admin resets someone's password -- otherwise an already-open
+    session keeps working with the old credential, which is not what "reset" is expected to mean."""
+    with _conn() as conn:
+        conn.execute("DELETE FROM sessions WHERE userId = ?", (user_id,))
 
 
 def count_users() -> int:
@@ -380,7 +445,8 @@ def delete_db_session(token: str) -> None:
 _SYSTEM_FIELDS = (
     "kind", "name", "hostname", "ip", "mac", "vendor", "model", "os", "location", "purpose",
     "descriptionMd", "url", "docUrl", "notes", "importance", "parentId", "status", "discovered",
-    "confirmed", "discoverySource", "discoveryKey", "openPorts", "services", "tags", "extra",
+    "confirmed", "discoverySource", "discoveryKey", "monitored", "monitorPorts",
+    "openPorts", "services", "tags", "extra",
 )
 
 
@@ -422,7 +488,7 @@ def _system_params(values: dict) -> list:
             out.append(_dump(value))
         elif field == "parentId":
             out.append(value or None)
-        elif field in ("discovered", "confirmed"):
+        elif field in ("discovered", "confirmed", "monitored"):
             out.append(1 if value else 0)
         else:
             out.append(defaults.get(field, "") if value in (None, "") else value)
@@ -773,6 +839,91 @@ def abandon_stale_scans() -> None:
             "UPDATE scans SET status = 'failed', finishedAt = ?, phase = 'abgebrochen (Neustart)' WHERE status = 'running'",
             (_now(),),
         )
+
+
+# --------------------------------------------------------------------------------------------
+# Access log
+# --------------------------------------------------------------------------------------------
+
+_ACCESS_LOG_KEEP = 5000
+
+
+def log_access(action: str, *, user: dict | None = None, username: str = "", detail: str = "",
+               ip: str = "", user_agent: str = "", ok: bool = True) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO accessLog(id, at, userId, username, action, detail, ip, userAgent, ok) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (_new_id(), _now(), (user or {}).get("id"), username or (user or {}).get("username", ""),
+             action, detail[:500], ip[:60], user_agent[:200], 1 if ok else 0),
+        )
+        conn.execute(
+            "DELETE FROM accessLog WHERE id NOT IN "
+            "(SELECT id FROM accessLog ORDER BY at DESC, rowid DESC LIMIT ?)",
+            (_ACCESS_LOG_KEEP,),
+        )
+
+
+def list_access_log(limit: int = 200, action: str | None = None, only_failures: bool = False) -> list[dict]:
+    sql = "SELECT * FROM accessLog"
+    clauses, params = [], []
+    if action:
+        clauses.append("action = ?")
+        params.append(action)
+    if only_failures:
+        clauses.append("ok = 0")
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY at DESC, rowid DESC LIMIT ?"
+    params.append(max(1, min(1000, limit)))
+    with _conn() as conn:
+        return _rows(conn.execute(sql, tuple(params)))
+
+
+def access_log_actions() -> list[str]:
+    with _conn() as conn:
+        return [r["action"] for r in conn.execute("SELECT DISTINCT action FROM accessLog ORDER BY action")]
+
+
+# --------------------------------------------------------------------------------------------
+# Live monitoring
+# --------------------------------------------------------------------------------------------
+
+def list_monitored_systems() -> list[dict]:
+    with _conn() as conn:
+        return _rows(conn.execute(
+            "SELECT * FROM systems WHERE monitored = 1 AND (ip != '' OR hostname != '') "
+            "ORDER BY CASE importance WHEN 'critical' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, name"
+        ))
+
+
+def record_monitor_state(system_id: str, status: str, detail: str) -> bool:
+    """Writes the status and, only on a change, an event. Returns True if the status changed."""
+    with _conn() as conn:
+        row = conn.execute("SELECT status FROM systems WHERE id = ?", (system_id,)).fetchone()
+        if row is None:
+            return False
+        changed = row["status"] != status
+        conn.execute("UPDATE systems SET status = ?, lastSeen = CASE WHEN ? = 'online' THEN ? ELSE lastSeen END "
+                     "WHERE id = ?", (status, status, _now(), system_id))
+        if changed:
+            conn.execute(
+                "INSERT INTO monitorEvents(id, systemId, at, status, detail) VALUES(?,?,?,?,?)",
+                (_new_id(), system_id, _now(), status, detail[:300]),
+            )
+    return changed
+
+
+def list_monitor_events(system_id: str | None = None, limit: int = 100) -> list[dict]:
+    sql = "SELECT e.*, s.name AS systemName FROM monitorEvents e LEFT JOIN systems s ON s.id = e.systemId"
+    params: list = []
+    if system_id:
+        sql += " WHERE e.systemId = ?"
+        params.append(system_id)
+    sql += " ORDER BY e.at DESC, e.rowid DESC LIMIT ?"
+    params.append(max(1, min(500, limit)))
+    with _conn() as conn:
+        return _rows(conn.execute(sql, tuple(params)))
 
 
 # --------------------------------------------------------------------------------------------

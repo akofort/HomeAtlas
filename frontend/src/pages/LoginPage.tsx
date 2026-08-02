@@ -1,9 +1,11 @@
 import { useState, type FormEvent } from "react";
-import { api } from "../lib/api";
+import { ApiError, api } from "../lib/api";
 
 export default function LoginPage({ onLoggedIn }: { onLoggedIn: () => void }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [totpCode, setTotpCode] = useState("");
+  const [needsCode, setNeedsCode] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -12,9 +14,15 @@ export default function LoginPage({ onLoggedIn }: { onLoggedIn: () => void }) {
     setBusy(true);
     setError("");
     try {
-      await api.login(username, password);
+      await api.login(username, password, totpCode);
       onLoggedIn();
     } catch (err) {
+      // The backend answers 401 either way; the header distinguishes "wrong password" from
+      // "password fine, second factor still needed" without the message giving that away.
+      if (err instanceof ApiError && err.mfaRequired) {
+        setNeedsCode(true);
+        setTotpCode("");
+      }
       setError(err instanceof Error ? err.message : "Anmeldung fehlgeschlagen.");
     } finally {
       setBusy(false);
@@ -45,7 +53,30 @@ export default function LoginPage({ onLoggedIn }: { onLoggedIn: () => void }) {
                  onChange={(e) => setPassword(e.target.value)} />
         </div>
 
-        <button type="submit" disabled={busy || !username || !password} style={{ width: "100%" }}>
+        {needsCode && (
+          <div className="field">
+            <label htmlFor="totp">Code aus der Authenticator-App</label>
+            <input
+              id="totp"
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              maxLength={6}
+              autoFocus
+              placeholder="6-stellig"
+              className="mono"
+              style={{ letterSpacing: "0.4em", fontSize: "1.15rem" }}
+              value={totpCode}
+              onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, ""))}
+            />
+            <div className="field-hint">Der Code wechselt alle 30 Sekunden.</div>
+          </div>
+        )}
+
+        <button
+          type="submit"
+          disabled={busy || !username || !password || (needsCode && totpCode.length < 6)}
+          style={{ width: "100%" }}
+        >
           {busy ? "Anmelden…" : "Anmelden"}
         </button>
 

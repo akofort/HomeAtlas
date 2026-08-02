@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="HomeAtlas">
+  <!-- Kompassrose in einem Haus: „Atlas“ (Orientierung) über „Home“ (Dach). Bewusst nur wenige,
+       kräftige Formen, damit das Zeichen auch als 16-px-Favicon noch erkennbar bleibt. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#132038"/>
+      <stop offset="1" stop-color="#0b1120"/>
+    </linearGradient>
+    <linearGradient id="needle" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7dd3fc"/>
+      <stop offset="1" stop-color="#0ea5e9"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+
+  <!-- Dach -->
+  <path d="M256 92 L436 232 L404 232 L404 246 L108 246 L108 232 L76 232 Z"
+        fill="#38bdf8" opacity="0.95"/>
+
+  <!-- Hauskörper -->
+  <path d="M124 246 H388 V404 a24 24 0 0 1 -24 24 H148 a24 24 0 0 1 -24 -24 Z"
+        fill="#1b2540" stroke="#38bdf8" stroke-width="10" stroke-linejoin="round"/>
+
+  <!-- Kompassrose -->
+  <circle cx="256" cy="330" r="74" fill="#0b1120" stroke="#26304a" stroke-width="8"/>
+  <path d="M256 268 L280 318 L256 306 L232 318 Z" fill="url(#needle)"/>
+  <path d="M256 392 L232 342 L256 354 L280 342 Z" fill="#64748b"/>
+  <circle cx="256" cy="330" r="12" fill="#0b1120" stroke="#7dd3fc" stroke-width="7"/>
+
+  <!-- Netzknoten: die vier Himmelsrichtungen als Geräte gelesen -->
+  <circle cx="256" cy="248" r="9" fill="#34d399"/>
+  <circle cx="338" cy="330" r="9" fill="#34d399"/>
+  <circle cx="174" cy="330" r="9" fill="#34d399"/>
+  <circle cx="256" cy="412" r="9" fill="#34d399"/>
+</svg>

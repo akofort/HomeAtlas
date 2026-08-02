@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, type ModelOption, type SettingsResponse } from "../lib/api";
+import { api, type ModelOption, type PasswordPolicy, type SettingsResponse } from "../lib/api";
 import { useAuth } from "../App";
 
 const KEY_FIELD: Record<string, string> = {
@@ -287,12 +287,64 @@ export default function SettingsPage() {
         </div>
       )}
 
-      {tab === "account" && <AccountTab username={user?.username ?? ""} />}
+      {tab === "scan" && isAdmin && (
+        <div className="card">
+          <h2>Dauerüberwachung</h2>
+          <p className="muted" style={{ marginTop: -6 }}>
+            Wichtige Geräte werden laufend geprüft, nicht nur beim Scan. Geräte mit der Bedeutung
+            „kritisch" kommen automatisch dazu.
+          </p>
+          <label className="row" style={{ cursor: "pointer", fontWeight: 400, color: "var(--text)", marginBottom: 12 }}>
+            <input type="checkbox" style={{ width: "auto" }} checked={form.monitorEnabled ?? true}
+                   onChange={(e) => set("monitorEnabled", e.target.checked)} />
+            Dauerüberwachung aktiv
+          </label>
+          <div className="grid cols-2">
+            <div className="field">
+              <label>Prüfabstand (Sekunden)</label>
+              <input type="number" min={5} max={600} value={form.monitorIntervalSeconds ?? 10}
+                     onChange={(e) => set("monitorIntervalSeconds", Number(e.target.value))} />
+              <div className="field-hint">
+                Ein Ausfall wird erst nach zwei aufeinanderfolgenden Fehlversuchen gemeldet — ein
+                einzelner verlorener Ping löst nichts aus.
+              </div>
+            </div>
+            <div className="field">
+              <label>Wartezeit je Prüfung (Millisekunden)</label>
+              <input type="number" min={200} max={10000} value={form.monitorTimeoutMs ?? 1500}
+                     onChange={(e) => set("monitorTimeoutMs", Number(e.target.value))} />
+            </div>
+            <div className="field" style={{ gridColumn: "1 / -1" }}>
+              <label>Namen für den DNS-Test</label>
+              <input
+                value={(form.dnsTestNames ?? []).join(", ")}
+                onChange={(e) => set("dnsTestNames", e.target.value.split(",").map((s) => s.trim()).filter(Boolean))}
+              />
+              <div className="field-hint">
+                Bewusst externe Adressen: nur lokale Namen aufzulösen gelingt auch dann noch, wenn
+                die Weiterleitung ins Internet defekt ist — genau der häufigste Fehler.
+              </div>
+            </div>
+          </div>
+          <button onClick={() => void save(form)} disabled={busy !== ""}>Speichern</button>
+        </div>
+      )}
+
+      {tab === "account" && <AccountTab username={user?.username ?? ""} totpEnabled={Boolean(user?.totpEnabled)} />}
 
       {tab === "about" && (
         <div className="card">
-          <h2>Über HomeAtlas</h2>
-          <p className="muted">Die Dokumentation deines Heimnetzes — automatisch erstellt, in verständlicher Sprache.</p>
+          <div className="row" style={{ gap: 16, alignItems: "center", marginBottom: 12 }}>
+            <img src="/icon.svg" alt="" width={64} height={64} style={{ borderRadius: 14 }} />
+            <div>
+              <h2 style={{ margin: 0 }}>HomeAtlas</h2>
+              <p className="muted" style={{ margin: 0 }}>
+                Die Dokumentation deines Heimnetzes — automatisch erstellt, in verständlicher Sprache.
+              </p>
+            </div>
+          </div>
+          <img src="/about.svg" alt="Vom Netzwerk-Scan über die Erkennung zur fertigen Dokumentation"
+               style={{ width: "100%", maxWidth: 800, borderRadius: 12, marginBottom: 16 }} />
           <div className="table-wrap">
             <table>
               <tbody>
@@ -308,12 +360,17 @@ export default function SettingsPage() {
   );
 }
 
-function AccountTab({ username }: { username: string }) {
+function AccountTab({ username, totpEnabled }: { username: string; totpEnabled: boolean }) {
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [repeat, setRepeat] = useState("");
   const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
+  const [policy, setPolicy] = useState<PasswordPolicy | null>(null);
+
+  useEffect(() => {
+    api.passwordPolicy().then(setPolicy).catch(() => setPolicy(null));
+  }, []);
 
   async function submit() {
     if (newPassword !== repeat) {
@@ -348,16 +405,148 @@ function AccountTab({ username }: { username: string }) {
         <label>Neues Passwort</label>
         <input type="password" autoComplete="new-password" value={newPassword}
                onChange={(e) => setNewPassword(e.target.value)} />
-        <div className="field-hint">Mindestens 8 Zeichen.</div>
+        {policy && (
+          <ul className="field-hint" style={{ margin: "6px 0 0", paddingLeft: "1.1em" }}>
+            {policy.rules.map((rule) => <li key={rule}>{rule}</li>)}
+          </ul>
+        )}
       </div>
       <div className="field">
         <label>Neues Passwort wiederholen</label>
         <input type="password" autoComplete="new-password" value={repeat}
                onChange={(e) => setRepeat(e.target.value)} />
       </div>
-      <button onClick={() => void submit()} disabled={busy || !currentPassword || newPassword.length < 8}>
+      <button onClick={() => void submit()}
+              disabled={busy || !currentPassword || newPassword.length < (policy?.minLength ?? 10)}>
         {busy ? "Ändere…" : "Passwort ändern"}
       </button>
+
+      <MfaSection enabled={totpEnabled} />
+    </div>
+  );
+}
+
+/** Zwei-Faktor-Anmeldung. Der Geheimtext wird erst nach einem funktionierenden Code scharfgeschaltet
+ *  — sonst könnte eine abgebrochene Einrichtung aussperren. */
+function MfaSection({ enabled }: { enabled: boolean }) {
+  const [setup, setSetup] = useState<{ secret: string; uri: string; qrSvg: string } | null>(null);
+  const [code, setCode] = useState("");
+  const [password, setPassword] = useState("");
+  const [disabling, setDisabling] = useState(false);
+  const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [active, setActive] = useState(enabled);
+
+  async function start() {
+    setBusy(true);
+    setNotice(null);
+    try {
+      setSetup(await api.mfaSetup());
+    } catch (e) {
+      setNotice({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function confirm() {
+    setBusy(true);
+    try {
+      await api.mfaConfirm(code);
+      setActive(true);
+      setSetup(null);
+      setCode("");
+      setNotice({ kind: "ok", text: "Zwei-Faktor-Anmeldung ist aktiv. Ab jetzt wird bei jeder Anmeldung der Code abgefragt." });
+    } catch (e) {
+      setNotice({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function disable() {
+    setBusy(true);
+    try {
+      await api.mfaDisable(password);
+      setActive(false);
+      setDisabling(false);
+      setPassword("");
+      setNotice({ kind: "ok", text: "Zwei-Faktor-Anmeldung abgeschaltet." });
+    } catch (e) {
+      setNotice({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div style={{ marginTop: 28, paddingTop: 20, borderTop: "1px solid var(--border)" }}>
+      <div className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
+        <h3 style={{ margin: 0 }}>Zwei-Faktor-Anmeldung (optional)</h3>
+        <span className={`badge ${active ? "ok" : ""}`}>{active ? "aktiv" : "nicht eingerichtet"}</span>
+      </div>
+      <p className="muted">
+        Zusätzlich zum Passwort ein Code aus einer Authenticator-App (Aegis, 2FAS, Google
+        Authenticator, 1Password …). Wer dann dein Passwort kennt, kommt trotzdem nicht hinein.
+      </p>
+
+      {notice && <div className={`notice ${notice.kind}`}>{notice.text}</div>}
+
+      {active ? (
+        disabling ? (
+          <>
+            <div className="field">
+              <label>Zur Bestätigung dein Passwort</label>
+              <input type="password" autoComplete="current-password" value={password}
+                     onChange={(e) => setPassword(e.target.value)} />
+            </div>
+            <div className="row">
+              <button className="danger" onClick={() => void disable()} disabled={busy || !password}>
+                Abschalten
+              </button>
+              <button className="secondary" onClick={() => setDisabling(false)}>Abbrechen</button>
+            </div>
+          </>
+        ) : (
+          <button className="secondary" onClick={() => setDisabling(true)}>Zwei-Faktor abschalten</button>
+        )
+      ) : setup ? (
+        <>
+          <p className="muted">
+            <strong>1.</strong> QR-Code in der App scannen — oder den Schlüssel von Hand eintippen.
+          </p>
+          {setup.qrSvg ? (
+            <div
+              style={{ background: "#fff", padding: 10, borderRadius: 10, display: "inline-block" }}
+              dangerouslySetInnerHTML={{ __html: setup.qrSvg }}
+            />
+          ) : (
+            <div className="notice info">
+              QR-Code konnte nicht erzeugt werden — bitte den Schlüssel unten von Hand eintragen.
+            </div>
+          )}
+          <div className="field" style={{ marginTop: 12 }}>
+            <label>Schlüssel zum Abtippen</label>
+            <code className="mono" style={{ display: "block", wordBreak: "break-all", background: "var(--bg)", padding: "8px 10px", borderRadius: 8 }}>
+              {setup.secret}
+            </code>
+          </div>
+          <p className="muted"><strong>2.</strong> Zur Bestätigung den aktuellen Code eingeben:</p>
+          <div className="field" style={{ maxWidth: 220 }}>
+            <input inputMode="numeric" maxLength={6} placeholder="6-stellig" className="mono"
+                   style={{ letterSpacing: "0.4em", fontSize: "1.15rem" }}
+                   value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))} />
+          </div>
+          <div className="row">
+            <button onClick={() => void confirm()} disabled={busy || code.length < 6}>Aktivieren</button>
+            <button className="secondary" onClick={() => setSetup(null)}>Abbrechen</button>
+          </div>
+        </>
+      ) : (
+        <button className="secondary" onClick={() => void start()} disabled={busy}>
+          {busy ? "Erzeuge…" : "Einrichten"}
+        </button>
+      )}
     </div>
   );
 }

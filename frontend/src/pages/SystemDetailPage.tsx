@@ -100,6 +100,7 @@ export default function SystemDetailPage() {
               {system.status === "online" ? "erreichbar" : system.status === "offline" ? "nicht erreichbar" : "Zustand unbekannt"}
             </span>
             {system.importance === "critical" && <span className="badge warn">kritisch fürs Haus</span>}
+            {system.monitored === 1 && <span className="badge">dauerhaft überwacht</span>}
             {system.discovered === 1 && <span className="badge">automatisch gefunden</span>}
             {system.url && (
               <a className="badge" href={system.url} target="_blank" rel="noreferrer">Weboberfläche öffnen ↗</a>
@@ -169,6 +170,35 @@ export default function SystemDetailPage() {
             <label>Interne Notiz</label>
             <input value={draft.notes ?? ""} onChange={(e) => setDraft({ ...draft, notes: e.target.value })} />
           </div>
+
+          <label className="row" style={{ cursor: "pointer", fontWeight: 400, color: "var(--text)", marginBottom: 8 }}>
+            <input type="checkbox" style={{ width: "auto" }} checked={Boolean(draft.monitored)}
+                   onChange={(e) => setDraft({ ...draft, monitored: e.target.checked ? 1 : 0 })} />
+            Dauerhaft überwachen (alle paar Sekunden prüfen)
+          </label>
+          {Boolean(draft.monitored) && (
+            <div className="field">
+              <label>Zu prüfende Ports (optional, max. 3)</label>
+              <input
+                placeholder="z. B. 443, 445 — leer = automatisch bzw. Ping"
+                value={(draft.monitorPorts ?? []).join(", ")}
+                onChange={(e) =>
+                  setDraft({
+                    ...draft,
+                    monitorPorts: e.target.value
+                      .split(",")
+                      .map((s) => Number(s.trim()))
+                      .filter((n) => Number.isInteger(n) && n > 0 && n < 65536)
+                      .slice(0, 3),
+                  })
+                }
+              />
+              <div className="field-hint">
+                Ein geprüfter Port sagt mehr als ein Ping: ein NAS, das auf Ping antwortet, während
+                die Dateifreigabe tot ist, gilt sonst als „erreichbar".
+              </div>
+            </div>
+          )}
           <div className="row">
             <button onClick={() => void save()}>Speichern</button>
             <button className="secondary" onClick={() => setEditing(false)}>Abbrechen</button>

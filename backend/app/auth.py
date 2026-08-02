@@ -13,7 +13,7 @@ import hashlib
 import os
 import secrets
 
-from . import db
+from . import crypto, db, security
 
 SESSION_COOKIE_NAME = "homeatlas_session"
 SESSION_TTL_SECONDS = 30 * 24 * 60 * 60  # 30 days
@@ -34,19 +34,60 @@ def ensure_admin_bootstrapped() -> str | None:
     if db.count_users() > 0:
         return None
     username = os.environ.get("ADMIN_USERNAME", "admin")
-    password = os.environ.get("ADMIN_PASSWORD") or secrets.token_urlsafe(12)
+    # Readable by design: this password gets copied out of a terminal by hand exactly once.
+    # Four words plus digits clears the policy and is far easier to retype than base64 noise.
+    password = os.environ.get("ADMIN_PASSWORD") or "-".join(
+        [secrets.choice(_WORDS) for _ in range(4)] + [str(secrets.randbelow(90) + 10)]
+    )
     salt = secrets.token_hex(16)
     db.create_user(username, hash_password(password, salt), salt, ROLE_ADMIN)
     return password if not os.environ.get("ADMIN_PASSWORD") else None
 
 
-def verify_login(username: str, password: str) -> dict | None:
+_WORDS = (
+    "Anker", "Blume", "Dachs", "Eiche", "Feder", "Garten", "Hafen", "Insel", "Kerze", "Lampe",
+    "Mond", "Nebel", "Otter", "Pfeil", "Quelle", "Regen", "Sonne", "Turm", "Ufer", "Vogel",
+    "Wolke", "Zeder", "Brunnen", "Distel", "Falke", "Granit", "Hummel", "Kiesel", "Linde", "Marmor",
+)
+
+
+class MfaRequired(Exception):
+    """Credentials were correct but a second factor is configured and missing/wrong."""
+
+    def __init__(self, wrong_code: bool = False):
+        super().__init__("MFA erforderlich")
+        self.wrong_code = wrong_code
+
+
+def verify_login(username: str, password: str, totp_code: str = "") -> dict | None:
+    """Returns the raw user row, None on bad credentials, and raises `MfaRequired` when the
+    password was right but the second factor is still needed. Keeping those three cases distinct
+    matters: the caller must not reveal that a password was correct by wording alone, but it does
+    need to know when to show the code field."""
     user = db.get_user_by_username_raw(username)
     if user is None:
+        # Hash anyway so a missing account doesn't answer measurably faster than a wrong password.
+        hash_password(password, "dummy-salt")
         return None
     if not secrets.compare_digest(hash_password(password, user["salt"]), user["passwordHash"]):
         return None
+    if user.get("totpEnabled"):
+        secret = crypto.decrypt(user.get("totpSecretEnc") or "")
+        if not totp_code:
+            raise MfaRequired()
+        if not security.verify_totp(secret, totp_code):
+            raise MfaRequired(wrong_code=True)
     return user
+
+
+def verify_password(user_id: str, password: str) -> bool:
+    """Password only, no second factor. Used where the session is already authenticated and the
+    password is being re-asked as confirmation -- going through `verify_login` there would demand
+    a TOTP code to switch TOTP off, which cannot work."""
+    user = db.get_user_raw(user_id)
+    if user is None:
+        return False
+    return secrets.compare_digest(hash_password(password, user["salt"]), user["passwordHash"])
 
 
 def create_session(user_id: str) -> str:
@@ -69,9 +110,15 @@ def destroy_session(token: str) -> None:
 
 
 def change_password(user_id: str, current_password: str, new_password: str) -> bool:
+    """Raises `security.PasswordError` if the new password is too weak."""
     user = db.get_user_raw(user_id)
     if user is None or not secrets.compare_digest(hash_password(current_password, user["salt"]), user["passwordHash"]):
         return False
+    security.check_password(new_password, user["username"])
+    set_password(user_id, new_password)
+    return True
+
+
+def set_password(user_id: str, new_password: str) -> None:
     salt = secrets.token_hex(16)
     db.set_user_password(user_id, hash_password(new_password, salt), salt)
-    return True

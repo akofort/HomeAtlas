@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="HomeAtlas">
+  <!-- Eigene, stark vereinfachte Fassung des App-Icons: bei 16 px verschwinden Kompassnadel und
+       Netzknoten zu Matsch, deshalb hier nur Dach, Körper und ein einzelner Punkt. -->
+  <rect width="64" height="64" rx="14" fill="#0b1120"/>
+  <path d="M32 11 L56 30 L49 30 L49 32 L15 32 L15 30 L8 30 Z" fill="#38bdf8"/>
+  <path d="M17 32 H47 V50 a3 3 0 0 1 -3 3 H20 a3 3 0 0 1 -3 -3 Z"
+        fill="#1b2540" stroke="#38bdf8" stroke-width="3" stroke-linejoin="round"/>
+  <circle cx="32" cy="42" r="7" fill="#0b1120" stroke="#7dd3fc" stroke-width="3"/>
+  <circle cx="32" cy="42" r="2.5" fill="#34d399"/>
+</svg>

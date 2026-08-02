@@ -23,6 +23,9 @@ Läuft als Docker-Container im eigenen Netz. Keine Cloud, keine Registrierung.
 | **Hersteller-Doku** | Link zur passenden Support-Seite je Gerät; von der KI vorgeschlagene Links werden vor dem Speichern auf Erreichbarkeit geprüft |
 | **Versionierte Doku** | Jeder frühere Stand jeder Seite bleibt abrufbar und wiederherstellbar |
 | **Zwei Rollen** | Administrator sieht und ändert alles; Mitglieder lesen die Doku und nutzen den Chat — ohne Passwörter |
+| **Dauerüberwachung** | Wichtige Geräte alle paar Sekunden per Port oder Ping geprüft, mit Ausfallverlauf |
+| **Übersichtsplan** | Automatisch erzeugter Netzplan vom Internet bis zu den Endgeräten |
+| **Anmeldeschutz** | Passwortrichtlinie, optional Zwei-Faktor per Authenticator-App, Zugriffsprotokoll |
 
 Der Anbieter für die KI ist frei wählbar: **Anthropic Claude, OpenAI, Google Gemini, DeepSeek**
 oder ein **lokaler Ollama-Server** (dann verlässt kein einziges Byte das Haus).
@@ -197,6 +200,24 @@ Admin-Route abrufbar.
 GET-Endpunkte aufgerufen — aber wer den Socket lesen kann, kann auf dem Host viel. Wem das zu
 weit geht, entfernt die Zeile in `docker-compose.yml`; alles außer der Container-Erkennung
 funktioniert weiter.
+
+**Anmeldeschutz.** Passwörter müssen mindestens 10 Zeichen haben und entweder drei der vier
+Zeichenarten enthalten oder ab 20 Zeichen als Wortfolge durchgehen — lange Passphrasen sind
+stärker *und* merkbarer als kurze Sonderzeichen-Akrobatik. Optional lässt sich pro Konto eine
+Zwei-Faktor-Anmeldung per Authenticator-App einschalten (TOTP nach RFC 6238, ohne externen
+Dienst). Sie wird erst scharf, nachdem ein funktionierender Code eingegeben wurde — eine
+abgebrochene Einrichtung kann also niemanden aussperren.
+
+**Zugriffsprotokoll.** Anmeldungen, Fehlversuche, Benutzeränderungen und *jedes Anzeigen eines
+gespeicherten Passworts* landen im Protokoll. Gerade Letzteres ist für einen Zugangsspeicher der
+Eintrag, den man später wirklich sucht.
+
+**HomeAtlas ist kein Passwort-Manager.** Hier gehören Zugänge zur *Technik* hinein: Router,
+NAS, Kundennummer beim Anbieter — damit man im Störungsfall drankommt. Für persönliche Passwörter
+und Bankzugänge gehört ein echter Safe her: [Bitwarden](https://bitwarden.com/) (auch selbst
+gehostet als [Vaultwarden](https://github.com/dani-garcia/vaultwarden)),
+[KeePassXC](https://keepassxc.org/) oder [1Password](https://1password.com/). Die bieten
+Browser-Integration, Freigaben und Notfallzugriff — Dinge, die diese App bewusst nicht macht.
 
 **Kein HTTPS out of the box.** HomeAtlas ist für den Betrieb im eigenen LAN gedacht. Wer es von
 außen erreichbar macht, gehört hinter einen Reverse Proxy mit TLS — und sollte sich vorher
