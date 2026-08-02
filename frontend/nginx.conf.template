@@ -1,0 +1,22 @@
+server {
+    listen ${HOMEATLAS_PORT};
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Both containers run on the host network, so the backend is reachable on loopback rather
+    # than by compose service name.
+    location /api/ {
+        proxy_pass http://127.0.0.1:8000/api/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        # A chat turn can run several tool calls plus an LLM round trip; the default 60s cuts
+        # those off mid-answer.
+        proxy_read_timeout 300s;
+    }
+
+    # Single-page app: every unknown path is a client-side route, not a 404.
+    location / {
+        try_files $uri /index.html;
+    }
+}

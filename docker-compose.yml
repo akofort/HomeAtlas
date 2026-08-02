@@ -1,0 +1,43 @@
+services:
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    # Required, not a convenience: discovery reads the host's ARP/neighbour table and sends
+    # multicast (mDNS/SSDP) that a bridge network would not carry. On a bridge the app would only
+    # ever see the Docker network, never the actual home LAN.
+    network_mode: host
+    volumes:
+      - homeatlas-data:/data
+      # Read-only, and only GET endpoints are ever called (see docker_probe.py). Be aware that
+      # socket access is root-equivalent on the host -- remove this line to run without container
+      # discovery; everything else keeps working.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - TZ=Europe/Berlin
+      - HOMEATLAS_DB_PATH=/data/homeatlas.db
+      - HOMEATLAS_KEY_PATH=/data/secret.key
+      - HOMEATLAS_OUI_PATH=/data/oui.json
+      # Initial login. Leave both unset and a random password is generated on first start and
+      # printed once to `docker compose logs backend`. Only used when no user exists yet --
+      # editing these later does nothing.
+      # - ADMIN_USERNAME=admin
+      # - ADMIN_PASSWORD=change-me
+
+  frontend:
+    build:
+      context: ./frontend
+      # deploy.sh fills these in; the build context on the server has no .git directory, so the
+      # commit stamp has to be computed on the machine that triggers the build.
+      args:
+        VITE_BUILD_SHA: ${VITE_BUILD_SHA:-dev}
+        VITE_BUILD_TIME: ${VITE_BUILD_TIME:-}
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      # 8080 (fritzbox-phonebook) and 8180 (GlucoSphere-Web) are already taken on 192.168.1.110.
+      - HOMEATLAS_PORT=${HOMEATLAS_PORT:-8280}
+    depends_on:
+      - backend
+
+volumes:
+  homeatlas-data:

@@ -1,0 +1,16 @@
+node_modules/
+dist/
+*.tsbuildinfo
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.db
+*.db-wal
+*.db-shm
+secret.key
+oui.json
+.env
+.DS_Store
+.idea/
+.vscode/
