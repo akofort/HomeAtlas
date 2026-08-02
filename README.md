@@ -65,6 +65,20 @@ docker compose logs backend | grep -A4 Anmeldedaten
 Ein eigenes Passwort lässt sich stattdessen in `docker-compose.yml` über `ADMIN_USERNAME` /
 `ADMIN_PASSWORD` vorgeben (wirkt nur, solange noch kein Benutzer existiert).
 
+### Passwort verloren?
+
+Das generierte Passwort wird **genau einmal** ausgegeben — ins Startprotokoll des Containers, der
+den Benutzer angelegt hat. Ist dieser Container weg (Absturzschleife, `docker compose down`,
+Log-Rotation), das Datenvolume aber noch da, hilft `ADMIN_PASSWORD` nicht mehr weiter: es greift
+nur, solange überhaupt kein Benutzer existiert. Dafür gibt es das Wiederherstellungswerkzeug:
+
+```bash
+docker compose exec backend python -m app.reset_password                       # Benutzer auflisten
+docker compose exec backend python -m app.reset_password admin neuespasswort   # Passwort setzen
+```
+
+Das legt den Benutzer auch neu als Administrator an, falls gar keiner mehr existiert.
+
 ---
 
 ## Der erste Durchlauf
