@@ -19,6 +19,11 @@ VOLUME ["/data"]
 # Bound to loopback on purpose: the container runs with network_mode host (it has to, to see the
 # real LAN), so binding 0.0.0.0 would publish the unauthenticated-by-default API on every
 # interface of the Docker host. nginx sits in front and is the only thing that reaches it.
+#
+# The port is a variable for the same reason: on the host network this is the *host's* loopback,
+# so it collides with anything else already listening there. 8000 is a common default for other
+# apps, hence 8281 (next to the UI's 8280).
 ENV HOMEATLAS_BIND=127.0.0.1
-EXPOSE 8000
-CMD ["sh", "-c", "exec uvicorn app.main:app --host \"$HOMEATLAS_BIND\" --port 8000"]
+ENV HOMEATLAS_API_PORT=8281
+EXPOSE 8281
+CMD ["sh", "-c", "exec uvicorn app.main:app --host \"$HOMEATLAS_BIND\" --port \"$HOMEATLAS_API_PORT\""]

@@ -36,11 +36,14 @@ cd HomeAtlas
 ./deploy.sh                      # deployt nach 192.168.1.110, Port 8280
 ```
 
-Anderes Ziel oder anderer Port:
+Anderes Ziel oder andere Ports:
 
 ```bash
-HOMEATLAS_HOST=192.168.1.50 HOMEATLAS_PORT=8380 ./deploy.sh
+HOMEATLAS_HOST=192.168.1.50 HOMEATLAS_PORT=8380 HOMEATLAS_API_PORT=8381 ./deploy.sh
 ```
+
+`deploy.sh` prüft vorab, ob beide Ports auf dem Zielhost frei sind, und nennt im Konfliktfall den
+Prozess, der sie belegt.
 
 ### Direkt per docker compose
 
@@ -167,6 +170,7 @@ Konfidenz werden verworfen: die regelbasierte Vermutung ist besser als ein Schul
 | Umgebungsvariable | Standard | Bedeutung |
 |---|---|---|
 | `HOMEATLAS_PORT` | `8280` | Port, auf dem die Oberfläche lauscht |
+| `HOMEATLAS_API_PORT` | `8281` | Port des Backends. Weil beide Container im **Host-Netz** laufen, sind das Ports des Docker-Hosts — sie kollidieren mit allem, was dort schon lauscht. Belegt? `ss -tlnp \| grep :8281` und einen freien wählen |
 | `HOMEATLAS_DB_PATH` | `/data/homeatlas.db` | SQLite-Datenbank |
 | `HOMEATLAS_KEY_PATH` | `/data/secret.key` | Verschlüsselungsschlüssel (wird automatisch erzeugt) |
 | `HOMEATLAS_OUI_PATH` | `/data/oui.json` | Zwischenspeicher der IEEE-Herstellerdatenbank |

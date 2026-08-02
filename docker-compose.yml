@@ -14,6 +14,10 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - TZ=Europe/Berlin
+      # On the host network this is the HOST's loopback, so it collides with anything else
+      # already listening there (8000 is a popular default -- hence 8281). Must match the
+      # frontend's HOMEATLAS_API_PORT.
+      - HOMEATLAS_API_PORT=${HOMEATLAS_API_PORT:-8281}
       - HOMEATLAS_DB_PATH=/data/homeatlas.db
       - HOMEATLAS_KEY_PATH=/data/secret.key
       - HOMEATLAS_OUI_PATH=/data/oui.json
@@ -36,6 +40,7 @@ services:
     environment:
       # 8080 (fritzbox-phonebook) and 8180 (GlucoSphere-Web) are already taken on 192.168.1.110.
       - HOMEATLAS_PORT=${HOMEATLAS_PORT:-8280}
+      - HOMEATLAS_API_PORT=${HOMEATLAS_API_PORT:-8281}
     depends_on:
       - backend
 
