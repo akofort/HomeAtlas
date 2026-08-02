@@ -37,46 +37,69 @@ _DEFAULT_PORTS_BY_KIND: dict[str, tuple[int, ...]] = {
 }
 
 
-def effective_ports(system: dict) -> list[int]:
+def effective_ports(system: dict) -> tuple[list[int], bool]:
+    """Returns (ports, explicit). `explicit` means a human chose them, which decides whether a
+    closed port is authoritative or merely one signal among two."""
     configured = [int(p) for p in (system.get("monitorPorts") or []) if str(p).isdigit()]
     if configured:
-        return configured[:3]
+        return configured[:3], True
+
     open_ports = system.get("openPorts") or []
     preferred = _DEFAULT_PORTS_BY_KIND.get(system.get("kind", ""), ())
-    # Prefer a port the device is actually known to serve; a default that was never open would
-    # report a permanent outage.
-    chosen = [p for p in preferred if p in open_ports][:3]
-    if chosen:
-        return chosen
-    return list(open_ports)[:1]
+    # A port the device is known to serve is the best guess.
+    known = [p for p in preferred if p in open_ports][:3]
+    if known:
+        return known, False
+    if open_ports:
+        return list(open_ports)[:3], False
+    # Nothing was ever scanned (a hand-created entry). Try the ports typical for this kind anyway
+    # -- a service check says far more than a ping -- but since it is only a guess, a closed port
+    # falls back to ping below instead of declaring an outage.
+    return list(preferred)[:3], False
+
+
+def _describe_ports(ports: list[int]) -> str:
+    return ", ".join(f"{p} ({port_catalog.label_for(p)[0]})" for p in ports)
 
 
 async def check_system(system: dict, timeout_s: float) -> tuple[str, str]:
-    """Returns (status, human-readable detail)."""
+    """Returns (status, human-readable detail).
+
+    Explicitly configured ports are the verdict: a NAS answering ICMP while its file service is
+    dead is not "reachable" in any sense the household cares about. Guessed ports are softer --
+    if none answer, a ping still counts as alive, and the detail says the service was not found so
+    the difference is visible rather than hidden.
+    """
     host = (system.get("ip") or system.get("hostname") or "").strip()
     if not host:
         return "unknown", "Keine Adresse hinterlegt"
 
-    targets = effective_ports(system)
+    targets, explicit = effective_ports(system)
+    open_now: list[int] = []
     if targets:
         results = await asyncio.gather(
             *(diagnostics.check_port(host, port, timeout_s) for port in targets),
             return_exceptions=True,
         )
-        reachable = [
-            (targets[i], r) for i, r in enumerate(results) if isinstance(r, dict) and r.get("open")
-        ]
-        if reachable:
-            names = ", ".join(f"{p} ({port_catalog.label_for(p)[0]})" for p, _ in reachable)
-            return "online", f"Dienst erreichbar auf Port {names}"
-        closed = ", ".join(str(p) for p in targets)
-        return "offline", f"Kein Dienst erreichbar (geprüft: Port {closed})"
+        open_now = [targets[i] for i, r in enumerate(results) if isinstance(r, dict) and r.get("open")]
+        if open_now:
+            return "online", f"Dienst erreichbar auf Port {_describe_ports(open_now)}"
+        if explicit:
+            return "offline", f"Kein Dienst erreichbar (geprüft: Port {_describe_ports(targets)})"
 
     try:
         result = await diagnostics.ping(host, count=1)
     except Exception:  # noqa: BLE001 -- a monitor must never raise into its own loop
         return "unknown", "Prüfung fehlgeschlagen"
-    return ("online", "Antwortet auf Ping") if result.get("reachable") else ("offline", "Antwortet nicht auf Ping")
+
+    if result.get("reachable"):
+        if targets:
+            return "online", (f"Antwortet auf Ping, aber Port {_describe_ports(targets)} "
+                              "nahm keine Verbindung an")
+        return "online", "Antwortet auf Ping"
+    if targets:
+        return "offline", f"Weder Ping noch Port {_describe_ports(targets)} erreichbar"
+    return "offline", "Antwortet nicht auf Ping"
 
 
 class Monitor:
@@ -116,6 +139,9 @@ class Monitor:
     async def run_once(self, settings: dict | None = None) -> list[dict]:
         settings = settings or db.get_settings()
         timeout_s = max(0.2, int(settings.get("monitorTimeoutMs", 1500)) / 1000)
+        # Cheap UPDATE, but it is what keeps a newly-marked-critical device from being ignored
+        # until the next full scan.
+        db.ensure_monitoring_for_critical()
         systems = db.list_monitored_systems()
         if not systems:
             self.last_run = time.time()

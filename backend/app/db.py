@@ -317,6 +317,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "monitorEnabled": True,
     "monitorIntervalSeconds": 10,
     "monitorTimeoutMs": 1500,
+    # Fallback credential for authenticated probing, used only where a device has no credential of
+    # its own. Stored encrypted inside this blob, same as the API keys, and masked by the API.
+    "defaultCredentialEnabled": False,
+    "defaultCredentialUsername": "",
+    "defaultCredentialIsKey": False,
+    "defaultCredentialSecretEnc": "",
+    "defaultCredentialPassphraseEnc": "",
+    "defaultCredentialPort": 0,
     # Names resolved by the DNS self-test. External by design -- resolving only local names would
     # pass even when the forwarder to the internet is broken, which is the common failure.
     "dnsTestNames": ["www.google.com", "heise.de", "github.com"],
@@ -888,6 +896,21 @@ def access_log_actions() -> list[str]:
 # --------------------------------------------------------------------------------------------
 # Live monitoring
 # --------------------------------------------------------------------------------------------
+
+def ensure_monitoring_for_critical() -> int:
+    """Enrols every critical device that has an address into the live monitor.
+
+    Runs on startup and before each monitor round, not just at scan time. Otherwise a device that
+    a human marks as critical in the UI is never polled and sits at status "unknown" forever --
+    which is exactly what the dashboard's "most important devices" list was showing.
+    """
+    with _conn() as conn:
+        cursor = conn.execute(
+            "UPDATE systems SET monitored = 1 "
+            "WHERE importance = 'critical' AND monitored = 0 AND (ip != '' OR hostname != '')"
+        )
+        return cursor.rowcount or 0
+
 
 def list_monitored_systems() -> list[dict]:
     with _conn() as conn:

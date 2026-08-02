@@ -147,6 +147,8 @@ export interface System {
   lastSeen: string;
   updatedAt: string;
   accountCount?: number;
+  /** Server-derived "what is this for" sentence; falls back to the kind when nothing is stored. */
+  description?: string;
 }
 
 export interface Account {
@@ -248,10 +250,12 @@ export interface Dashboard {
   };
   byKind: Record<string, number>;
   kindLabels: Record<string, string>;
-  criticalSystems: System[];
+  criticalSystems: (System & { monitorPortsEffective?: number[] })[];
   recentlyChanged: System[];
   lastScan: Scan | null;
   llmConfigured: boolean;
+  monitorEnabled: boolean;
+  monitorIntervalSeconds: number;
 }
 
 export interface ModelOption {
@@ -322,7 +326,10 @@ export const api = {
 
   listSystems: (kind?: string) =>
     get<{ systems: System[]; kindLabels: Record<string, string> }>(`/systems${kind ? `?kind=${kind}` : ""}`),
-  getSystem: (id: string) => get<{ system: System; accounts: Account[] }>(`/systems/${id}`),
+  getSystem: (id: string) =>
+    get<{ system: System; accounts: Account[]; description: string; monitorPortsEffective: number[] }>(
+      `/systems/${id}`,
+    ),
   createSystem: (body: Partial<System>) => post<{ system: System }>("/systems", body),
   updateSystem: (id: string, body: Partial<System>) => patch<{ system: System }>(`/systems/${id}`, body),
   deleteSystem: (id: string) => del<{ ok: boolean }>(`/systems/${id}`),

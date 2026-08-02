@@ -133,6 +133,63 @@ TOPICS: tuple[Topic, ...] = (
 )
 
 
+# What a device of this kind is *for*, in one sentence a non-technical reader understands. Used
+# only when nothing better is stored, so a real description or an LLM-written purpose always wins.
+_KIND_PURPOSE = {
+    "router": "Verbindet das Haus mit dem Internet und verteilt das Netz an alle Geräte.",
+    "network": "Verteilt das Netzwerk im Haus weiter — per Kabel oder als WLAN.",
+    "server": "Ein dauerhaft laufender Rechner, auf dem Dienste für den Haushalt bereitstehen.",
+    "nas": "Zentraler Netzwerkspeicher: hier liegen gemeinsam genutzte Dateien und Sicherungen.",
+    "container": "Eine einzelne Anwendung, abgeschottet auf einem Server ausgeführt.",
+    "vm": "Ein vollständiger virtueller Rechner, der auf einem größeren Server läuft.",
+    "pc": "Ein persönlicher Rechner im Haushalt.",
+    "mobile": "Ein Telefon oder Tablet im WLAN.",
+    "printer": "Netzwerkdrucker, über den alle Geräte im Haus drucken können.",
+    "camera": "Kamera, die ihr Bild über das Netzwerk bereitstellt.",
+    "smarthome": "Teil der Smart-Home-Steuerung — schaltet, misst oder steuert etwas im Haus.",
+    "climate": "Steuert oder misst Temperatur, Lüftung oder Luftqualität.",
+    "heating": "Gehört zur Heizung oder Wärmepumpe.",
+    "energy": "Gehört zur Energieversorgung — Photovoltaik, Ladestation oder Stromzähler.",
+    "media": "Gibt Musik oder Video wieder oder streamt es ins Haus.",
+    "iot": "Kleines vernetztes Gerät mit einer speziellen Aufgabe.",
+    "other": "",
+}
+
+
+def describe_device(system: dict) -> str:
+    """Best available "what is this for" sentence.
+
+    Falls back through: hand-written description → purpose → what the kind implies, enriched by the
+    most telling open service. Without the fallback most entries in "Die Geräte im Einzelnen" would
+    show nothing at all, which is precisely the section someone reads to find out what a device is.
+    """
+    description = (system.get("descriptionMd") or "").strip()
+    if description:
+        return description
+    purpose = (system.get("purpose") or "").strip()
+    if purpose and not purpose.startswith("Gerät "):
+        return purpose
+
+    base = _KIND_PURPOSE.get(system.get("kind", ""), "")
+    services = system.get("services") or []
+    hint = ""
+    if services:
+        # Name the single most identifying service rather than listing ports.
+        primary = next(
+            (s for s in services if s["port"] in (8123, 32400, 8096, 9100, 631, 445, 5001, 8006, 1883, 554)),
+            services[0],
+        )
+        hint = f" Erreichbar ist unter anderem {primary['service']} — {primary['explanation'][0].lower()}{primary['explanation'][1:]}."
+
+    docker = (system.get("extra") or {}).get("docker") or {}
+    if docker.get("image"):
+        hint = f" Läuft als Container aus dem Image `{docker['image']}`." + hint
+
+    if not base and not hint:
+        return ""
+    return (base + hint).strip()
+
+
 def _fmt_date(value: str | None) -> str:
     if not value:
         return "-"
@@ -170,10 +227,9 @@ def _device_details(systems: list[dict]) -> str:
     parts: list[str] = []
     for s in systems:
         parts.append(f"### {s['name']}\n")
-        if s["descriptionMd"]:
-            parts.append(f"{s['descriptionMd']}\n")
-        elif s["purpose"]:
-            parts.append(f"{s['purpose']}\n")
+        description = describe_device(s)
+        if description:
+            parts.append(f"{description}\n")
 
         facts = []
         if s["ip"]:

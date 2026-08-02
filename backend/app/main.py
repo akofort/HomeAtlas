@@ -46,6 +46,7 @@ async def lifespan(_app: FastAPI):
             "unter Einstellungen -> Konto aendern.\n" + "=" * 72,
             os.environ.get("ADMIN_USERNAME", "admin"), generated,
         )
+    db.ensure_monitoring_for_critical()
     monitor_module.monitor.start()
     try:
         yield
@@ -307,6 +308,12 @@ async def delete_user(user_id: str, user: dict = Depends(require_admin)) -> dict
 # ---------------------------------------------------------------------------------------------
 
 _SECRET_SETTING_FIELDS = ("claudeApiKey", "openAiApiKey", "geminiApiKey", "deepseekApiKey", "ollamaApiKey")
+# Written encrypted, never returned. The client sends plaintext under the name without the `Enc`
+# suffix; an empty value means "keep what is stored", same rule as the account edit form.
+_ENCRYPTED_SETTING_FIELDS = {
+    "defaultCredentialSecret": "defaultCredentialSecretEnc",
+    "defaultCredentialPassphrase": "defaultCredentialPassphraseEnc",
+}
 _MASK = "********"
 
 
@@ -314,6 +321,10 @@ def _mask_settings(settings: dict) -> dict:
     masked = dict(settings)
     for field in _SECRET_SETTING_FIELDS:
         masked[field] = _MASK if settings.get(field) else ""
+    for plain, encrypted in _ENCRYPTED_SETTING_FIELDS.items():
+        # The ciphertext never leaves the server; the UI only learns whether something is stored.
+        masked.pop(encrypted, None)
+        masked[f"has{plain[0].upper()}{plain[1:]}"] = bool(settings.get(encrypted))
     return masked
 
 
@@ -324,6 +335,14 @@ def _unmask_patch(patch: dict, current: dict) -> dict:
     for field in _SECRET_SETTING_FIELDS:
         if cleaned.get(field) == _MASK:
             cleaned[field] = current.get(field, "")
+    for plain, encrypted in _ENCRYPTED_SETTING_FIELDS.items():
+        if plain in cleaned:
+            value = cleaned.pop(plain)
+            # Blank means "leave it alone" -- the form never receives the stored value, so treating
+            # it as "clear" would wipe the credential on every unrelated settings save.
+            if value:
+                cleaned[encrypted] = crypto.encrypt(value)
+        cleaned.pop(f"has{plain[0].upper()}{plain[1:]}", None)
     return cleaned
 
 
@@ -393,7 +412,8 @@ async def list_systems(kind: str | None = None, _: dict = Depends(current_user))
     for account in db.list_accounts():
         if account["systemId"]:
             accounts_by_system[account["systemId"]] = accounts_by_system.get(account["systemId"], 0) + 1
-    return {"systems": [{**s, "accountCount": accounts_by_system.get(s["id"], 0)} for s in systems],
+    return {"systems": [{**s, "accountCount": accounts_by_system.get(s["id"], 0),
+                         "description": docs.describe_device(s)} for s in systems],
             "kindLabels": docs.KIND_LABELS}
 
 
@@ -402,15 +422,19 @@ async def get_system(system_id: str, _: dict = Depends(current_user)) -> dict:
     system = db.get_system(system_id)
     if system is None:
         raise HTTPException(status_code=404, detail="Gerät nicht gefunden.")
-    accounts = [{k: v for k, v in a.items() if k != "secretEnc"} | {"hasSecret": bool(a["secretEnc"])}
-                for a in db.list_accounts(system_id)]
-    return {"system": system, "accounts": accounts}
+    accounts = [_public_account(a) for a in db.list_accounts(system_id)]
+    return {"system": system, "accounts": accounts,
+            # Derived rather than stored, so it stays correct as the device's data fills in.
+            "description": docs.describe_device(system),
+            "monitorPortsEffective": monitor_module.effective_ports(system)[0]}
 
 
 @app.post("/api/systems")
 async def create_system(body: dict = Body(...), _: dict = Depends(require_admin)) -> dict:
     # confirmed=1: anything a human typed is protected from being overwritten by the next scan.
-    return {"system": db.create_system({**body, "confirmed": 1, "discovered": 0})}
+    system = db.create_system({**body, "confirmed": 1, "discovered": 0})
+    db.ensure_monitoring_for_critical()
+    return {"system": db.get_system(system["id"])}
 
 
 @app.patch("/api/systems/{system_id}")
@@ -418,7 +442,10 @@ async def update_system(system_id: str, patch: dict = Body(...), _: dict = Depen
     system = db.update_system(system_id, {**patch, "confirmed": 1})
     if system is None:
         raise HTTPException(status_code=404, detail="Gerät nicht gefunden.")
-    return {"system": system}
+    # Marking something critical in the UI has to start the monitoring right away, not at the next
+    # scan -- that gap is why the dashboard used to show "unbekannt" for the important devices.
+    db.ensure_monitoring_for_critical()
+    return {"system": db.get_system(system_id)}
 
 
 @app.delete("/api/systems/{system_id}")
@@ -736,7 +763,8 @@ async def monitor_status(_: dict = Depends(current_user)) -> dict:
         "systems": [
             {"id": s["id"], "name": s["name"], "ip": s["ip"], "kind": s["kind"],
              "status": s["status"], "importance": s["importance"], "lastSeen": s["lastSeen"],
-             "ports": monitor_module.effective_ports(s)}
+             "ports": monitor_module.effective_ports(s)[0],
+             "portsExplicit": monitor_module.effective_ports(s)[1]}
             for s in systems
         ],
         "events": db.list_monitor_events(limit=50),
@@ -782,7 +810,12 @@ async def dashboard(_: dict = Depends(current_user)) -> dict:
         },
         "byKind": {k: sum(1 for s in systems if s["kind"] == k) for k in sorted({s["kind"] for s in systems})},
         "kindLabels": docs.KIND_LABELS,
-        "criticalSystems": [s for s in systems if s["importance"] == "critical"][:8],
+        "criticalSystems": [
+            {**s, "monitorPortsEffective": monitor_module.effective_ports(s)[0]}
+            for s in systems if s["importance"] == "critical"
+        ][:8],
+        "monitorIntervalSeconds": settings.get("monitorIntervalSeconds", 10),
+        "monitorEnabled": settings.get("monitorEnabled", True),
         "recentlyChanged": sorted(systems, key=lambda s: s["updatedAt"], reverse=True)[:8],
         "lastScan": scan,
         "llmConfigured": provider == "OLLAMA" or bool(llm_providers.api_key_for(provider, settings)),

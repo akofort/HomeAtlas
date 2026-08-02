@@ -14,7 +14,7 @@ const BASE_URL_FIELD: Record<string, string> = {
   CLAUDE: "claudeBaseUrl", OPENAI: "openAiBaseUrl", DEEPSEEK: "deepseekBaseUrl", OLLAMA: "ollamaBaseUrl",
 };
 
-type Tab = "general" | "llm" | "scan" | "account" | "about";
+type Tab = "general" | "llm" | "scan" | "monitor" | "account" | "about";
 
 export default function SettingsPage() {
   const { isAdmin, user } = useAuth();
@@ -87,7 +87,7 @@ export default function SettingsPage() {
 
   const TABS: [Tab, string][] = isAdmin
     ? [["general", "Allgemein"], ["llm", "KI-Assistent"], ["scan", "Netzwerk-Scan"],
-       ["account", "Konto"], ["about", "Über"]]
+       ["monitor", "Überwachung"], ["account", "Konto"], ["about", "Über"]]
     : [["account", "Konto"], ["about", "Über"]];
 
   return (
@@ -288,6 +288,82 @@ export default function SettingsPage() {
       )}
 
       {tab === "scan" && isAdmin && (
+        <div className="card">
+          <h2>Standard-Zugang für die Geräteabfrage</h2>
+          <p className="muted" style={{ marginTop: -6 }}>
+            Wird nur bei Geräten benutzt, für die <em>kein eigener</em> Zugang hinterlegt ist —
+            praktisch, wenn auf allen Servern derselbe Wartungszugang existiert.
+          </p>
+          <div className="notice info">
+            Aus gutem Grund eng begrenzt: der Zugang wird nur bei Servern, NAS, VMs und PCs
+            versucht, und nur wenn der passende Port beim Scan offen war. Router und unbekannte
+            Geräte bleiben außen vor — dort richtet ein fehlgeschlagener Anmeldeversuch am ehesten
+            Schaden an (manche sperren das Konto nach mehreren Fehlversuchen).
+          </div>
+
+          <label className="row" style={{ cursor: "pointer", fontWeight: 400, color: "var(--text)", marginBottom: 12 }}>
+            <input type="checkbox" style={{ width: "auto" }} checked={form.defaultCredentialEnabled ?? false}
+                   onChange={(e) => set("defaultCredentialEnabled", e.target.checked)} />
+            Standard-Zugang verwenden
+          </label>
+
+          {form.defaultCredentialEnabled && (
+            <div className="grid cols-2">
+              <div className="field">
+                <label>Benutzername</label>
+                <input placeholder="z. B. root" value={form.defaultCredentialUsername ?? ""}
+                       autoComplete="off"
+                       onChange={(e) => set("defaultCredentialUsername", e.target.value)} />
+              </div>
+              <div className="field">
+                <label>Port (optional)</label>
+                <input type="number" min={0} max={65535} placeholder="Standard: 22"
+                       value={form.defaultCredentialPort || ""}
+                       onChange={(e) => set("defaultCredentialPort", Number(e.target.value))} />
+              </div>
+              <div className="field" style={{ gridColumn: "1 / -1" }}>
+                <label className="row" style={{ cursor: "pointer", fontWeight: 400, color: "var(--text)" }}>
+                  <input type="checkbox" style={{ width: "auto" }} checked={form.defaultCredentialIsKey ?? false}
+                         onChange={(e) => set("defaultCredentialIsKey", e.target.checked)} />
+                  Es handelt sich um einen SSH-Schlüssel (statt eines Passworts)
+                </label>
+              </div>
+              <div className="field" style={{ gridColumn: "1 / -1" }}>
+                <label>{form.defaultCredentialIsKey ? "Privater SSH-Schlüssel" : "Passwort"}</label>
+                {form.defaultCredentialIsKey ? (
+                  <textarea style={{ minHeight: 130 }} spellCheck={false}
+                            placeholder={form.hasDefaultCredentialSecret ? "unverändert lassen" : "-----BEGIN OPENSSH PRIVATE KEY-----"}
+                            value={form.defaultCredentialSecret ?? ""}
+                            onChange={(e) => set("defaultCredentialSecret", e.target.value)} />
+                ) : (
+                  <input type="password" autoComplete="new-password"
+                         placeholder={form.hasDefaultCredentialSecret ? "unverändert lassen" : ""}
+                         value={form.defaultCredentialSecret ?? ""}
+                         onChange={(e) => set("defaultCredentialSecret", e.target.value)} />
+                )}
+                <div className="field-hint">
+                  {form.hasDefaultCredentialSecret
+                    ? "Es ist etwas hinterlegt. Leer lassen, um es beizubehalten."
+                    : "Wird verschlüsselt gespeichert und nie zurückgegeben."}
+                </div>
+              </div>
+              {form.defaultCredentialIsKey && (
+                <div className="field">
+                  <label>Passphrase des Schlüssels (falls vorhanden)</label>
+                  <input type="password" autoComplete="new-password"
+                         placeholder={form.hasDefaultCredentialPassphrase ? "unverändert lassen" : ""}
+                         value={form.defaultCredentialPassphrase ?? ""}
+                         onChange={(e) => set("defaultCredentialPassphrase", e.target.value)} />
+                </div>
+              )}
+            </div>
+          )}
+
+          <button onClick={() => void save(form)} disabled={busy !== ""}>Speichern</button>
+        </div>
+      )}
+
+      {tab === "monitor" && isAdmin && (
         <div className="card">
           <h2>Dauerüberwachung</h2>
           <p className="muted" style={{ marginTop: -6 }}>

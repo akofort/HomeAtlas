@@ -56,11 +56,19 @@ async def _probe_with_credentials(log) -> tuple[int, list[str]]:
     """
     warnings: list[str] = []
     probed = 0
+    settings = db.get_settings()
+    used_fallback = 0
 
     for system in db.list_systems():
         accounts = db.list_probe_accounts(system["id"])
         if not accounts:
-            continue
+            # Only where nothing device-specific is stored, and only where probe_auth's guardrails
+            # allow it (right kind of device, matching port actually open).
+            fallback = probe_auth.fallback_account(settings, system)
+            if fallback is None:
+                continue
+            accounts = [fallback]
+            used_fallback += 1
         try:
             outcome = await probe_auth.probe_system(system, accounts)
         except Exception as exc:  # noqa: BLE001 -- one unreachable device must not end the scan
@@ -90,6 +98,8 @@ async def _probe_with_credentials(log) -> tuple[int, list[str]]:
         probed += 1
         log(f"Abgefragt: {system['name']} ({', '.join(outcome['results'])})")
 
+    if used_fallback:
+        log(f"Standard-Zugang bei {used_fallback} Gerät(en) ohne eigenen Zugang versucht")
     return probed, warnings
 
 

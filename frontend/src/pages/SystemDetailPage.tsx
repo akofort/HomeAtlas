@@ -14,6 +14,8 @@ export default function SystemDetailPage() {
   const navigate = useNavigate();
   const { isAdmin } = useAuth();
   const [system, setSystem] = useState<System | null>(null);
+  const [derived, setDerived] = useState("");
+  const [monitorPorts, setMonitorPorts] = useState<number[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [draft, setDraft] = useState<Partial<System>>({});
   const [editing, setEditing] = useState(false);
@@ -29,6 +31,8 @@ export default function SystemDetailPage() {
       .then((r) => {
         setSystem(r.system);
         setAccounts(r.accounts);
+        setDerived(r.description);
+        setMonitorPorts(r.monitorPortsEffective);
       })
       .catch((e) => setError(e.message));
   }, [id]);
@@ -100,7 +104,11 @@ export default function SystemDetailPage() {
               {system.status === "online" ? "erreichbar" : system.status === "offline" ? "nicht erreichbar" : "Zustand unbekannt"}
             </span>
             {system.importance === "critical" && <span className="badge warn">kritisch fürs Haus</span>}
-            {system.monitored === 1 && <span className="badge">dauerhaft überwacht</span>}
+            {system.monitored === 1 && (
+              <span className="badge" title={monitorPorts.length > 0 ? `Geprüft wird Port ${monitorPorts.join(", ")}` : "Geprüft wird per Ping"}>
+                überwacht · {monitorPorts.length > 0 ? `Port ${monitorPorts.join(", ")}` : "Ping"}
+              </span>
+            )}
             {system.discovered === 1 && <span className="badge">automatisch gefunden</span>}
             {system.url && (
               <a className="badge" href={system.url} target="_blank" rel="noreferrer">Weboberfläche öffnen ↗</a>
@@ -210,6 +218,14 @@ export default function SystemDetailPage() {
             <h2>Beschreibung</h2>
             {system.descriptionMd ? (
               <Markdown>{system.descriptionMd}</Markdown>
+            ) : derived ? (
+              <>
+                <Markdown>{derived}</Markdown>
+                <p className="field-hint" style={{ marginTop: 10 }}>
+                  Aus Gerätetyp und gefundenen Diensten abgeleitet. Über „Bearbeiten" lässt sich eine
+                  eigene Beschreibung hinterlegen, die dann Vorrang hat.
+                </p>
+              </>
             ) : (
               <p className="muted">Noch keine Beschreibung. Ein Netzwerk-Scan mit KI-Unterstützung ergänzt sie automatisch.</p>
             )}

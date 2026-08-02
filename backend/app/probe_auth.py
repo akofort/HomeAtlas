@@ -283,6 +283,45 @@ def _derive_purpose(results: dict) -> str:
     return ""
 
 
+def fallback_account(settings: dict, system: dict) -> dict | None:
+    """The configured default credential, as an account-shaped dict -- or None if it must not be
+    used for this device.
+
+    Guardrails, because unlike a per-device credential this one gets offered to many machines:
+
+    * Off unless explicitly enabled, and skipped entirely for any device that already has its own
+      credential (the caller checks that).
+    * Only offered where the matching service is actually open: SSH needs port 22 (or the
+      configured one) in the scan results. Without that check this would be credential spraying
+      across the whole subnet, and repeated failures can lock accounts out on some devices.
+    * Never used against a router or an unidentified device -- those are the ones most likely to
+      lock out or alarm, and least likely to share a household SSH login.
+    """
+    if not settings.get("defaultCredentialEnabled"):
+        return None
+    secret = settings.get("defaultCredentialSecretEnc") or ""
+    if not secret:
+        return None
+    if system.get("kind") not in ("server", "nas", "vm", "pc", "container"):
+        return None
+
+    port = int(settings.get("defaultCredentialPort") or 0) or 22
+    if port not in (system.get("openPorts") or []):
+        return None
+
+    return {
+        "id": "__default__",
+        "label": "Standard-Zugang",
+        "category": "sshkey" if settings.get("defaultCredentialIsKey") else "login",
+        "username": settings.get("defaultCredentialUsername") or "root",
+        "secretEnc": secret,
+        "passphraseEnc": settings.get("defaultCredentialPassphraseEnc") or "",
+        "url": "",
+        "port": port,
+        "allowProbe": 1,
+    }
+
+
 async def probe_system(system: dict, accounts: list[dict]) -> dict:
     """Runs every applicable probe for one device. `accounts` must already be filtered to
     credentials cleared for probing."""
