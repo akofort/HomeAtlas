@@ -16,6 +16,7 @@ export default function DocsPage() {
   const [error, setError] = useState("");
   const [versions, setVersions] = useState<DocVersion[] | null>(null);
   const [preview, setPreview] = useState<DocVersion | null>(null);
+  const [manualDraft, setManualDraft] = useState<string | null>(null);
 
   useEffect(() => {
     api.listDocs().then((r) => setPages(r.pages)).catch((e) => setError(e.message));
@@ -29,6 +30,7 @@ export default function DocsPage() {
     setEditing(false);
     setVersions(null);
     setPreview(null);
+    setManualDraft(null);
     api.getDoc(slug).then((r) => setPage(r.page)).catch((e) => setError(e.message));
   }, [slug]);
 
@@ -92,6 +94,19 @@ export default function DocsPage() {
     try {
       setPage((await api.saveDoc(slug, draft)).page);
       setEditing(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveManual() {
+    if (!slug || manualDraft === null) return;
+    setBusy(true);
+    try {
+      setPage((await api.saveDocManual(slug, manualDraft)).page);
+      setManualDraft(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -234,6 +249,66 @@ export default function DocsPage() {
                 </div>
               )}
 
+              {!preview && !editing && (manualDraft !== null || page.manualMd?.trim() || isAdmin) && (
+                <div
+                  className="card"
+                  style={{
+                    background: "var(--bg)",
+                    borderLeft: "3px solid var(--accent-strong)",
+                    marginBottom: 20,
+                  }}
+                >
+                  <div className="row" style={{ justifyContent: "space-between", marginBottom: 10 }}>
+                    <h3 style={{ margin: 0 }}>Eigene Notizen</h3>
+                    {isAdmin && (
+                      manualDraft === null ? (
+                        <button className="secondary small" onClick={() => setManualDraft(page.manualMd ?? "")}>
+                          {page.manualMd?.trim() ? "Bearbeiten" : "Notiz hinzufügen"}
+                        </button>
+                      ) : (
+                        <div className="row">
+                          <button className="small" onClick={() => void saveManual()} disabled={busy}>
+                            Speichern
+                          </button>
+                          <button className="secondary small" onClick={() => setManualDraft(null)}>
+                            Abbrechen
+                          </button>
+                        </div>
+                      )
+                    )}
+                  </div>
+
+                  {manualDraft !== null ? (
+                    <>
+                      <div className="notice info">
+                        Dieser Teil gehört dir. Er wird von HomeAtlas <strong>nie</strong> automatisch
+                        geändert oder überschrieben — auch nicht beim Neuerzeugen der Dokumentation.
+                        Alles darunter bleibt dagegen automatisch aktuell.
+                      </div>
+                      <textarea
+                        style={{ minHeight: 220 }}
+                        autoFocus
+                        placeholder={
+                          "z. B.\n\n- Sicherung für den Serverschrank: Keller, Kasten links, F3\n" +
+                          "- Nach Stromausfall braucht der Switch ~5 Minuten, bevor WLAN wieder geht\n" +
+                          "- Wartungsvertrag Heizung: Firma Meier, 0123 456789"
+                        }
+                        value={manualDraft}
+                        onChange={(e) => setManualDraft(e.target.value)}
+                      />
+                    </>
+                  ) : page.manualMd?.trim() ? (
+                    <Markdown>{page.manualMd}</Markdown>
+                  ) : (
+                    <p className="muted" style={{ margin: 0 }}>
+                      Noch keine eigenen Notizen zu diesem Kapitel. Was hier steht, bleibt dauerhaft
+                      erhalten — Sicherungskästen, Standorte, Ansprechpartner, Eigenheiten, die kein
+                      Scan finden kann.
+                    </p>
+                  )}
+                </div>
+              )}
+
               {preview ? (
                 <>
                   <div className="notice info">
@@ -241,13 +316,22 @@ export default function DocsPage() {
                     Dies ist nur eine Ansicht — die Seite selbst ist unverändert.{" "}
                     <button className="secondary small" onClick={() => setPreview(null)}>Zurück zum aktuellen Stand</button>
                   </div>
+                  {preview.manualMd?.trim() && (
+                    <div className="card" style={{ background: "var(--bg)", borderLeft: "3px solid var(--border)" }}>
+                      <h3 style={{ marginTop: 0 }}>Eigene Notizen (damaliger Stand)</h3>
+                      <Markdown>{preview.manualMd}</Markdown>
+                    </div>
+                  )}
                   <Markdown>{preview.bodyMd ?? ""}</Markdown>
                 </>
               ) : editing ? (
                 <>
                   <div className="notice info">
-                    Sobald du eine Seite von Hand speicherst, wird sie beim nächsten automatischen Lauf
-                    nicht mehr überschrieben. Der bisherige Text bleibt im Verlauf erhalten.
+                    Du bearbeitest hier den <strong>automatisch erzeugten</strong> Teil. Sobald du ihn
+                    von Hand speicherst, wird die ganze Seite beim nächsten Lauf nicht mehr
+                    aktualisiert — Gerätetabellen bleiben dann auf diesem Stand stehen. Für dauerhafte
+                    Ergänzungen sind meist die <strong>eigenen Notizen</strong> die bessere Wahl: die
+                    bleiben erhalten, während der Rest aktuell bleibt.
                   </div>
                   <textarea style={{ minHeight: 480 }} value={draft} onChange={(e) => setDraft(e.target.value)} />
                 </>

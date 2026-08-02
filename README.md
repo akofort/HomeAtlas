@@ -96,9 +96,26 @@ Das legt den Benutzer auch neu als Administrator an, falls gar keiner mehr exist
 
 Von Hand gepflegte Angaben sind ab dem Moment geschützt, in dem du sie speicherst: der nächste
 Scan aktualisiert nur noch die veränderlichen Fakten (IP, Zustand, offene Ports) und lässt Name,
-Standort und Beschreibung unangetastet. Gleiches gilt für Doku-Seiten — eine von Hand bearbeitete
-Seite wird nicht mehr überschrieben (in der Oberfläche als *von Hand bearbeitet* markiert; über
-*Neu erzeugen* lässt sich das zurücknehmen).
+Standort und Beschreibung unangetastet.
+
+### Eigene Notizen je Kapitel
+
+Jedes Doku-Kapitel hat einen festen Bereich, den die Generierung **nie** anfasst — für alles, was
+kein Scan herausfinden kann: wo die Sicherung für den Serverschrank sitzt, dass der Switch nach
+einem Stromausfall fünf Minuten braucht, wer den Wartungsvertrag für die Heizung hat.
+
+Der Bereich liegt technisch in einer eigenen Spalte, nicht als markierter Abschnitt im erzeugten
+Text. Dadurch kann eine Neuerzeugung ihn gar nicht erst beschädigen, statt sich darauf zu
+verlassen, dass ein Parser ihn jedes Mal korrekt wiederfindet. Beides bleibt unabhängig: die
+Notiz steht dauerhaft, während Gerätetabellen und Beschreibungen weiter automatisch aktuell
+bleiben.
+
+Der KI-Assistent bekommt diesen Teil getrennt und ausdrücklich als verlässlicher gekennzeichnet —
+was Bewohner über ihr eigenes Haus aufschreiben, wiegt schwerer als jede Scan-Schlussfolgerung.
+
+Wer stattdessen eine **ganze** Seite selbst schreiben will, kann das weiterhin tun; sie wird dann
+als *von Hand bearbeitet* markiert und gar nicht mehr aktualisiert (über *Neu erzeugen*
+zurücknehmbar). Für dauerhafte Ergänzungen sind die eigenen Notizen aber meist die bessere Wahl.
 
 ---
 

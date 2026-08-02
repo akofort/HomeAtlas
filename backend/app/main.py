@@ -372,6 +372,15 @@ async def edit_doc(slug: str, body: dict = Body(...), _: dict = Depends(require_
     return {"page": page}
 
 
+@app.put("/api/docs/{slug}/manual")
+async def edit_doc_manual(slug: str, body: dict = Body(...), _: dict = Depends(require_admin)) -> dict:
+    """The household's own notes for a chapter. Kept apart from the generated body so a scan can
+    keep refreshing the device tables while this text stays exactly as written."""
+    if db.get_doc_page(slug) is None:
+        raise HTTPException(status_code=404, detail="Kapitel nicht gefunden.")
+    return {"page": db.set_doc_page_manual(slug, body.get("manualMd", ""))}
+
+
 @app.post("/api/docs/{slug}/reset")
 async def reset_doc(slug: str, _: dict = Depends(require_admin)) -> dict:
     db.reset_doc_page(slug)

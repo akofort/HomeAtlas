@@ -163,6 +163,7 @@ CREATE TABLE IF NOT EXISTS docPageVersions (
     slug TEXT NOT NULL,
     title TEXT NOT NULL,
     bodyMd TEXT NOT NULL,
+    manualMd TEXT NOT NULL DEFAULT '',
     generated INTEGER NOT NULL DEFAULT 1,
     reason TEXT NOT NULL DEFAULT '',
     createdAt TEXT NOT NULL
@@ -175,6 +176,10 @@ CREATE TABLE IF NOT EXISTS docPages (
     topic TEXT NOT NULL,
     title TEXT NOT NULL,
     bodyMd TEXT NOT NULL DEFAULT '',
+    -- The household's own notes for this chapter. Held in its own column rather than as a marked
+    -- region inside bodyMd: generation then cannot damage it by construction, instead of relying
+    -- on a parser to find and re-splice a block every time the layout changes.
+    manualMd TEXT NOT NULL DEFAULT '',
     intro TEXT NOT NULL DEFAULT '',
     generated INTEGER NOT NULL DEFAULT 1,
     sortOrder INTEGER NOT NULL DEFAULT 0,
@@ -225,6 +230,8 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("accounts", "passphraseEnc", "TEXT NOT NULL DEFAULT ''"),
     ("accounts", "allowProbe", "INTEGER NOT NULL DEFAULT 0"),
     ("accounts", "port", "INTEGER NOT NULL DEFAULT 0"),
+    ("docPages", "manualMd", "TEXT NOT NULL DEFAULT ''"),
+    ("docPageVersions", "manualMd", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -603,13 +610,14 @@ def snapshot_doc_page(slug: str, reason: str) -> None:
     """Records the CURRENT content before it is replaced. Called by every writer -- a snapshot
     taken after the write would store the new text and lose exactly what it was meant to keep."""
     page = get_doc_page(slug)
-    if page is None or not page["bodyMd"].strip():
+    if page is None or not (page["bodyMd"].strip() or (page["manualMd"] or "").strip()):
         return
     with _conn() as conn:
         conn.execute(
-            "INSERT INTO docPageVersions(id, slug, title, bodyMd, generated, reason, createdAt) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (_new_id(), slug, page["title"], page["bodyMd"], page["generated"], reason, _now()),
+            "INSERT INTO docPageVersions(id, slug, title, bodyMd, manualMd, generated, reason, createdAt) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (_new_id(), slug, page["title"], page["bodyMd"], page["manualMd"] or "",
+             page["generated"], reason, _now()),
         )
         # Unbounded history would grow by a full copy of every chapter on every scan.
         conn.execute(
@@ -643,10 +651,24 @@ def restore_doc_version(version_id: str) -> dict | None:
     snapshot_doc_page(version["slug"], "vor Wiederherstellung")
     with _conn() as conn:
         conn.execute(
-            "UPDATE docPages SET bodyMd = ?, generated = 0, updatedAt = ? WHERE slug = ?",
-            (version["bodyMd"], _now(), version["slug"]),
+            "UPDATE docPages SET bodyMd = ?, manualMd = ?, generated = 0, updatedAt = ? WHERE slug = ?",
+            (version["bodyMd"], version["manualMd"] or "", _now(), version["slug"]),
         )
     return get_doc_page(version["slug"])
+
+
+def set_doc_page_manual(slug: str, manual_md: str) -> dict | None:
+    """Writes the household's own notes for a chapter.
+
+    Deliberately does NOT touch `generated`: the notes and the auto-written body are independent.
+    Someone should be able to add a permanent note to a chapter and still receive updated device
+    tables on the next scan -- pinning the whole page for that would defeat the point.
+    """
+    snapshot_doc_page(slug, "vor Änderung der eigenen Notizen")
+    with _conn() as conn:
+        conn.execute("UPDATE docPages SET manualMd = ?, updatedAt = ? WHERE slug = ?",
+                     (manual_md, _now(), slug))
+    return get_doc_page(slug)
 
 
 def upsert_doc_page(slug: str, topic: str, title: str, body_md: str, intro: str, sort_order: int, generated: bool = True) -> dict:

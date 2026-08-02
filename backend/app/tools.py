@@ -255,7 +255,8 @@ async def _dispatch(name: str, args: dict) -> object:
 
     if name == "list_documentation":
         return {"pages": [
-            {"slug": p["slug"], "title": p["title"], "topic": p["topic"], "intro": p["intro"]}
+            {"slug": p["slug"], "title": p["title"], "topic": p["topic"], "intro": p["intro"],
+             "hatEigeneNotizen": bool((p["manualMd"] or "").strip())}
             for p in db.list_doc_pages()
         ]}
 
@@ -263,7 +264,14 @@ async def _dispatch(name: str, args: dict) -> object:
         page = db.get_doc_page(args.get("slug", ""))
         if page is None:
             return {"error": f"Kein Kapitel mit dem Kürzel '{args.get('slug', '')}'."}
-        return {"slug": page["slug"], "title": page["title"], "bodyMd": page["bodyMd"]}
+        result = {"slug": page["slug"], "title": page["title"], "bodyMd": page["bodyMd"]}
+        # Surfaced separately and labelled: notes a human wrote about their own household are more
+        # authoritative than anything a scan concluded, and the assistant should treat them so.
+        if (page["manualMd"] or "").strip():
+            result["eigeneNotizen"] = page["manualMd"]
+            result["hinweis"] = ("'eigeneNotizen' stammt von den Bewohnern selbst und ist "
+                                 "verlässlicher als der automatisch erzeugte Teil.")
+        return result
 
     if name == "list_accounts":
         accounts = db.list_accounts(args.get("systemId") or None)

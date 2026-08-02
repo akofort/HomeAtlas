@@ -115,6 +115,7 @@ export interface DocVersion {
   createdAt: string;
   size: number;
   bodyMd?: string;
+  manualMd?: string;
 }
 
 export interface ProbeFact {
@@ -141,6 +142,8 @@ export interface DocPage {
   topic: string;
   title: string;
   bodyMd: string;
+  /** Own notes — never touched by generation. */
+  manualMd: string;
   intro: string;
   generated: number;
   sortOrder: number;
@@ -257,6 +260,8 @@ export const api = {
   listDocs: () => get<{ pages: Omit<DocPage, "bodyMd">[] }>("/docs"),
   getDoc: (slug: string) => get<{ page: DocPage }>(`/docs/${slug}`),
   saveDoc: (slug: string, bodyMd: string) => put<{ page: DocPage }>(`/docs/${slug}`, { bodyMd }),
+  saveDocManual: (slug: string, manualMd: string) =>
+    put<{ page: DocPage }>(`/docs/${slug}/manual`, { manualMd }),
   resetDoc: (slug: string) => post<{ page: DocPage }>(`/docs/${slug}/reset`),
   generateDocs: (useLlm: boolean) => post<{ generated: string[] }>("/docs/generate", { useLlm }),
   listDocVersions: (slug: string) => get<{ versions: DocVersion[] }>(`/docs/${slug}/versions`),
