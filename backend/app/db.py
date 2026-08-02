@@ -108,6 +108,9 @@ CREATE TABLE IF NOT EXISTS systems (
     purpose TEXT NOT NULL DEFAULT '',
     descriptionMd TEXT NOT NULL DEFAULT '',
     url TEXT NOT NULL DEFAULT '',
+    -- Link to the manufacturer's manual/support page for this exact model. Separate from `url`,
+    -- which is the device's own web interface -- when something is broken you often need both.
+    docUrl TEXT NOT NULL DEFAULT '',
     notes TEXT NOT NULL DEFAULT '',
     importance TEXT NOT NULL DEFAULT 'normal',
     parentId TEXT,
@@ -139,11 +142,32 @@ CREATE TABLE IF NOT EXISTS accounts (
     category TEXT NOT NULL DEFAULT 'login',
     username TEXT NOT NULL DEFAULT '',
     secretEnc TEXT NOT NULL DEFAULT '',
+    -- Passphrase for an SSH private key held in secretEnc, encrypted the same way.
+    passphraseEnc TEXT NOT NULL DEFAULT '',
     url TEXT NOT NULL DEFAULT '',
     notes TEXT NOT NULL DEFAULT '',
+    -- Opt-in, default off: may HomeAtlas use this credential to log in and read? Nothing is ever
+    -- used for authenticated probing unless a human explicitly ticks this per credential.
+    allowProbe INTEGER NOT NULL DEFAULT 0,
+    -- SSH port / target overrides for credentials whose device isn't on the default port.
+    port INTEGER NOT NULL DEFAULT 0,
     updatedAt TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_accounts_system ON accounts(systemId);
+
+-- Every version of every documentation page, so a regenerate is never destructive and older
+-- states stay reachable. Written before each change, not after -- a snapshot taken afterwards
+-- would already be the new text.
+CREATE TABLE IF NOT EXISTS docPageVersions (
+    id TEXT PRIMARY KEY,
+    slug TEXT NOT NULL,
+    title TEXT NOT NULL,
+    bodyMd TEXT NOT NULL,
+    generated INTEGER NOT NULL DEFAULT 1,
+    reason TEXT NOT NULL DEFAULT '',
+    createdAt TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_docversions_slug ON docPageVersions(slug, createdAt DESC);
 
 CREATE TABLE IF NOT EXISTS docPages (
     id TEXT PRIMARY KEY,
@@ -193,10 +217,25 @@ CREATE TABLE IF NOT EXISTS chatMessages (
 CREATE INDEX IF NOT EXISTS idx_chatmsg_chat ON chatMessages(chatId);
 """
 
+# Columns added after the first release. `CREATE TABLE IF NOT EXISTS` does nothing to a table that
+# already exists, so an installation that predates a column would keep the old shape and every
+# query naming it would fail -- these are applied explicitly on startup.
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("systems", "docUrl", "TEXT NOT NULL DEFAULT ''"),
+    ("accounts", "passphraseEnc", "TEXT NOT NULL DEFAULT ''"),
+    ("accounts", "allowProbe", "INTEGER NOT NULL DEFAULT 0"),
+    ("accounts", "port", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
 def init_db() -> None:
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     with _conn() as conn:
         conn.executescript(_SCHEMA)
+        for table, column, ddl in _ADDED_COLUMNS:
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 # --------------------------------------------------------------------------------------------
@@ -224,6 +263,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "scanEnableHttpBanner": True,
     "scanUseLlm": True,
     "scanExcludeIps": [],
+    # Individual hosts outside the scanned subnets -- a router on another segment, a VM behind a
+    # bridge. Addresses of hand-created devices are added automatically (see pipeline).
+    "scanExtraTargets": [],
+    "scanUseCredentials": True,
 }
 
 _SETTINGS_KEY = "app"
@@ -329,7 +372,7 @@ def delete_db_session(token: str) -> None:
 
 _SYSTEM_FIELDS = (
     "kind", "name", "hostname", "ip", "mac", "vendor", "model", "os", "location", "purpose",
-    "descriptionMd", "url", "notes", "importance", "parentId", "status", "discovered",
+    "descriptionMd", "url", "docUrl", "notes", "importance", "parentId", "status", "discovered",
     "confirmed", "discoverySource", "discoveryKey", "openPorts", "services", "tags", "extra",
 )
 
@@ -438,14 +481,17 @@ def upsert_discovered_system(found: dict) -> tuple[dict, bool]:
         "lastSeen": now,
     }
     if not existing["confirmed"]:
-        for field in ("kind", "name", "hostname", "mac", "vendor", "model", "os", "purpose", "descriptionMd", "url"):
+        for field in ("kind", "name", "hostname", "mac", "vendor", "model", "os", "location",
+                      "purpose", "descriptionMd", "url", "docUrl"):
             value = found.get(field)
             if value:
                 volatile[field] = value
     else:
-        # Even for confirmed rows, fill fields that are still empty -- adding a MAC or a vendor to
-        # a hand-created entry is strictly new information, not an overwrite.
-        for field in ("hostname", "mac", "vendor", "model", "os"):
+        # Even for confirmed rows, fill fields that are still empty -- adding a MAC, a vendor or a
+        # manufacturer manual to a hand-created entry is strictly new information, not an
+        # overwrite. `purpose` and `location` are included because a hand-created row usually has
+        # only a name, and filling the blanks is the whole point of a rescan.
+        for field in ("hostname", "mac", "vendor", "model", "os", "docUrl", "purpose", "location"):
             if found.get(field) and not existing.get(field):
                 volatile[field] = found[field]
     return update_system(existing["id"], volatile), False  # type: ignore[return-value]
@@ -487,27 +533,48 @@ def create_account(data: dict) -> dict:
     account_id = _new_id()
     with _conn() as conn:
         conn.execute(
-            "INSERT INTO accounts(id, systemId, label, category, username, secretEnc, url, notes, updatedAt) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO accounts(id, systemId, label, category, username, secretEnc, passphraseEnc, "
+            "url, notes, allowProbe, port, updatedAt) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 account_id, data.get("systemId") or None, data.get("label") or "Zugang",
                 data.get("category") or "login", data.get("username") or "", data.get("secretEnc") or "",
-                data.get("url") or "", data.get("notes") or "", _now(),
+                data.get("passphraseEnc") or "", data.get("url") or "", data.get("notes") or "",
+                1 if data.get("allowProbe") else 0, int(data.get("port") or 0), _now(),
             ),
         )
     return get_account(account_id)  # type: ignore[return-value]
 
 
 def update_account(account_id: str, patch: dict) -> dict | None:
-    allowed = ("systemId", "label", "category", "username", "secretEnc", "url", "notes")
+    allowed = ("systemId", "label", "category", "username", "secretEnc", "passphraseEnc",
+               "url", "notes", "allowProbe", "port")
     fields = [f for f in allowed if f in patch]
     if not fields:
         return get_account(account_id)
     assignments = ", ".join(f"{f} = ?" for f in fields)
-    values = [patch[f] if f != "systemId" else (patch[f] or None) for f in fields]
+
+    def coerce(field: str):
+        if field == "systemId":
+            return patch[field] or None
+        if field == "allowProbe":
+            return 1 if patch[field] else 0
+        if field == "port":
+            return int(patch[field] or 0)
+        return patch[field]
+
+    values = [coerce(f) for f in fields]
     with _conn() as conn:
         conn.execute(f"UPDATE accounts SET {assignments}, updatedAt = ? WHERE id = ?", (*values, _now(), account_id))
     return get_account(account_id)
+
+
+def list_probe_accounts(system_id: str) -> list[dict]:
+    """Credentials a human explicitly cleared for authenticated read-only probing of this device."""
+    with _conn() as conn:
+        return _rows(conn.execute(
+            "SELECT * FROM accounts WHERE systemId = ? AND allowProbe = 1 ORDER BY category, label",
+            (system_id,),
+        ))
 
 
 def delete_account(account_id: str) -> None:
@@ -529,11 +596,66 @@ def get_doc_page(slug: str) -> dict | None:
         return _row(conn.execute("SELECT * FROM docPages WHERE slug = ?", (slug,)).fetchone())
 
 
+_DOC_VERSION_KEEP = 50
+
+
+def snapshot_doc_page(slug: str, reason: str) -> None:
+    """Records the CURRENT content before it is replaced. Called by every writer -- a snapshot
+    taken after the write would store the new text and lose exactly what it was meant to keep."""
+    page = get_doc_page(slug)
+    if page is None or not page["bodyMd"].strip():
+        return
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO docPageVersions(id, slug, title, bodyMd, generated, reason, createdAt) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (_new_id(), slug, page["title"], page["bodyMd"], page["generated"], reason, _now()),
+        )
+        # Unbounded history would grow by a full copy of every chapter on every scan.
+        conn.execute(
+            "DELETE FROM docPageVersions WHERE slug = ? AND id NOT IN "
+            "(SELECT id FROM docPageVersions WHERE slug = ? ORDER BY createdAt DESC, rowid DESC LIMIT ?)",
+            (slug, slug, _DOC_VERSION_KEEP),
+        )
+
+
+def list_doc_versions(slug: str) -> list[dict]:
+    with _conn() as conn:
+        return _rows(conn.execute(
+            "SELECT id, slug, title, generated, reason, createdAt, length(bodyMd) AS size "
+            "FROM docPageVersions WHERE slug = ? ORDER BY createdAt DESC, rowid DESC",
+            (slug,),
+        ))
+
+
+def get_doc_version(version_id: str) -> dict | None:
+    with _conn() as conn:
+        return _row(conn.execute("SELECT * FROM docPageVersions WHERE id = ?", (version_id,)).fetchone())
+
+
+def restore_doc_version(version_id: str) -> dict | None:
+    """Restoring is itself a change, so the state being replaced is snapshotted first -- an
+    accidental restore stays undoable. The page becomes `generated = 0`: a deliberately chosen old
+    text must not be overwritten by the next automatic run."""
+    version = get_doc_version(version_id)
+    if version is None:
+        return None
+    snapshot_doc_page(version["slug"], "vor Wiederherstellung")
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE docPages SET bodyMd = ?, generated = 0, updatedAt = ? WHERE slug = ?",
+            (version["bodyMd"], _now(), version["slug"]),
+        )
+    return get_doc_page(version["slug"])
+
+
 def upsert_doc_page(slug: str, topic: str, title: str, body_md: str, intro: str, sort_order: int, generated: bool = True) -> dict:
     """Regenerating documentation must not silently discard a page the user has rewritten -- a page
     with `generated = 0` keeps its body and only refreshes its title/intro metadata."""
     existing = get_doc_page(slug)
     now = _now()
+    if existing is not None and existing["generated"] and existing["bodyMd"] != body_md:
+        snapshot_doc_page(slug, "automatisch neu erzeugt")
     with _conn() as conn:
         if existing is None:
             conn.execute(
@@ -556,6 +678,7 @@ def upsert_doc_page(slug: str, topic: str, title: str, body_md: str, intro: str,
 
 def set_doc_page_body(slug: str, body_md: str) -> dict | None:
     """A manual edit pins the page (`generated = 0`) so the next auto-generation leaves it alone."""
+    snapshot_doc_page(slug, "vor manueller Bearbeitung")
     with _conn() as conn:
         conn.execute("UPDATE docPages SET bodyMd = ?, generated = 0, updatedAt = ? WHERE slug = ?", (body_md, _now(), slug))
     return get_doc_page(slug)

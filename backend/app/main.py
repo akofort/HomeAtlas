@@ -21,7 +21,8 @@ from contextlib import asynccontextmanager
 from fastapi import Body, Cookie, Depends, FastAPI, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
-from . import auth, crypto, db, diagnostics, docker_probe, docs, llm_providers, model_catalog, oui, pipeline, tools
+from . import (auth, crypto, db, diagnostics, docker_probe, docs, llm_providers, model_catalog,
+               oui, pipeline, probe_auth, tools)
 
 logger = logging.getLogger("homeatlas")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -288,12 +289,20 @@ class AccountBody(BaseModel):
     category: str = "login"
     username: str = ""
     secret: str = ""
+    passphrase: str = ""
     url: str = ""
     notes: str = ""
+    allowProbe: bool = False
+    port: int = 0
 
 
 def _public_account(account: dict) -> dict:
-    return {k: v for k, v in account.items() if k != "secretEnc"} | {"hasSecret": bool(account.get("secretEnc"))}
+    """Strips both encrypted blobs. `hasSecret`/`hasPassphrase` tell the UI whether something is
+    stored without ever shipping it."""
+    return {k: v for k, v in account.items() if k not in ("secretEnc", "passphraseEnc")} | {
+        "hasSecret": bool(account.get("secretEnc")),
+        "hasPassphrase": bool(account.get("passphraseEnc")),
+    }
 
 
 @app.get("/api/accounts")
@@ -303,18 +312,21 @@ async def list_accounts(_: dict = Depends(require_admin)) -> dict:
 
 @app.post("/api/accounts")
 async def create_account(body: AccountBody, _: dict = Depends(require_admin)) -> dict:
-    account = db.create_account({**body.model_dump(exclude={"secret"}),
-                                 "secretEnc": crypto.encrypt(body.secret)})
+    account = db.create_account({**body.model_dump(exclude={"secret", "passphrase"}),
+                                 "secretEnc": crypto.encrypt(body.secret),
+                                 "passphraseEnc": crypto.encrypt(body.passphrase)})
     return {"account": _public_account(account)}
 
 
 @app.patch("/api/accounts/{account_id}")
 async def update_account(account_id: str, body: AccountBody, _: dict = Depends(require_admin)) -> dict:
-    patch = body.model_dump(exclude={"secret"})
+    patch = body.model_dump(exclude={"secret", "passphrase"})
     # An empty secret means "leave it alone" -- the edit form never receives the stored value, so
     # treating blank as "clear it" would silently delete the password on every unrelated edit.
     if body.secret:
         patch["secretEnc"] = crypto.encrypt(body.secret)
+    if body.passphrase:
+        patch["passphraseEnc"] = crypto.encrypt(body.passphrase)
     account = db.update_account(account_id, patch)
     if account is None:
         raise HTTPException(status_code=404, detail="Zugang nicht gefunden.")
@@ -374,6 +386,53 @@ async def generate_docs(body: dict = Body(default={}), _: dict = Depends(require
     use_llm = body.get("useLlm", settings.get("scanUseLlm", True))
     slugs = await docs.generate(settings, use_llm=use_llm)
     return {"generated": slugs}
+
+
+@app.get("/api/docs/{slug}/versions")
+async def list_doc_versions(slug: str, _: dict = Depends(current_user)) -> dict:
+    return {"versions": db.list_doc_versions(slug)}
+
+
+@app.get("/api/docs/{slug}/versions/{version_id}")
+async def get_doc_version(slug: str, version_id: str, _: dict = Depends(current_user)) -> dict:
+    version = db.get_doc_version(version_id)
+    if version is None or version["slug"] != slug:
+        raise HTTPException(status_code=404, detail="Version nicht gefunden.")
+    return {"version": version}
+
+
+@app.post("/api/docs/{slug}/versions/{version_id}/restore")
+async def restore_doc_version(slug: str, version_id: str, _: dict = Depends(require_admin)) -> dict:
+    version = db.get_doc_version(version_id)
+    if version is None or version["slug"] != slug:
+        raise HTTPException(status_code=404, detail="Version nicht gefunden.")
+    page = db.restore_doc_version(version_id)
+    return {"page": page}
+
+
+# ---------------------------------------------------------------------------------------------
+# Authenticated probing (read-only -- see probe_auth)
+# ---------------------------------------------------------------------------------------------
+
+@app.post("/api/systems/{system_id}/probe")
+async def probe_system(system_id: str, _: dict = Depends(require_admin)) -> dict:
+    """Runs the read-only login probe for one device on demand, so the result is visible
+    immediately instead of only after the next full scan."""
+    system = db.get_system(system_id)
+    if system is None:
+        raise HTTPException(status_code=404, detail="Gerät nicht gefunden.")
+    accounts = db.list_probe_accounts(system_id)
+    if not accounts:
+        raise HTTPException(status_code=400, detail=(
+            "Für dieses Gerät ist kein Zugang freigegeben. Unter Zugänge beim gewünschten Eintrag "
+            "„Zum Auslesen verwenden“ aktivieren."
+        ))
+    outcome = await probe_auth.probe_system(system, accounts)
+    if outcome["ran"]:
+        db.update_system(system_id, {"extra": {**(system.get("extra") or {}), "probe": outcome["results"]}})
+        if outcome.get("purpose") and not system.get("purpose"):
+            db.update_system(system_id, {"purpose": outcome["purpose"]})
+    return {"outcome": outcome, "system": db.get_system(system_id)}
 
 
 # ---------------------------------------------------------------------------------------------

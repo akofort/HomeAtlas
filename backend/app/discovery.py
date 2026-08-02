@@ -30,7 +30,7 @@ from typing import Awaitable, Callable
 
 import httpx
 
-from . import oui, ports as port_catalog
+from . import oui, ports as port_catalog, vendor_docs
 
 ProgressFn = Callable[[str, int, str | None], None]
 
@@ -442,9 +442,14 @@ def _best_name(ip: str, hostname: str, mdns: list[dict], ssdp: list[dict], banne
     return ip
 
 
-def _guess(open_ports: list[int], mdns: list[dict], ssdp: list[dict], banner: dict, vendor: str) -> tuple[str, str, str]:
-    """Rule-based first guess of (kind, model, purpose). Runs before any LLM call so the app is
-    useful with no API key configured at all, and gives the LLM a baseline to correct."""
+def _guess(open_ports: list[int], mdns: list[dict], ssdp: list[dict], banner: dict,
+           vendor: str) -> tuple[str, str, str, bool]:
+    """Rule-based first guess of (kind, model, purpose, confident). Runs before any LLM call so the
+    app is useful with no API key configured at all, and gives the LLM a baseline to correct.
+
+    `confident` distinguishes a real identification from a filler string. Without it the LLM step
+    can't tell "this is a Sonos speaker" from "something answers on a port", and would either skip
+    devices that still need a real purpose or re-ask about ones already known."""
     text = " ".join([
         banner.get("title", ""), banner.get("server", ""), vendor,
         *(e.get("type", "") + " " + e.get("name", "") for e in mdns),
@@ -493,23 +498,30 @@ def _guess(open_ports: list[int], mdns: list[dict], ssdp: list[dict], banner: di
     ]
     for needles, kind, model_name, purpose in signatures:
         if any(needle in text for needle in needles):
-            return kind, model or model_name, purpose
+            return kind, model or model_name, purpose, True
 
     hint = port_catalog.hint_from_ports(open_ports)
     if hint:
         kind, model_name, purpose = hint
-        return kind, model or model_name, purpose
+        return kind, model or model_name, purpose, True
 
+    # Everything below is a placeholder, not an identification.
     if any(p in open_ports for p in (22, 3306, 5432, 2049)):
-        return "server", model, "Server oder Kleinrechner im Netzwerk"
+        return "server", model, "Server oder Kleinrechner im Netzwerk", False
     if open_ports:
-        return "other", model, "Gerät mit Netzwerkdiensten -- Art noch nicht bestimmt"
-    return "other", model, "Gerät antwortet im Netzwerk, verrät aber keine Details"
+        return "other", model, "Gerät mit Netzwerkdiensten -- Art noch nicht bestimmt", False
+    return "other", model, "Gerät antwortet im Netzwerk, verrät aber keine Details", False
 
 
-async def discover(settings: dict, progress: ProgressFn) -> dict:
+async def discover(settings: dict, progress: ProgressFn, extra_targets: list[str] | None = None) -> dict:
     """Runs the whole network side of a scan. Returns findings ready for the inventory plus the
-    raw context (gateway, DNS, Docker) the documentation generator needs."""
+    raw context (gateway, DNS, Docker) the documentation generator needs.
+
+    `extra_targets` are individual hosts probed regardless of the configured subnets -- a router on
+    a different segment (10.1.1.1 while the LAN is 192.168.1.0/24), a VM behind a bridge, anything
+    routed rather than local. They get the full treatment (ping, ports, reverse DNS, banner); only
+    the ARP lookup will come up empty for them, since they are not on this L2 segment.
+    """
     warnings: list[str] = []
     timeout_s = max(0.1, settings.get("scanTimeoutMs", 700) / 1000)
     concurrency = max(8, min(512, int(settings.get("scanConcurrency", 128))))
@@ -539,8 +551,27 @@ async def discover(settings: dict, progress: ProgressFn) -> dict:
             hosts = hosts[:_MAX_HOSTS_PER_SUBNET]
         addresses.extend(str(h) for h in hosts if str(h) not in excluded)
 
+    subnet_address_count = len(set(addresses))
+    routed: list[str] = []
+    for target in extra_targets or []:
+        target = target.strip()
+        if not target or target in excluded or target in addresses:
+            continue
+        # Hostnames are resolved here so the rest of the pipeline only ever deals with addresses.
+        if not re.match(r"^\d+\.\d+\.\d+\.\d+$", target):
+            try:
+                target = socket.gethostbyname(target)
+            except OSError:
+                warnings.append(f"'{target}' ließ sich nicht auflösen und wurde übersprungen.")
+                continue
+            if target in addresses:
+                continue
+        routed.append(target)
+        addresses.append(target)
+
     addresses = list(dict.fromkeys(addresses))
-    progress("Geräte suchen", 5, f"{len(addresses)} Adressen in {', '.join(subnets)}")
+    extra_note = f" + {len(routed)} Einzelziel(e) außerhalb" if routed else ""
+    progress("Geräte suchen", 5, f"{subnet_address_count} Adressen in {', '.join(subnets)}{extra_note}")
 
     # Phase 1 -- liveness. Multicast discovery runs concurrently: it listens for announcements
     # rather than polling, so it costs nothing to overlap with the sweep and saves ~10s.
@@ -604,8 +635,9 @@ async def discover(settings: dict, progress: ProgressFn) -> dict:
         banner = banners.get(ip, {})
         hostname = hostnames.get(ip, "")
 
-        kind, model, purpose = _guess(open_ports, device_mdns, device_ssdp, banner, vendor)
+        kind, model, purpose, confident = _guess(open_ports, device_mdns, device_ssdp, banner, vendor)
         if ip == gateway:
+            confident = True
             kind, purpose = "router", purpose if "Router" in purpose else "Internet-Router -- die Verbindung ins Internet läuft über dieses Gerät"
 
         sources = ["ping/arp"]
@@ -618,10 +650,16 @@ async def discover(settings: dict, progress: ProgressFn) -> dict:
         if banner:
             sources.append("http")
 
+        name = _best_name(ip, hostname, device_mdns, device_ssdp, banner, vendor)
+        # Curated manufacturer documentation, matched across everything known about the device.
+        # Anything not covered here is left to the LLM in classify.py, whose suggestions are
+        # link-checked before they are stored.
+        _, doc_url = vendor_docs.lookup(vendor, model, name, banner.get("title", ""), banner.get("server", ""))
+
         findings.append({
             "discoveryKey": f"mac:{mac}" if mac else f"ip:{ip}",
             "kind": kind,
-            "name": _best_name(ip, hostname, device_mdns, device_ssdp, banner, vendor),
+            "name": name,
             "hostname": hostname,
             "ip": ip,
             "mac": mac,
@@ -629,6 +667,7 @@ async def discover(settings: dict, progress: ProgressFn) -> dict:
             "model": model,
             "purpose": purpose,
             "url": banner.get("url", ""),
+            "docUrl": doc_url,
             "status": "online",
             "importance": "critical" if ip == gateway else "normal",
             "discovered": 1,
@@ -641,6 +680,8 @@ async def discover(settings: dict, progress: ProgressFn) -> dict:
                 "httpBanner": banner,
                 "randomizedMac": oui.is_locally_administered(mac),
                 "isGateway": ip == gateway,
+                "routedTarget": ip in routed,
+                "guessConfident": confident,
             },
         })
 
@@ -651,10 +692,12 @@ async def discover(settings: dict, progress: ProgressFn) -> dict:
         "dnsServers": dns_servers(),
         "hostIp": primary_ip(),
         "warnings": warnings,
+        "routedTargets": routed,
         "counts": {
             "addressesScanned": len(addresses),
             "devicesFound": len(findings),
             "withMdns": sum(1 for f in findings if f["extra"]["mdns"]),
             "withSsdp": sum(1 for f in findings if f["extra"]["ssdp"]),
+            "routedFound": sum(1 for f in findings if f["extra"]["routedTarget"]),
         },
     }

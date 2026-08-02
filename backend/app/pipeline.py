@@ -10,7 +10,87 @@ from __future__ import annotations
 
 import traceback
 
-from . import classify, db, discovery, docker_probe, docs, oui
+import ipaddress
+
+from . import classify, db, discovery, docker_probe, docs, oui, probe_auth
+
+
+def _extra_targets(settings: dict, subnets_hint: list[str]) -> list[str]:
+    """Hosts to probe that the subnet sweep would never reach.
+
+    Two sources. Explicitly configured targets (Einstellungen -> Netzwerk-Scan), and the addresses
+    of devices someone already entered by hand -- a router at 10.1.1.1 while the LAN is
+    192.168.1.0/24, or a VM behind a bridge. Without this, a hand-created entry could never be
+    enriched: it would sit in the inventory with a name and nothing else forever.
+    """
+    targets: list[str] = [t.strip() for t in (settings.get("scanExtraTargets") or []) if t.strip()]
+
+    networks = []
+    for subnet in subnets_hint:
+        try:
+            networks.append(ipaddress.ip_network(subnet, strict=False))
+        except ValueError:
+            continue
+
+    for system in db.list_systems():
+        address = (system.get("ip") or "").strip()
+        if not address or address in targets:
+            continue
+        try:
+            parsed = ipaddress.ip_address(address)
+        except ValueError:
+            continue
+        # Inside a scanned subnet it is covered already; outside it needs to be named explicitly.
+        if not any(parsed in network for network in networks):
+            targets.append(address)
+    return targets
+
+
+async def _probe_with_credentials(log) -> tuple[int, list[str]]:
+    """Logs into the devices whose stored credentials were explicitly cleared for it and records
+    what it read. Strictly read-only -- see probe_auth.
+
+    Facts learned here are written into `extra.probe` for display, and are additionally used to
+    fill `purpose`, `os` and `model` **only where those are still empty**. An authenticated read is
+    more authoritative than a port guess, but it must not overwrite what a human typed.
+    """
+    warnings: list[str] = []
+    probed = 0
+
+    for system in db.list_systems():
+        accounts = db.list_probe_accounts(system["id"])
+        if not accounts:
+            continue
+        try:
+            outcome = await probe_auth.probe_system(system, accounts)
+        except Exception as exc:  # noqa: BLE001 -- one unreachable device must not end the scan
+            warnings.append(f"Abfrage von {system['name']} fehlgeschlagen: {exc}")
+            continue
+
+        if not outcome["ran"]:
+            for label, result in (outcome.get("results") or {}).items():
+                if not result.get("ok") and result.get("error"):
+                    warnings.append(f"{system['name']} ({label}): {result['error']}")
+            continue
+
+        patch: dict = {"extra": {**(system.get("extra") or {}), "probe": outcome["results"]}}
+        if outcome.get("purpose") and not system.get("purpose"):
+            patch["purpose"] = outcome["purpose"]
+
+        facts = {key: value["value"] for result in outcome["results"].values() if result.get("ok")
+                 for key, value in result.get("facts", {}).items()}
+        if facts.get("os") and not system.get("os"):
+            patch["os"] = facts["os"].splitlines()[0][:120]
+        if facts.get("model") and not system.get("model"):
+            patch["model"] = facts["model"].strip()[:100]
+        if facts.get("modelName") and not system.get("model"):
+            patch["model"] = facts["modelName"].strip()[:100]
+
+        db.update_system(system["id"], patch)
+        probed += 1
+        log(f"Abgefragt: {system['name']} ({', '.join(outcome['results'])})")
+
+    return probed, warnings
 
 
 async def run_full_scan(scan_id: str) -> None:
@@ -34,7 +114,12 @@ async def run_full_scan(scan_id: str) -> None:
             if not ok:
                 warnings.append(f"Hersteller-Datenbank nicht geladen: {message}")
 
-        result = await discovery.discover(settings, progress)
+        configured_subnets = settings.get("scanSubnets") or discovery.local_subnets()
+        extra = _extra_targets(settings, configured_subnets)
+        if extra:
+            log(f"Zusätzliche Einzelziele außerhalb der Bereiche: {', '.join(extra[:10])}")
+
+        result = await discovery.discover(settings, progress, extra_targets=extra)
         findings = result["findings"]
         warnings += result["warnings"]
 
@@ -68,6 +153,14 @@ async def run_full_scan(scan_id: str) -> None:
         db.mark_systems_offline(seen_ids)
         log(f"Inventar: {created} neu, {updated} aktualisiert")
 
+        probed = 0
+        if settings.get("scanUseCredentials", True):
+            progress("Geräte mit hinterlegtem Zugang abfragen", 93, None)
+            probed, probe_warnings = await _probe_with_credentials(log)
+            warnings += probe_warnings
+        else:
+            log("Auslesen per Zugangsdaten ist in den Einstellungen abgeschaltet")
+
         progress("Dokumentation schreiben", 96, None)
         try:
             pages = await docs.generate(db.get_settings(), use_llm=settings.get("scanUseLlm", True), log=log)
@@ -80,6 +173,8 @@ async def run_full_scan(scan_id: str) -> None:
             "devicesFound": len(findings),
             "created": created,
             "updated": updated,
+            "probed": probed,
+            "routedTargets": result.get("routedTargets") or [],
             "subnets": result["subnets"],
             "gateway": result["gateway"],
             "dnsServers": result["dnsServers"],

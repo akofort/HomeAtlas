@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, type DocPage } from "../lib/api";
+import { api, type DocPage, type DocVersion } from "../lib/api";
 import { useAuth } from "../App";
 import Markdown from "../components/Markdown";
 
@@ -14,6 +14,8 @@ export default function DocsPage() {
   const [editing, setEditing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [versions, setVersions] = useState<DocVersion[] | null>(null);
+  const [preview, setPreview] = useState<DocVersion | null>(null);
 
   useEffect(() => {
     api.listDocs().then((r) => setPages(r.pages)).catch((e) => setError(e.message));
@@ -25,8 +27,49 @@ export default function DocsPage() {
       return;
     }
     setEditing(false);
+    setVersions(null);
+    setPreview(null);
     api.getDoc(slug).then((r) => setPage(r.page)).catch((e) => setError(e.message));
   }, [slug]);
+
+  async function toggleVersions() {
+    if (!slug) return;
+    if (versions) {
+      setVersions(null);
+      setPreview(null);
+      return;
+    }
+    try {
+      setVersions((await api.listDocVersions(slug)).versions);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function showVersion(version: DocVersion) {
+    if (!slug) return;
+    try {
+      setPreview((await api.getDocVersion(slug, version.id)).version);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function restoreVersion(version: DocVersion) {
+    if (!slug) return;
+    const when = new Date(version.createdAt).toLocaleString("de-DE");
+    if (!window.confirm(`Stand vom ${when} wiederherstellen? Der aktuelle Text wird vorher als Version gesichert.`)) return;
+    setBusy(true);
+    try {
+      setPage((await api.restoreDocVersion(slug, version.id)).page);
+      setVersions((await api.listDocVersions(slug)).versions);
+      setPreview(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function regenerate() {
     setBusy(true);
@@ -135,6 +178,9 @@ export default function DocsPage() {
                     {page.generated === 0 && <span className="badge warn">von Hand bearbeitet</span>}
                     {!editing ? (
                       <>
+                        <button className="secondary small" onClick={() => void toggleVersions()}>
+                          {versions ? "Verlauf schließen" : "Verlauf"}
+                        </button>
                         <button className="secondary small" onClick={() => { setDraft(page.bodyMd); setEditing(true); }}>
                           Bearbeiten
                         </button>
@@ -154,11 +200,54 @@ export default function DocsPage() {
                 )}
               </div>
 
-              {editing ? (
+              {versions && (
+                <div className="card" style={{ background: "var(--bg)" }}>
+                  <h3 style={{ marginTop: 0 }}>Verlauf dieser Seite</h3>
+                  {versions.length === 0 ? (
+                    <p className="muted" style={{ marginBottom: 0 }}>
+                      Noch keine früheren Stände. Ab der ersten Änderung wird jeder vorherige Text
+                      hier gesichert.
+                    </p>
+                  ) : (
+                    <div className="table-wrap">
+                      <table>
+                        <thead>
+                          <tr><th>Zeitpunkt</th><th>Anlass</th><th>Umfang</th><th /></tr>
+                        </thead>
+                        <tbody>
+                          {versions.map((v) => (
+                            <tr key={v.id}>
+                              <td>{new Date(v.createdAt).toLocaleString("de-DE")}</td>
+                              <td className="muted">{v.reason}</td>
+                              <td className="muted">{Math.round(v.size / 100) / 10} kB</td>
+                              <td style={{ whiteSpace: "nowrap", width: 1 }}>
+                                <button className="secondary small" onClick={() => void showVersion(v)}>Ansehen</button>{" "}
+                                <button className="secondary small" disabled={busy}
+                                        onClick={() => void restoreVersion(v)}>Wiederherstellen</button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {preview ? (
+                <>
+                  <div className="notice info">
+                    Alter Stand vom <strong>{new Date(preview.createdAt).toLocaleString("de-DE")}</strong> ({preview.reason}).
+                    Dies ist nur eine Ansicht — die Seite selbst ist unverändert.{" "}
+                    <button className="secondary small" onClick={() => setPreview(null)}>Zurück zum aktuellen Stand</button>
+                  </div>
+                  <Markdown>{preview.bodyMd ?? ""}</Markdown>
+                </>
+              ) : editing ? (
                 <>
                   <div className="notice info">
                     Sobald du eine Seite von Hand speicherst, wird sie beim nächsten automatischen Lauf
-                    nicht mehr überschrieben.
+                    nicht mehr überschrieben. Der bisherige Text bleibt im Verlauf erhalten.
                   </div>
                   <textarea style={{ minHeight: 480 }} value={draft} onChange={(e) => setDraft(e.target.value)} />
                 </>

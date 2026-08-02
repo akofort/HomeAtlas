@@ -14,10 +14,11 @@ Deliberately additive, never destructive:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 
-from . import llm_providers, prompts
+from . import llm_providers, prompts, vendor_docs
 
 # Small enough that one bad batch loses little work, large enough to amortize the prompt.
 _BATCH_SIZE = 10
@@ -30,16 +31,28 @@ _VALID_IMPORTANCE = {"critical", "normal", "low"}
 
 
 def needs_classification(finding: dict) -> bool:
-    """Only devices the rules couldn't place, and only if there is *something* to reason about.
-    A silent host with no ports, no name and no vendor gives the model nothing but its IP -- asking
-    anyway would invite a confident invention."""
-    if finding.get("kind") not in ("other", ""):
-        return False
+    """Which devices are worth an LLM call.
+
+    Requires evidence first: a silent host with no ports, no name and no vendor gives the model
+    nothing but an IP address, and asking anyway invites a confident invention.
+
+    Given evidence, a device qualifies if the rules couldn't place it, if their guess was only a
+    placeholder (`guessConfident`), or if it still lacks a purpose or a manufacturer link -- the
+    last two are what makes the inventory readable, so they are worth filling even for hardware
+    that was recognised.
+    """
     evidence = finding.get("extra") or {}
-    return bool(
+    has_evidence = bool(
         finding.get("openPorts") or finding.get("vendor") or finding.get("hostname")
         or evidence.get("mdns") or evidence.get("ssdp") or evidence.get("httpBanner")
     )
+    if not has_evidence:
+        return False
+    if finding.get("kind") in ("other", ""):
+        return True
+    if not evidence.get("guessConfident", True):
+        return True
+    return not finding.get("purpose") or not finding.get("docUrl")
 
 
 def _evidence_for(finding: dict) -> dict:
@@ -49,6 +62,10 @@ def _evidence_for(finding: dict) -> dict:
         "ip": finding.get("ip", ""),
         "hostname": finding.get("hostname", ""),
         "macVendor": finding.get("vendor", ""),
+        # What the rules already concluded. Given to the model so it corrects or completes rather
+        # than starting from scratch -- and so it can leave a confident identification alone.
+        "bisherigeEinordnung": finding.get("kind", ""),
+        "bisherigerZweck": finding.get("purpose", ""),
         "openPorts": [
             f"{s['port']} ({s['service']})" for s in (finding.get("services") or [])
         ][:20],
@@ -118,22 +135,54 @@ async def classify(findings: list[dict], settings: dict, log=None) -> tuple[dict
                 "model": str(entry.get("model") or "").strip()[:100],
                 "purpose": str(entry.get("purpose") or "").strip()[:200],
                 "descriptionMd": str(entry.get("description") or "").strip()[:800],
+                "docUrl": str(entry.get("docUrl") or "").strip()[:300],
                 "importance": importance,
                 "confidence": entry.get("confidence", "medium"),
             }
         if log:
             log(f"KI-Einordnung: {len(batch)} Geräte geprüft")
+
+    await _drop_dead_links(by_ip, warnings, log)
     return by_ip, warnings
+
+
+async def _drop_dead_links(by_ip: dict[str, dict], warnings: list[str], log) -> None:
+    """Checks every LLM-suggested documentation link and removes the ones that don't answer.
+
+    This is not optional politeness. A model asked for a manual URL produces a plausible, correctly
+    structured, frequently non-existent one, and the place those links surface is the chapter
+    someone reads while something is broken. A missing link is a small gap; a link that 404s costs
+    real time at the worst moment.
+    """
+    candidates = {ip: data["docUrl"] for ip, data in by_ip.items() if data.get("docUrl")}
+    if not candidates:
+        return
+    checks = await asyncio.gather(
+        *(vendor_docs.validate(url) for url in candidates.values()), return_exceptions=True
+    )
+    dropped = 0
+    for (ip, url), ok in zip(candidates.items(), checks):
+        if ok is not True:
+            by_ip[ip]["docUrl"] = ""
+            dropped += 1
+    if dropped:
+        message = f"{dropped} von {len(candidates)} vorgeschlagenen Hersteller-Links waren nicht erreichbar und wurden verworfen."
+        warnings.append(message)
+        if log:
+            log(message)
 
 
 def apply(finding: dict, classification: dict) -> dict:
     """Merges one classification into a finding. Empty strings from the model never overwrite a
     value the rules already found -- a blank answer is an absence of information, not a correction."""
     merged = dict(finding)
-    for field in ("kind", "name", "vendor", "model", "purpose", "descriptionMd", "importance"):
+    for field in ("kind", "name", "vendor", "model", "purpose", "descriptionMd", "importance", "docUrl"):
         value = classification.get(field)
         if value:
             merged[field] = value
+    # A curated link always beats a suggested one -- it was verified by a human, not by an HTTP 200.
+    if finding.get("docUrl"):
+        merged["docUrl"] = finding["docUrl"]
     merged["discoverySource"] = f"{finding.get('discoverySource', '')}+ki".strip("+")
     merged["extra"] = {**(finding.get("extra") or {}),
                        "aiConfidence": classification.get("confidence", "medium")}

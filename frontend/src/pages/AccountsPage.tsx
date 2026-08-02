@@ -5,6 +5,7 @@ import { api, type Account, type System } from "../lib/api";
 const CATEGORIES: [string, string][] = [
   ["contract", "Vertrag / Kundenkonto"],
   ["login", "Anmeldung an Gerät oder Dienst"],
+  ["sshkey", "SSH-Schlüssel"],
   ["wifi", "WLAN-Zugang"],
   ["apikey", "API-Schlüssel"],
   ["other", "Sonstiges"],
@@ -19,13 +20,16 @@ interface Draft {
   category: string;
   username: string;
   secret: string;
+  passphrase: string;
   url: string;
   notes: string;
+  allowProbe: boolean;
+  port: number;
 }
 
 const emptyDraft = (): Draft => ({
   id: null, systemId: "", label: "", category: "contract",
-  username: "", secret: "", url: "", notes: "",
+  username: "", secret: "", passphrase: "", url: "", notes: "", allowProbe: false, port: 0,
 });
 
 export default function AccountsPage() {
@@ -78,8 +82,11 @@ export default function AccountsPage() {
       // Never prefilled: the plaintext is fetched only on explicit "Anzeigen", and a blank field
       // means "leave the stored password alone" (see the backend's update_account).
       secret: "",
+      passphrase: "",
       url: account.url,
       notes: account.notes,
+      allowProbe: Boolean(account.allowProbe),
+      port: account.port ?? 0,
     });
   }
 
@@ -94,8 +101,11 @@ export default function AccountsPage() {
         category: draft.category,
         username: draft.username,
         secret: draft.secret,
+        passphrase: draft.passphrase,
         url: draft.url,
         notes: draft.notes,
+        allowProbe: draft.allowProbe,
+        port: Number(draft.port) || 0,
       };
       if (draft.id) {
         await api.updateAccount(draft.id, body);
@@ -183,28 +193,76 @@ export default function AccountsPage() {
               <input value={draft.username} autoComplete="off"
                      onChange={(e) => setDraft({ ...draft, username: e.target.value })} />
             </div>
-            <div className="field">
-              <label>Passwort</label>
-              <input type="password" autoComplete="new-password" value={draft.secret}
-                     placeholder={draft.id ? "unverändert lassen" : ""}
-                     onChange={(e) => setDraft({ ...draft, secret: e.target.value })} />
-              <div className="field-hint">
-                {draft.id
-                  ? "Leer lassen, um das gespeicherte Passwort beizubehalten."
-                  : "Wird verschlüsselt gespeichert."}
+            {draft.category === "sshkey" ? (
+              <>
+                <div className="field" style={{ gridColumn: "1 / -1" }}>
+                  <label>Privater SSH-Schlüssel</label>
+                  <textarea
+                    style={{ minHeight: 150 }}
+                    spellCheck={false}
+                    value={draft.secret}
+                    placeholder={draft.id
+                      ? "unverändert lassen"
+                      : "-----BEGIN OPENSSH PRIVATE KEY-----\n…\n-----END OPENSSH PRIVATE KEY-----"}
+                    onChange={(e) => setDraft({ ...draft, secret: e.target.value })}
+                  />
+                  <div className="field-hint">
+                    Der <strong>private</strong> Schlüssel, vollständig mit BEGIN- und END-Zeile.
+                    Wird verschlüsselt gespeichert.
+                  </div>
+                </div>
+                <div className="field">
+                  <label>Passphrase des Schlüssels (falls vorhanden)</label>
+                  <input type="password" autoComplete="new-password" value={draft.passphrase}
+                         placeholder={draft.id ? "unverändert lassen" : ""}
+                         onChange={(e) => setDraft({ ...draft, passphrase: e.target.value })} />
+                </div>
+              </>
+            ) : (
+              <div className="field">
+                <label>Passwort</label>
+                <input type="password" autoComplete="new-password" value={draft.secret}
+                       placeholder={draft.id ? "unverändert lassen" : ""}
+                       onChange={(e) => setDraft({ ...draft, secret: e.target.value })} />
+                <div className="field-hint">
+                  {draft.id
+                    ? "Leer lassen, um das gespeicherte Passwort beizubehalten."
+                    : "Wird verschlüsselt gespeichert."}
+                </div>
               </div>
-            </div>
+            )}
             <div className="field">
               <label>Adresse (optional)</label>
               <input placeholder="https://…" value={draft.url}
                      onChange={(e) => setDraft({ ...draft, url: e.target.value })} />
             </div>
+            {(draft.category === "sshkey" || draft.category === "login") && (
+              <div className="field">
+                <label>Abweichender Port (optional)</label>
+                <input type="number" min={0} max={65535} value={draft.port || ""}
+                       placeholder="Standard (SSH: 22)"
+                       onChange={(e) => setDraft({ ...draft, port: Number(e.target.value) })} />
+              </div>
+            )}
             <div className="field" style={{ gridColumn: "1 / -1" }}>
               <label>Notiz (optional)</label>
               <input placeholder="z. B. Hotline 0800 …, Vertrag läuft bis …" value={draft.notes}
                      onChange={(e) => setDraft({ ...draft, notes: e.target.value })} />
             </div>
           </div>
+
+          <label className="row" style={{ cursor: "pointer", fontWeight: 400, color: "var(--text)", marginBottom: 6 }}>
+            <input type="checkbox" style={{ width: "auto" }} checked={draft.allowProbe}
+                   onChange={(e) => setDraft({ ...draft, allowProbe: e.target.checked })} />
+            Diesen Zugang zum Auslesen des Geräts verwenden
+          </label>
+          <div className="notice info" style={{ marginTop: 4 }}>
+            HomeAtlas meldet sich damit am Gerät an und liest Eckdaten aus — Betriebssystem,
+            Laufzeit, Speicherplatz, laufende Container. Es werden <strong>ausschließlich</strong> fest
+            einprogrammierte Lesebefehle ausgeführt; nichts wird geändert, installiert oder neu
+            gestartet. Ohne diesen Haken bleibt der Zugang reine Ablage.
+          </div>
+
           <div className="row">
             <button onClick={() => void save()} disabled={busy || !draft.label.trim()}>
               {busy ? "Speichere…" : "Speichern"}
@@ -246,6 +304,11 @@ export default function AccountsPage() {
                   <tr key={a.id}>
                     <td>
                       <strong>{a.label}</strong>
+                      {a.allowProbe ? (
+                        <span className="badge ok" style={{ marginLeft: 8 }} title="Wird zum Auslesen des Geräts verwendet">
+                          liest aus
+                        </span>
+                      ) : null}
                       {a.url && (
                         <div style={{ fontSize: "0.83rem" }}>
                           <a href={a.url} target="_blank" rel="noreferrer">{a.url}</a>
@@ -266,7 +329,11 @@ export default function AccountsPage() {
                       {!a.hasSecret ? (
                         <span className="muted">keins</span>
                       ) : secrets[a.id] !== undefined ? (
-                        <code className="mono">{secrets[a.id]}</code>
+                        <code className="mono" style={{ whiteSpace: "pre-wrap", wordBreak: "break-all",
+                                                        display: "block", maxWidth: 320, maxHeight: 160,
+                                                        overflow: "auto" }}>
+                          {secrets[a.id]}
+                        </code>
                       ) : (
                         <button className="secondary small" onClick={() => void reveal(a.id)}>Anzeigen</button>
                       )}

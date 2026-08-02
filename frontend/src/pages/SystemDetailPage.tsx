@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, type Account, type System } from "../lib/api";
+import { api, type Account, type ProbeResult, type System } from "../lib/api";
 import { useAuth } from "../App";
 import Markdown from "../components/Markdown";
 
@@ -20,6 +20,8 @@ export default function SystemDetailPage() {
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
   const [secrets, setSecrets] = useState<Record<string, string>>({});
+  const [probing, setProbing] = useState(false);
+  const [probeNotice, setProbeNotice] = useState<{ kind: "ok" | "error" | "info"; text: string } | null>(null);
 
   useEffect(() => {
     api
@@ -52,6 +54,28 @@ export default function SystemDetailPage() {
     }
   }
 
+  async function probe() {
+    setProbing(true);
+    setProbeNotice(null);
+    try {
+      const { outcome, system: updated } = await api.probeSystem(id);
+      setSystem(updated);
+      if (outcome.ran) {
+        setProbeNotice({ kind: "ok", text: `Gerät ausgelesen über: ${Object.keys(outcome.results).join(", ")}` });
+      } else {
+        const reasons = Object.values(outcome.results).map((r) => r.error).filter(Boolean);
+        setProbeNotice({
+          kind: "error",
+          text: reasons.length > 0 ? reasons.join(" · ") : outcome.reason || "Keine Verbindung möglich.",
+        });
+      }
+    } catch (e) {
+      setProbeNotice({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setProbing(false);
+    }
+  }
+
   async function remove() {
     if (!window.confirm(`„${system?.name}" wirklich löschen? Zugehörige Zugänge werden mitgelöscht.`)) return;
     await api.deleteSystem(id);
@@ -62,6 +86,7 @@ export default function SystemDetailPage() {
   if (!system) return <span className="spinner" />;
 
   const docker = system.extra?.docker;
+  const probeResults = Object.entries((system.extra?.probe ?? {}) as Record<string, ProbeResult>);
 
   return (
     <>
@@ -79,15 +104,27 @@ export default function SystemDetailPage() {
             {system.url && (
               <a className="badge" href={system.url} target="_blank" rel="noreferrer">Weboberfläche öffnen ↗</a>
             )}
+            {system.docUrl && (
+              <a className="badge" href={system.docUrl} target="_blank" rel="noreferrer">
+                Hersteller-Dokumentation ↗
+              </a>
+            )}
           </div>
         </div>
         {isAdmin && !editing && (
           <div className="row">
+            {accounts.some((a) => a.allowProbe) && (
+              <button className="secondary" onClick={() => void probe()} disabled={probing}>
+                {probing ? "Frage ab…" : "Gerät auslesen"}
+              </button>
+            )}
             <button className="secondary" onClick={() => { setDraft(system); setEditing(true); }}>Bearbeiten</button>
             <button className="danger" onClick={() => void remove()}>Löschen</button>
           </div>
         )}
       </div>
+
+      {probeNotice && <div className={`notice ${probeNotice.kind}`}>{probeNotice.text}</div>}
 
       {saved && <div className="notice ok">Gespeichert. Diese Angaben bleiben bei künftigen Scans erhalten.</div>}
 
@@ -98,7 +135,8 @@ export default function SystemDetailPage() {
             {([
               ["name", "Name"], ["ip", "Adresse im Netzwerk"], ["hostname", "Hostname"],
               ["vendor", "Hersteller"], ["model", "Modell"], ["location", "Standort"],
-              ["url", "Weboberfläche (URL)"], ["purpose", "Zweck in einem Satz"],
+              ["url", "Weboberfläche (URL)"], ["docUrl", "Hersteller-Dokumentation (URL)"],
+              ["purpose", "Zweck in einem Satz"],
             ] as const).map(([field, label]) => (
               <div className="field" key={field}>
                 <label>{label}</label>
@@ -193,6 +231,46 @@ export default function SystemDetailPage() {
               </tbody>
             </table>
           </div>
+        </div>
+      )}
+
+      {probeResults.length > 0 && (
+        <div className="card">
+          <h2>Direkt vom Gerät ausgelesen</h2>
+          <p className="muted" style={{ marginTop: -6 }}>
+            Über einen hinterlegten Zugang angemeldet und nur gelesen — nichts wurde verändert.
+          </p>
+          {probeResults.map(([source, result]) => (
+            <div key={source} style={{ marginBottom: 18 }}>
+              <div className="row" style={{ marginBottom: 8 }}>
+                <span className={`badge ${result.ok ? "ok" : "danger"}`}>{source}</span>
+              </div>
+              {result.ok ? (
+                <div className="table-wrap">
+                  <table>
+                    <tbody>
+                      {Object.entries(result.facts).map(([key, fact]) => (
+                        <tr key={key}>
+                          <th style={{ width: "28%" }}>{fact.label}</th>
+                          <td>
+                            {fact.value.includes("\n") ? (
+                              <pre className="mono" style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: "0.82rem" }}>
+                                {fact.value}
+                              </pre>
+                            ) : (
+                              <span className="mono">{fact.value}</span>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p className="muted">{result.error}</p>
+              )}
+            </div>
+          ))}
         </div>
       )}
 

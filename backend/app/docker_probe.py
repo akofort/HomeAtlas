@@ -60,6 +60,7 @@ async def probe(host_ip: str = "") -> dict:
         return {"ok": False, "error": f"Docker-Socket {_SOCKET} ist nicht eingebunden.", "systems": []}
     try:
         version = await _get("/version")
+        info = await _get("/info")
         containers = await _get("/containers/json?all=1")
         networks = await _get("/networks")
         volumes = await _get("/volumes")
@@ -68,6 +69,11 @@ async def probe(host_ip: str = "") -> dict:
 
     assert isinstance(containers, list)
     volume_list = (volumes or {}).get("Volumes") or [] if isinstance(volumes, dict) else []
+    # "Where is this container?" has exactly one useful answer for a household: the machine it
+    # runs on. Docker's /info reports that host's own name, which beats a room label nobody would
+    # ever fill in for 30 containers.
+    host_name = (info or {}).get("Name", "") if isinstance(info, dict) else ""
+    location = host_name or host_ip or "Docker-Host"
 
     systems = []
     for container in containers:
@@ -86,6 +92,7 @@ async def probe(host_ip: str = "") -> dict:
             "kind": "container",
             "name": name,
             "ip": host_ip,
+            "location": location,
             "model": container.get("Image", ""),
             "status": "online" if state == "running" else "offline",
             "discovered": 1,
@@ -112,6 +119,7 @@ async def probe(host_ip: str = "") -> dict:
     return {
         "ok": True,
         "error": "",
+        "hostName": host_name,
         "version": {
             "version": (version or {}).get("Version", "") if isinstance(version, dict) else "",
             "apiVersion": (version or {}).get("ApiVersion", "") if isinstance(version, dict) else "",

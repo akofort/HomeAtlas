@@ -4,3 +4,4 @@ httpx==0.28.1
 pydantic==2.10.5
 cryptography==44.0.0
 zeroconf==0.136.2
+asyncssh==2.19.0

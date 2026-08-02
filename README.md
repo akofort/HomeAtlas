@@ -18,7 +18,10 @@ Läuft als Docker-Container im eigenen Netz. Keine Cloud, keine Registrierung.
 | **Selbstständige Erkennung** | Ping/ARP-Sweep, Portscan, Reverse-DNS, mDNS/Bonjour, UPnP/SSDP, HTTP-Banner und Docker-API — fünf unabhängige Quellen, weil keine davon allein alles sieht |
 | **Verständliche Doku** | 12 Kapitel nach Themen (Internet & Router, Netzwerk, Server, Container, Smart Home, Wärme & Energie, Zugänge, Notfall …) als Markdown im Browser |
 | **KI-Assistent** | Kennt das Inventar, misst live nach und führt Schritt für Schritt durch die Fehlersuche |
-| **Zugangsverwaltung** | Passwörter verschlüsselt gespeichert, nie in der Doku, nie beim KI-Anbieter |
+| **Zugangsverwaltung** | Passwörter, SSH-Schlüssel und Passphrasen verschlüsselt gespeichert, nie in der Doku, nie beim KI-Anbieter |
+| **Geräte auslesen** | Mit freigegebenen Zugängen anmelden und Eckdaten lesen — streng lesend, feste Befehlsliste (SSH, HTTP, FRITZ!Box TR-064) |
+| **Hersteller-Doku** | Link zur passenden Support-Seite je Gerät; von der KI vorgeschlagene Links werden vor dem Speichern auf Erreichbarkeit geprüft |
+| **Versionierte Doku** | Jeder frühere Stand jeder Seite bleibt abrufbar und wiederherstellbar |
 | **Zwei Rollen** | Administrator sieht und ändert alles; Mitglieder lesen die Doku und nutzen den Chat — ohne Passwörter |
 
 Der Anbieter für die KI ist frei wählbar: **Anthropic Claude, OpenAI, Google Gemini, DeepSeek**
@@ -149,6 +152,29 @@ Administratoren. Es gibt keine Route, die den Zugangsspeicher im Klartext ausgib
 **Diagnose-Werkzeuge ohne Shell.** Alles, was der Assistent ausführen kann, ist lesend, hat ein
 Timeout und läuft über `create_subprocess_exec` mit Argumentliste. Ein Hostname mit `;` oder
 Backticks ist ein Hostname, kein Befehl — und wird vorher gegen ein striktes Muster geprüft.
+
+**Anmelden ja, verändern nie.** Ist für ein Gerät ein Zugang hinterlegt *und* ausdrücklich zum
+Auslesen freigegeben, meldet sich HomeAtlas an und liest Eckdaten. Dass dabei nichts verändert
+wird, ist eine Eigenschaft des Codes, keine Zusicherung im Text:
+
+- Die SSH-Befehle stehen als **Konstante** in `probe_auth._SSH_COMMANDS`. Es gibt keine
+  Einstellung, keinen API-Parameter und kein KI-Werkzeug, das etwas hinzufügen könnte — sonst wäre
+  daraus eine Fernsteuerung mit hübscher Oberfläche geworden.
+- Jeder Befehl ist lesend und nicht-interaktiv: kein Paketmanager, keine Dienststeuerung, keine
+  Umleitung, kein `sudo`. Fehlschläge werden geschluckt, damit ein fehlendes Programm nie in einen
+  Zweitversuch mit gröberen Mitteln mündet.
+- HTTP wird ausschließlich mit **GET** aufgerufen; bei TR-064 werden nur `GetInfo`-Aktionen
+  gebaut — die `Set*`-Hälfte dieser Schnittstelle kommt im Quelltext nicht vor.
+- **Opt-in pro Zugang.** Ohne den Haken „Zum Auslesen verwenden“ passiert nichts, und das
+  Verfahren lässt sich unter *Einstellungen → Netzwerk-Scan* komplett abschalten.
+
+Bewusste Abwägung: SSH-Hostschlüssel werden **nicht** geprüft. HomeAtlas hat keinen Vertrauensspeicher,
+und die Alternative — die Verbindung zu jedem Gerät beim ersten Kontakt zu verweigern — würde die
+Funktion in genau dem Netz unbrauchbar machen, das sie dokumentieren soll.
+
+**SSH-Schlüssel und Passphrasen** liegen im selben verschlüsselten Feld wie Passwörter und
+unterliegen denselben Regeln: nie in der Doku, nie beim KI-Anbieter, nur einzeln über die
+Admin-Route abrufbar.
 
 **Der Docker-Socket ist root-äquivalent.** Read-only eingebunden und es werden ausschließlich
 GET-Endpunkte aufgerufen — aber wer den Socket lesen kann, kann auf dem Host viel. Wem das zu

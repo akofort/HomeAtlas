@@ -74,6 +74,7 @@ export interface System {
   purpose: string;
   descriptionMd: string;
   url: string;
+  docUrl: string;
   notes: string;
   importance: "critical" | "normal" | "low";
   parentId: string | null;
@@ -98,8 +99,40 @@ export interface Account {
   username: string;
   url: string;
   notes: string;
+  allowProbe: number;
+  port: number;
   updatedAt: string;
   hasSecret: boolean;
+  hasPassphrase: boolean;
+}
+
+export interface DocVersion {
+  id: string;
+  slug: string;
+  title: string;
+  generated: number;
+  reason: string;
+  createdAt: string;
+  size: number;
+  bodyMd?: string;
+}
+
+export interface ProbeFact {
+  label: string;
+  value: string;
+}
+
+export interface ProbeResult {
+  ok: boolean;
+  error: string;
+  facts: Record<string, ProbeFact>;
+}
+
+export interface ProbeOutcome {
+  ran: boolean;
+  results: Record<string, ProbeResult>;
+  purpose?: string;
+  reason: string;
 }
 
 export interface DocPage {
@@ -213,6 +246,7 @@ export const api = {
   createSystem: (body: Partial<System>) => post<{ system: System }>("/systems", body),
   updateSystem: (id: string, body: Partial<System>) => patch<{ system: System }>(`/systems/${id}`, body),
   deleteSystem: (id: string) => del<{ ok: boolean }>(`/systems/${id}`),
+  probeSystem: (id: string) => post<{ outcome: ProbeOutcome; system: System }>(`/systems/${id}/probe`),
 
   listAccounts: () => get<{ accounts: Account[] }>("/accounts"),
   createAccount: (body: Record<string, any>) => post<{ account: Account }>("/accounts", body),
@@ -225,6 +259,10 @@ export const api = {
   saveDoc: (slug: string, bodyMd: string) => put<{ page: DocPage }>(`/docs/${slug}`, { bodyMd }),
   resetDoc: (slug: string) => post<{ page: DocPage }>(`/docs/${slug}/reset`),
   generateDocs: (useLlm: boolean) => post<{ generated: string[] }>("/docs/generate", { useLlm }),
+  listDocVersions: (slug: string) => get<{ versions: DocVersion[] }>(`/docs/${slug}/versions`),
+  getDocVersion: (slug: string, id: string) => get<{ version: DocVersion }>(`/docs/${slug}/versions/${id}`),
+  restoreDocVersion: (slug: string, id: string) =>
+    post<{ page: DocPage }>(`/docs/${slug}/versions/${id}/restore`),
 
   startScan: () => post<{ scanId: string }>("/scans"),
   listScans: () => get<{ scans: Scan[]; running: Scan | null }>("/scans"),

@@ -190,8 +190,27 @@ def _device_details(systems: list[dict]) -> str:
             facts.append(f"- **Bedeutung:** {IMPORTANCE_LABELS.get(s['importance'], s['importance'])}")
         if s["url"]:
             facts.append(f"- **Weboberfläche:** [{s['url']}]({s['url']})")
+        if s.get("docUrl"):
+            facts.append(f"- **Hersteller-Dokumentation:** [{s['docUrl']}]({s['docUrl']})")
         facts.append(f"- **Zuletzt gesehen:** {_fmt_date(s['lastSeen'])}")
         parts.append("\n".join(facts) + "\n")
+
+        probe = (s.get("extra") or {}).get("probe") or {}
+        readings = [
+            (fact["label"], fact["value"])
+            for result in probe.values() if result.get("ok")
+            for fact in (result.get("facts") or {}).values()
+        ]
+        if readings:
+            parts.append("**Direkt vom Gerät ausgelesen**\n")
+            for label, value in readings[:14]:
+                # Multi-line command output (disks, services) belongs in a code block; a single
+                # value reads better inline.
+                if "\n" in value:
+                    parts.append(f"- **{_escape(label)}:**\n\n  ```\n  " + value.replace("\n", "\n  ") + "\n  ```\n")
+                else:
+                    parts.append(f"- **{_escape(label)}:** {_escape(value)}")
+            parts.append("")
 
         docker = (s.get("extra") or {}).get("docker") or {}
         if docker:

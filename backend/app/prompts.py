@@ -76,6 +76,12 @@ Regeln:
 - Die Beschreibung ist für Laien: ein bis zwei Sätze, die erklären, WOZU das Gerät im Haushalt da
   ist -- nicht, welche Ports offen sind. Also "Der Netzwerkdrucker im Arbeitszimmer, über den alle
   Geräte im Haus drucken können." statt "Gerät mit offenem Port 9100."
+- Der Zweck ("purpose") ist immer auszufüllen, auch wenn du das Gerät nur grob einordnen kannst.
+  Dann eben "Vermutlich ein Smart-Home-Sensor" statt einer erfundenen Genauigkeit.
+- "docUrl": Adresse der offiziellen Hersteller-Dokumentation oder Support-Seite für genau dieses
+  Modell. NUR wenn du sie sicher kennst. Eine geratene oder konstruierte Adresse ist schlimmer als
+  gar keine -- im Zweifel leer lassen. Bevorzuge die stabile Support-Startseite des Herstellers
+  gegenüber einem tiefen Link auf ein einzelnes PDF.
 - Erfinde keine Standorte, Räume oder Besitzer. Die kennst du nicht.
 
 Antworte AUSSCHLIESSLICH mit einem JSON-Array, ohne Text davor oder danach, ohne Markdown-Zaun.
@@ -84,8 +90,8 @@ Ein Objekt pro Gerät, in derselben Reihenfolge wie die Eingabe:
 [{"ip": "<IP aus der Eingabe>", "kind": "<Kategorie>", "name": "<kurzer sprechender Name>",
   "vendor": "<Hersteller oder \\"\\">", "model": "<Modell oder \\"\\">",
   "purpose": "<Kurzbeschreibung in einem Satz>",
-  "description": "<1-2 Sätze für Laien>", "importance": "critical|normal|low",
-  "confidence": "high|medium|low"}]
+  "description": "<1-2 Sätze für Laien>", "docUrl": "<Hersteller-Doku oder \\"\\">",
+  "importance": "critical|normal|low", "confidence": "high|medium|low"}]
 
 Erlaubte Werte für kind: router, network, server, nas, container, vm, pc, mobile, printer,
 camera, smarthome, climate, heating, energy, media, iot, other.

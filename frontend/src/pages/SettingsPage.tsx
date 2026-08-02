@@ -216,6 +216,20 @@ export default function SettingsPage() {
           </div>
 
           <div className="field">
+            <label>Einzelziele außerhalb dieser Bereiche</label>
+            <input
+              placeholder="z. B. 10.1.1.1, 192.168.178.1, nas.fritz.box"
+              value={(form.scanExtraTargets ?? []).join(", ")}
+              onChange={(e) => set("scanExtraTargets", e.target.value.split(",").map((s) => s.trim()).filter(Boolean))}
+            />
+            <div className="field-hint">
+              Für Geräte, die nicht im eigenen Netzbereich liegen — etwa ein Router auf 10.1.1.1,
+              während das Heimnetz 192.168.1.x nutzt, oder eine VM hinter einer Bridge. Adressen von
+              Geräten, die du selbst angelegt hast, werden automatisch mitgeprüft.
+            </div>
+          </div>
+
+          <div className="field">
             <label>Adressen ausnehmen</label>
             <input
               placeholder="z. B. 192.168.1.50, 192.168.1.51"
@@ -246,6 +260,7 @@ export default function SettingsPage() {
             ["scanEnableHttpBanner", "Weboberflächen auslesen, um Geräte zu erkennen"],
             ["scanEnableDocker", "Docker-Container auf dem Server erfassen"],
             ["scanUseLlm", "KI zur Einordnung unbekannter Geräte und für die Doku-Texte nutzen"],
+            ["scanUseCredentials", "Freigegebene Zugänge zum Auslesen der Geräte verwenden (nur lesend)"],
           ] as const).map(([key, label]) => (
             <label key={key} className="row" style={{ marginBottom: 10, cursor: "pointer", fontWeight: 400, color: "var(--text)" }}>
               <input type="checkbox" style={{ width: "auto" }} checked={form[key] ?? true}

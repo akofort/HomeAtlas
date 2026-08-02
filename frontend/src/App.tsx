@@ -11,6 +11,7 @@ import DocsPage from "./pages/DocsPage";
 import ChatPage from "./pages/ChatPage";
 import ScanPage from "./pages/ScanPage";
 import SettingsPage from "./pages/SettingsPage";
+import UsersPage from "./pages/UsersPage";
 
 interface AuthState {
   user: User | null;
@@ -35,6 +36,7 @@ const NAV = [
   { to: "/dokumentation", label: "Dokumentation", icon: "📘" },
   { to: "/assistent", label: "KI-Assistent", icon: "💬" },
   { to: "/scan", label: "Netzwerk-Scan", icon: "🔍", adminOnly: true },
+  { to: "/benutzer", label: "Benutzer", icon: "👥", adminOnly: true },
   { to: "/einstellungen", label: "Einstellungen", icon: "⚙️" },
 ];
 
@@ -126,6 +128,7 @@ export default function App() {
             <Route path="/dokumentation/:slug" element={<DocsPage />} />
             <Route path="/assistent" element={<ChatPage />} />
             {isAdmin && <Route path="/scan" element={<ScanPage />} />}
+            {isAdmin && <Route path="/benutzer" element={<UsersPage />} />}
             <Route path="/einstellungen" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
