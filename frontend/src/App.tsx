@@ -6,6 +6,7 @@ import SetupPage from "./pages/SetupPage";
 import DashboardPage from "./pages/DashboardPage";
 import InventoryPage from "./pages/InventoryPage";
 import SystemDetailPage from "./pages/SystemDetailPage";
+import AccountsPage from "./pages/AccountsPage";
 import DocsPage from "./pages/DocsPage";
 import ChatPage from "./pages/ChatPage";
 import ScanPage from "./pages/ScanPage";
@@ -30,6 +31,7 @@ export const useAuth = () => useContext(AuthContext);
 const NAV = [
   { to: "/", label: "Übersicht", icon: "🏠", end: true },
   { to: "/geraete", label: "Geräte", icon: "🖧" },
+  { to: "/zugaenge", label: "Zugänge", icon: "🔑", adminOnly: true },
   { to: "/dokumentation", label: "Dokumentation", icon: "📘" },
   { to: "/assistent", label: "KI-Assistent", icon: "💬" },
   { to: "/scan", label: "Netzwerk-Scan", icon: "🔍", adminOnly: true },
@@ -119,6 +121,7 @@ export default function App() {
             <Route path="/" element={<DashboardPage />} />
             <Route path="/geraete" element={<InventoryPage />} />
             <Route path="/geraete/:id" element={<SystemDetailPage />} />
+            {isAdmin && <Route path="/zugaenge" element={<AccountsPage />} />}
             <Route path="/dokumentation" element={<DocsPage />} />
             <Route path="/dokumentation/:slug" element={<DocsPage />} />
             <Route path="/assistent" element={<ChatPage />} />

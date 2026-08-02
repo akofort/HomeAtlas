@@ -218,9 +218,17 @@ export default function SystemDetailPage() {
 
       {isAdmin && (
         <div className="card">
-          <h2>Zugänge</h2>
+          <div className="row" style={{ justifyContent: "space-between", marginBottom: 12 }}>
+            <h2 style={{ margin: 0 }}>Zugänge</h2>
+            <Link className="btn" to="/zugaenge" style={{ display: "inline-block", fontSize: "0.85rem", padding: "5px 11px" }}>
+              Zugänge verwalten
+            </Link>
+          </div>
           {accounts.length === 0 ? (
-            <p className="muted">Für dieses Gerät ist kein Zugang hinterlegt.</p>
+            <p className="muted">
+              Für dieses Gerät ist kein Zugang hinterlegt — unter <Link to="/zugaenge">Zugänge</Link> lässt
+              sich einer anlegen und diesem Gerät zuordnen.
+            </p>
           ) : (
             <div className="table-wrap">
               <table>

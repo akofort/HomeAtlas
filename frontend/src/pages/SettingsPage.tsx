@@ -14,11 +14,11 @@ const BASE_URL_FIELD: Record<string, string> = {
   CLAUDE: "claudeBaseUrl", OPENAI: "openAiBaseUrl", DEEPSEEK: "deepseekBaseUrl", OLLAMA: "ollamaBaseUrl",
 };
 
-type Tab = "llm" | "scan" | "account" | "about";
+type Tab = "general" | "llm" | "scan" | "account" | "about";
 
 export default function SettingsPage() {
   const { isAdmin, user } = useAuth();
-  const [tab, setTab] = useState<Tab>(isAdmin ? "llm" : "account");
+  const [tab, setTab] = useState<Tab>(isAdmin ? "general" : "account");
   const [data, setData] = useState<SettingsResponse | null>(null);
   const [form, setForm] = useState<Record<string, any>>({});
   const [notice, setNotice] = useState<{ kind: "ok" | "error" | "info"; text: string } | null>(null);
@@ -86,7 +86,8 @@ export default function SettingsPage() {
   const modelOptions = liveModels.length > 0 ? liveModels : catalogModels;
 
   const TABS: [Tab, string][] = isAdmin
-    ? [["llm", "KI-Assistent"], ["scan", "Netzwerk-Scan"], ["account", "Konto"], ["about", "Über"]]
+    ? [["general", "Allgemein"], ["llm", "KI-Assistent"], ["scan", "Netzwerk-Scan"],
+       ["account", "Konto"], ["about", "Über"]]
     : [["account", "Konto"], ["about", "Über"]];
 
   return (
@@ -107,6 +108,22 @@ export default function SettingsPage() {
       </div>
 
       {notice && <div className={`notice ${notice.kind}`}>{notice.text}</div>}
+
+      {tab === "general" && isAdmin && (
+        <div className="card">
+          <h2>Allgemein</h2>
+          <div className="field">
+            <label>Name deines Zuhauses</label>
+            <input value={form.homeName ?? ""} onChange={(e) => set("homeName", e.target.value)} />
+            <div className="field-hint">
+              Erscheint als Überschrift auf der Übersicht und in der Dokumentation.
+            </div>
+          </div>
+          <button onClick={() => void save({ homeName: form.homeName })} disabled={busy !== ""}>
+            Speichern
+          </button>
+        </div>
+      )}
 
       {tab === "llm" && isAdmin && (
         <div className="card">
