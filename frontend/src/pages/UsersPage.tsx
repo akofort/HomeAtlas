@@ -109,6 +109,21 @@ export default function UsersPage() {
     }
   }
 
+  async function resetMfa(user: User) {
+    if (!window.confirm(
+      `Zwei-Faktor-Anmeldung von „${user.username}“ wirklich zurücksetzen? ` +
+      "Danach muss sie beim nächsten Login neu eingerichtet werden — bis dahin kommt niemand mit diesem Konto weiter.",
+    )) return;
+    setError("");
+    try {
+      await api.resetUserMfa(user.id);
+      await reload();
+      setNotice(`Zwei-Faktor-Anmeldung von „${user.username}“ zurückgesetzt.`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   const adminCount = users.filter((u) => u.role === "ADMIN").length;
 
   return (
@@ -235,9 +250,14 @@ export default function UsersPage() {
                       </td>
                       <td>
                         {u.totpEnabled ? (
-                          <span className="badge ok">aktiv</span>
+                          <span className="row" style={{ flexWrap: "nowrap" }}>
+                            <span className="badge ok">aktiv</span>
+                            <button className="secondary small" onClick={() => void resetMfa(u)}>
+                              Zurücksetzen
+                            </button>
+                          </span>
                         ) : (
-                          <span className="muted">aus</span>
+                          <span className="muted" title="Wird beim nächsten Login erzwungen">noch nicht eingerichtet</span>
                         )}
                       </td>
                       <td className="muted">{new Date(u.createdAt).toLocaleDateString("de-DE")}</td>

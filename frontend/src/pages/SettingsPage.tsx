@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, type ModelOption, type PasswordPolicy, type SettingsResponse } from "../lib/api";
+import { api, type ApiToken, type ModelOption, type PasswordPolicy, type SettingsResponse } from "../lib/api";
 import { useAuth } from "../App";
 
 const KEY_FIELD: Record<string, string> = {
@@ -14,7 +14,7 @@ const BASE_URL_FIELD: Record<string, string> = {
   CLAUDE: "claudeBaseUrl", OPENAI: "openAiBaseUrl", DEEPSEEK: "deepseekBaseUrl", OLLAMA: "ollamaBaseUrl",
 };
 
-type Tab = "general" | "llm" | "scan" | "monitor" | "account" | "about";
+type Tab = "general" | "llm" | "scan" | "monitor" | "mcp" | "account" | "about";
 
 export default function SettingsPage() {
   const { isAdmin, user } = useAuth();
@@ -87,7 +87,7 @@ export default function SettingsPage() {
 
   const TABS: [Tab, string][] = isAdmin
     ? [["general", "Allgemein"], ["llm", "KI-Assistent"], ["scan", "Netzwerk-Scan"],
-       ["monitor", "Überwachung"], ["account", "Konto"], ["about", "Über"]]
+       ["monitor", "Überwachung"], ["mcp", "MCP-Server"], ["account", "Konto"], ["about", "Über"]]
     : [["account", "Konto"], ["about", "Über"]];
 
   return (
@@ -254,11 +254,41 @@ export default function SettingsPage() {
             </div>
           </div>
 
+          <div className="grid cols-2">
+            <label className="row" style={{ cursor: "pointer", fontWeight: 400, color: "var(--text)" }}>
+              <input type="checkbox" style={{ width: "auto" }} checked={form.scanAutoEnabled ?? false}
+                     onChange={(e) => set("scanAutoEnabled", e.target.checked)} />
+              Scans automatisch wiederholen (statt nur auf Knopfdruck)
+            </label>
+            <div className="field">
+              <label>Intervall (Stunden)</label>
+              <input type="number" min={1} max={720} value={form.scanAutoIntervalHours ?? 24}
+                     disabled={!form.scanAutoEnabled}
+                     onChange={(e) => set("scanAutoIntervalHours", Number(e.target.value))} />
+              <div className="field-hint">
+                Mindestabstand zwischen zwei automatischen Scans -- ein manueller Scan zählt
+                mit. Betrifft auch, wie oft Konfigsicherungen (Switches, Router, Omada) erneuert
+                werden.
+              </div>
+            </div>
+          </div>
+
+          <div className="field">
+            <label>Aufbewahrte Konfigsicherungen je Gerät</label>
+            <input type="number" min={1} max={1000} value={form.configVersionKeep ?? 50}
+                   onChange={(e) => set("configVersionKeep", Number(e.target.value))} />
+            <div className="field-hint">
+              Ältere Versionen werden über dieser Anzahl automatisch gelöscht (je Gerät und
+              Sicherungsart).
+            </div>
+          </div>
+
           {([
             ["scanEnableMdns", "Smart-Home-Geräte über mDNS/Bonjour finden"],
             ["scanEnableSsdp", "Geräte über UPnP finden (TVs, Router, Drucker)"],
             ["scanEnableHttpBanner", "Weboberflächen auslesen, um Geräte zu erkennen"],
             ["scanEnableDocker", "Docker-Container auf dem Server erfassen"],
+            ["scanEnableOmada", "Access Points und Switches über den Omada Controller erfassen"],
             ["scanUseLlm", "KI zur Einordnung unbekannter Geräte und für die Doku-Texte nutzen"],
             ["scanUseCredentials", "Freigegebene Zugänge zum Auslesen der Geräte verwenden (nur lesend)"],
           ] as const).map(([key, label]) => (
@@ -406,6 +436,8 @@ export default function SettingsPage() {
         </div>
       )}
 
+      {tab === "mcp" && isAdmin && <McpTab />}
+
       {tab === "account" && <AccountTab username={user?.username ?? ""} totpEnabled={Boolean(user?.totpEnabled)} />}
 
       {tab === "about" && (
@@ -433,6 +465,110 @@ export default function SettingsPage() {
         </div>
       )}
     </>
+  );
+}
+
+function McpTab() {
+  const [tokens, setTokens] = useState<ApiToken[] | null>(null);
+  const [label, setLabel] = useState("");
+  const [freshToken, setFreshToken] = useState<ApiToken | null>(null);
+  const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const mcpUrl = `${window.location.origin}/api/mcp`;
+
+  function load() {
+    api.listMcpTokens().then((r) => setTokens(r.tokens)).catch((e) => setNotice({ kind: "error", text: e.message }));
+  }
+
+  useEffect(load, []);
+
+  async function create() {
+    if (!label.trim()) return;
+    setBusy(true);
+    setNotice(null);
+    try {
+      const { token } = await api.createMcpToken(label.trim());
+      setFreshToken(token);
+      setLabel("");
+      load();
+    } catch (e) {
+      setNotice({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove(id: string) {
+    if (!window.confirm("Dieses Token wirklich löschen? Clients, die es benutzen, verlieren sofort den Zugriff.")) return;
+    await api.deleteMcpToken(id);
+    if (freshToken?.id === id) setFreshToken(null);
+    load();
+  }
+
+  return (
+    <div className="card">
+      <h2>MCP-Server</h2>
+      <p className="muted" style={{ marginTop: -6 }}>
+        Macht dieselben lesenden Auskünfte, die auch der Chat-Assistent nutzt — Geräte,
+        Dokumentation, Live-Diagnosen — über das Model Context Protocol für externe Programme wie
+        Claude Desktop erreichbar. Keine Passwörter, nichts wird verändert; nur mit einem hier
+        erzeugten Token nutzbar.
+      </p>
+      <div className="field">
+        <label>Server-Adresse</label>
+        <input readOnly value={mcpUrl} className="mono" onClick={(e) => e.currentTarget.select()} />
+        <div className="field-hint">
+          Als Remote-MCP-Server eintragen, dazu eines der Tokens unten als Bearer-Zugangsdaten.
+        </div>
+      </div>
+
+      {notice && <div className={`notice ${notice.kind}`}>{notice.text}</div>}
+
+      {freshToken?.token && (
+        <div className="notice ok">
+          Token erzeugt: <code className="mono">{freshToken.token}</code>
+          <br />
+          Wird nur <strong>jetzt einmal</strong> angezeigt — bitte kopieren. Danach lässt es sich
+          nicht mehr nachlesen (nur widerrufen und neu erzeugen).
+        </div>
+      )}
+
+      <div className="row" style={{ marginBottom: 14 }}>
+        <input
+          style={{ flex: 1, minWidth: 200 }}
+          placeholder="Bezeichnung, z. B. Claude Desktop"
+          value={label}
+          onChange={(e) => setLabel(e.target.value)}
+        />
+        <button onClick={() => void create()} disabled={busy || !label.trim()}>Token erzeugen</button>
+      </div>
+
+      {tokens === null ? (
+        <span className="spinner" />
+      ) : tokens.length === 0 ? (
+        <p className="muted">Noch kein Token erzeugt.</p>
+      ) : (
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Bezeichnung</th><th>Erstellt</th><th>Zuletzt benutzt</th><th /></tr>
+            </thead>
+            <tbody>
+              {tokens.map((t) => (
+                <tr key={t.id}>
+                  <td>{t.label}</td>
+                  <td className="muted">{new Date(t.createdAt).toLocaleString("de-DE")}</td>
+                  <td className="muted">{t.lastUsedAt ? new Date(t.lastUsedAt).toLocaleString("de-DE") : "noch nie"}</td>
+                  <td style={{ width: 1 }}>
+                    <button className="danger" onClick={() => void remove(t.id)}>Widerrufen</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -502,127 +638,23 @@ function AccountTab({ username, totpEnabled }: { username: string; totpEnabled: 
   );
 }
 
-/** Zwei-Faktor-Anmeldung. Der Geheimtext wird erst nach einem funktionierenden Code scharfgeschaltet
- *  — sonst könnte eine abgebrochene Einrichtung aussperren. */
+/** Zwei-Faktor-Anmeldung ist inzwischen Pflicht (siehe MfaEnrollPage) -- die Einrichtung passiert
+ *  dort direkt nach dem Login, nicht mehr hier. Diese Karte zeigt nur noch den Status; es gibt
+ *  bewusst keine Selbstabschaltung mehr, nur ein Administrator kann sie zurücksetzen
+ *  (Benutzerverwaltung), damit ein gestohlenes Passwort allein sie nicht aushebeln kann. */
 function MfaSection({ enabled }: { enabled: boolean }) {
-  const [setup, setSetup] = useState<{ secret: string; uri: string; qrSvg: string } | null>(null);
-  const [code, setCode] = useState("");
-  const [password, setPassword] = useState("");
-  const [disabling, setDisabling] = useState(false);
-  const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [active, setActive] = useState(enabled);
-
-  async function start() {
-    setBusy(true);
-    setNotice(null);
-    try {
-      setSetup(await api.mfaSetup());
-    } catch (e) {
-      setNotice({ kind: "error", text: e instanceof Error ? e.message : String(e) });
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function confirm() {
-    setBusy(true);
-    try {
-      await api.mfaConfirm(code);
-      setActive(true);
-      setSetup(null);
-      setCode("");
-      setNotice({ kind: "ok", text: "Zwei-Faktor-Anmeldung ist aktiv. Ab jetzt wird bei jeder Anmeldung der Code abgefragt." });
-    } catch (e) {
-      setNotice({ kind: "error", text: e instanceof Error ? e.message : String(e) });
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function disable() {
-    setBusy(true);
-    try {
-      await api.mfaDisable(password);
-      setActive(false);
-      setDisabling(false);
-      setPassword("");
-      setNotice({ kind: "ok", text: "Zwei-Faktor-Anmeldung abgeschaltet." });
-    } catch (e) {
-      setNotice({ kind: "error", text: e instanceof Error ? e.message : String(e) });
-    } finally {
-      setBusy(false);
-    }
-  }
-
   return (
     <div style={{ marginTop: 28, paddingTop: 20, borderTop: "1px solid var(--border)" }}>
       <div className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
-        <h3 style={{ margin: 0 }}>Zwei-Faktor-Anmeldung (optional)</h3>
-        <span className={`badge ${active ? "ok" : ""}`}>{active ? "aktiv" : "nicht eingerichtet"}</span>
+        <h3 style={{ margin: 0 }}>Zwei-Faktor-Anmeldung (Pflicht)</h3>
+        <span className={`badge ${enabled ? "ok" : "warn"}`}>{enabled ? "aktiv" : "noch nicht eingerichtet"}</span>
       </div>
-      <p className="muted">
+      <p className="muted" style={{ marginBottom: 0 }}>
         Zusätzlich zum Passwort ein Code aus einer Authenticator-App (Aegis, 2FAS, Google
         Authenticator, 1Password …). Wer dann dein Passwort kennt, kommt trotzdem nicht hinein.
+        Gerät mit der App verloren? Ein Administrator setzt die Zwei-Faktor-Anmeldung unter
+        „Benutzer" zurück — danach wird sie beim nächsten Login neu eingerichtet.
       </p>
-
-      {notice && <div className={`notice ${notice.kind}`}>{notice.text}</div>}
-
-      {active ? (
-        disabling ? (
-          <>
-            <div className="field">
-              <label>Zur Bestätigung dein Passwort</label>
-              <input type="password" autoComplete="current-password" value={password}
-                     onChange={(e) => setPassword(e.target.value)} />
-            </div>
-            <div className="row">
-              <button className="danger" onClick={() => void disable()} disabled={busy || !password}>
-                Abschalten
-              </button>
-              <button className="secondary" onClick={() => setDisabling(false)}>Abbrechen</button>
-            </div>
-          </>
-        ) : (
-          <button className="secondary" onClick={() => setDisabling(true)}>Zwei-Faktor abschalten</button>
-        )
-      ) : setup ? (
-        <>
-          <p className="muted">
-            <strong>1.</strong> QR-Code in der App scannen — oder den Schlüssel von Hand eintippen.
-          </p>
-          {setup.qrSvg ? (
-            <div
-              style={{ background: "#fff", padding: 10, borderRadius: 10, display: "inline-block" }}
-              dangerouslySetInnerHTML={{ __html: setup.qrSvg }}
-            />
-          ) : (
-            <div className="notice info">
-              QR-Code konnte nicht erzeugt werden — bitte den Schlüssel unten von Hand eintragen.
-            </div>
-          )}
-          <div className="field" style={{ marginTop: 12 }}>
-            <label>Schlüssel zum Abtippen</label>
-            <code className="mono" style={{ display: "block", wordBreak: "break-all", background: "var(--bg)", padding: "8px 10px", borderRadius: 8 }}>
-              {setup.secret}
-            </code>
-          </div>
-          <p className="muted"><strong>2.</strong> Zur Bestätigung den aktuellen Code eingeben:</p>
-          <div className="field" style={{ maxWidth: 220 }}>
-            <input inputMode="numeric" maxLength={6} placeholder="6-stellig" className="mono"
-                   style={{ letterSpacing: "0.4em", fontSize: "1.15rem" }}
-                   value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))} />
-          </div>
-          <div className="row">
-            <button onClick={() => void confirm()} disabled={busy || code.length < 6}>Aktivieren</button>
-            <button className="secondary" onClick={() => setSetup(null)}>Abbrechen</button>
-          </div>
-        </>
-      ) : (
-        <button className="secondary" onClick={() => void start()} disabled={busy}>
-          {busy ? "Erzeuge…" : "Einrichten"}
-        </button>
-      )}
     </div>
   );
 }

@@ -8,9 +8,14 @@ services:
     network_mode: host
     volumes:
       - homeatlas-data:/data
-      # Read-only, and only GET endpoints are ever called (see docker_probe.py). Be aware that
-      # socket access is root-equivalent on the host -- remove this line to run without container
-      # discovery; everything else keeps working.
+      # `:ro` does NOT stop writes over an already-connected socket -- it only blocks filesystem-
+      # level operations on the special file itself (open-for-write, delete, rename). Container
+      # start/stop/restart/logs/exec (see docker_admin.py, admin-only, never reachable from the
+      # LLM tool-calling surface) go over this same connection and always could have. Discovery
+      # (docker_probe.py) only ever issues GET calls, but that has always been an application-code
+      # choice, not something this flag enforced. Socket access is root-equivalent on the host
+      # either way -- remove this line to run without Docker discovery/control; everything else
+      # keeps working.
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - TZ=Europe/Berlin

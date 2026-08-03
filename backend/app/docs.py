@@ -288,6 +288,12 @@ def _device_details(systems: list[dict]) -> str:
                 for svc in services[:15]
             ) + "\n")
 
+        if any("poe" in tag.lower() for tag in (s.get("tags") or [])):
+            parts.append(
+                "> ⚡ **Benötigt PoE:** Dieses Gerät bezieht seinen Strom über das Netzwerkkabel "
+                "und funktioniert nur an einem PoE-fähigen Switch oder mit einem PoE-Injector.\n"
+            )
+
         if s["notes"]:
             parts.append(f"> **Notiz:** {_escape(s['notes'])}\n")
     return "\n".join(parts)

@@ -13,17 +13,20 @@ Two cross-cutting rules the routes below implement consistently:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import secrets as _secrets
+import time
 from contextlib import asynccontextmanager
 
-from fastapi import Body, Cookie, Depends, FastAPI, HTTPException, Request, Response, status
-from fastapi.responses import PlainTextResponse
+from fastapi import Body, Cookie, Depends, FastAPI, HTTPException, Request, Response, WebSocket, status
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import (auth, crypto, db, diagnostics, docker_probe, docs, llm_providers, model_catalog,
-               monitor as monitor_module, oui, pipeline, probe_auth, security, topology, tools)
+from . import (auth, crypto, db, diagnostics, docker_admin, docker_probe, docs, llm_providers,
+               mcp_server, model_catalog, monitor as monitor_module, oui, pipeline, probe_auth,
+               remote_admin, security, topology, tools)
 
 logger = logging.getLogger("homeatlas")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -48,23 +51,47 @@ async def lifespan(_app: FastAPI):
         )
     db.ensure_monitoring_for_critical()
     monitor_module.monitor.start()
-    try:
-        yield
-    finally:
-        await monitor_module.monitor.stop()
+    pipeline.scheduler.start()
+    # The MCP session manager needs its task group alive for the app's whole lifetime, same as
+    # the monitor above -- see mcp_server.py.
+    async with mcp_server.session_manager.run():
+        try:
+            yield
+        finally:
+            await monitor_module.monitor.stop()
+            await pipeline.scheduler.stop()
 
 
 app = FastAPI(title="HomeAtlas", version="1.0.0", lifespan=lifespan)
+app.mount("/api/mcp", mcp_server.asgi_app)
 
 
 # ---------------------------------------------------------------------------------------------
 # Auth plumbing
 # ---------------------------------------------------------------------------------------------
 
-def current_user(homeatlas_session: str | None = Cookie(default=None)) -> dict:
+def session_user(homeatlas_session: str | None = Cookie(default=None)) -> dict:
+    """Resolves the session without requiring MFA enrollment to already be complete. Used only by
+    the handful of routes an unenrolled session must still be able to reach: `/me` (so the
+    frontend can even tell it needs to show the enrollment screen), `/logout`, and the enrollment
+    endpoints themselves. Everything else goes through `current_user` below."""
     user = auth.get_session_user(homeatlas_session)
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Nicht angemeldet.")
+    return user
+
+
+def current_user(user: dict = Depends(session_user)) -> dict:
+    """The second factor is mandatory, not optional: a session whose account has not enrolled one
+    yet gets 403'd out of everything except the allowlist above until it does. This is the one
+    place that rule lives -- every other route in this file depends on `current_user` (directly or
+    via `require_admin`), so nothing has to remember to check it individually."""
+    if not user.get("totpEnabled"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Bitte zuerst die Zwei-Faktor-Anmeldung einrichten.",
+            headers={"X-HomeAtlas-MFA": "enrollment-required"},
+        )
     return user
 
 
@@ -80,6 +107,41 @@ def _client(request: Request) -> tuple[str, str]:
     without it every entry would read 127.0.0.1 and the log would be useless."""
     ip = request.headers.get("x-real-ip") or (request.client.host if request.client else "")
     return ip, request.headers.get("user-agent", "")
+
+
+def _ws_client(websocket: WebSocket) -> tuple[str, str]:
+    ip = websocket.headers.get("x-real-ip") or (websocket.client.host if websocket.client else "")
+    return ip, websocket.headers.get("user-agent", "")
+
+
+async def _ws_authenticate(websocket: WebSocket) -> dict | None:
+    """Same bar as `current_user`: admin role AND `totpEnabled`. Returns None (caller closes with
+    code=1008) rather than raising -- `HTTPException` has no meaning once a WebSocket connection
+    is being negotiated; there is no HTTP response left to attach it to.
+
+    A same-origin browser WebSocket handshake carries cookies automatically (confirmed: the
+    session cookie is `samesite="lax"`, which permits same-site top-level navigation-adjacent
+    requests including a same-origin WS upgrade, same as it already permits same-origin fetches).
+    The `Origin` check below is defense in depth on top of that, not a response to a found gap --
+    it costs nothing and the blast radius of getting this specific check wrong (an interactive
+    root shell) is much larger than anywhere else this app's cookie-only trust model is used.
+
+    Compares hostnames only, not ports: reverse proxies routinely normalize or drop the port from
+    the Host header they forward (confirmed against this app's own bundled nginx -- its `$host`
+    variable strips the port even though the browser's Origin always includes a non-default one),
+    so a port-exact comparison would reject legitimate same-origin connections through any such
+    proxy, not just catch cross-origin ones."""
+    origin = websocket.headers.get("origin", "")
+    if origin:
+        from urllib.parse import urlsplit
+        origin_host = urlsplit(origin).hostname or ""
+        request_host = (websocket.headers.get("host", "") or "").split(":")[0]
+        if not origin_host or origin_host != request_host:
+            return None
+    user = auth.get_session_user(websocket.cookies.get(auth.SESSION_COOKIE_NAME))
+    if user is None or not user.get("totpEnabled") or user["role"] != auth.ROLE_ADMIN:
+        return None
+    return user
 
 
 class LoginBody(BaseModel):
@@ -133,7 +195,7 @@ async def logout(response: Response, homeatlas_session: str | None = Cookie(defa
 
 
 @app.get("/api/auth/me")
-async def me(user: dict = Depends(current_user)) -> dict:
+async def me(user: dict = Depends(session_user)) -> dict:
     return {"user": user}
 
 
@@ -165,16 +227,19 @@ async def password_policy(_: dict = Depends(current_user)) -> dict:
 
 
 # ---------------------------------------------------------------------------------------------
-# Second factor (TOTP)
+# Second factor (TOTP) -- mandatory. `current_user` (see above) refuses every other route until
+# `totpEnabled` is set, so `setup`/`confirm` below use the unenrolled-friendly `session_user`
+# instead -- they are precisely the routes a not-yet-enrolled session must still reach. There is
+# deliberately no self-service "disable": once required, turning it back off is an admin action
+# (`reset_user_mfa` in the users section) so a stolen password alone can never strip it.
 # ---------------------------------------------------------------------------------------------
 
 class TotpBody(BaseModel):
     code: str = ""
-    password: str = ""
 
 
 @app.post("/api/auth/mfa/setup")
-async def mfa_setup(user: dict = Depends(current_user)) -> dict:
+async def mfa_setup(user: dict = Depends(session_user)) -> dict:
     """Creates a fresh secret and hands back the QR. Not yet active -- `totpEnabled` only flips
     after `/confirm` proves a working code, so a half-finished setup can't lock anyone out."""
     if user.get("totpEnabled"):
@@ -186,7 +251,7 @@ async def mfa_setup(user: dict = Depends(current_user)) -> dict:
 
 
 @app.post("/api/auth/mfa/confirm")
-async def mfa_confirm(body: TotpBody, request: Request, user: dict = Depends(current_user)) -> dict:
+async def mfa_confirm(body: TotpBody, request: Request, user: dict = Depends(session_user)) -> dict:
     raw = db.get_user_raw(user["id"]) or {}
     secret = crypto.decrypt(raw.get("totpSecretEnc") or "")
     if not secret:
@@ -196,18 +261,6 @@ async def mfa_confirm(body: TotpBody, request: Request, user: dict = Depends(cur
     db.update_user(user["id"], {"totpEnabled": True})
     ip, agent = _client(request)
     db.log_access("mfa.enable", user=user, ip=ip, user_agent=agent)
-    return {"ok": True}
-
-
-@app.post("/api/auth/mfa/disable")
-async def mfa_disable(body: TotpBody, request: Request, user: dict = Depends(current_user)) -> dict:
-    """Requires the account password again -- otherwise anyone at an unlocked browser could strip
-    the second factor off, which defeats the point of having one."""
-    if not auth.verify_password(user["id"], body.password):
-        raise HTTPException(status_code=400, detail="Das Passwort stimmt nicht.")
-    db.update_user(user["id"], {"totpSecretEnc": "", "totpEnabled": False})
-    ip, agent = _client(request)
-    db.log_access("mfa.disable", user=user, ip=ip, user_agent=agent)
     return {"ok": True}
 
 
@@ -303,6 +356,22 @@ async def delete_user(user_id: str, user: dict = Depends(require_admin)) -> dict
     return {"ok": True}
 
 
+@app.post("/api/users/{user_id}/mfa/reset")
+async def reset_user_mfa(user_id: str, request: Request, admin: dict = Depends(require_admin)) -> dict:
+    """The only way a second factor comes off an account -- see the module note above the TOTP
+    routes. Clears it rather than disabling the requirement: `current_user` treats
+    `totpEnabled = False` as "must enroll again", so this both recovers a locked-out user (lost
+    phone, reinstalled app) and immediately ends any open session's access to everything except
+    that enrollment, without waiting for it to expire."""
+    target = db.get_user(user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Benutzer nicht gefunden.")
+    db.update_user(user_id, {"totpSecretEnc": "", "totpEnabled": False})
+    ip, agent = _client(request)
+    db.log_access("mfa.reset", user=admin, ip=ip, user_agent=agent, detail=target["username"])
+    return {"user": db.get_user(user_id)}
+
+
 # ---------------------------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------------------------
@@ -363,6 +432,33 @@ async def update_settings(patch: dict = Body(...), _: dict = Depends(require_adm
     current = db.get_settings()
     merged = db.update_settings(_unmask_patch(patch, current))
     return {"settings": _mask_settings(merged)}
+
+
+# ---------------------------------------------------------------------------------------------
+# MCP access tokens (see mcp_server.py) -- admin-only, same "never bulk-return a secret" rule as
+# accounts: list/create responses never carry a raw token except the one moment it's minted.
+# ---------------------------------------------------------------------------------------------
+
+class McpTokenBody(BaseModel):
+    label: str
+
+
+@app.get("/api/settings/mcp-tokens")
+async def list_mcp_tokens(_: dict = Depends(require_admin)) -> dict:
+    return {"tokens": db.list_api_tokens()}
+
+
+@app.post("/api/settings/mcp-tokens")
+async def create_mcp_token(body: McpTokenBody, _: dict = Depends(require_admin)) -> dict:
+    if not body.label.strip():
+        raise HTTPException(status_code=400, detail="Bitte eine Bezeichnung angeben.")
+    return {"token": db.create_api_token(body.label.strip())}
+
+
+@app.delete("/api/settings/mcp-tokens/{token_id}")
+async def delete_mcp_token(token_id: str, _: dict = Depends(require_admin)) -> dict:
+    db.delete_api_token(token_id)
+    return {"ok": True}
 
 
 class ProviderBody(BaseModel):
@@ -527,6 +623,329 @@ async def delete_account(account_id: str, _: dict = Depends(require_admin)) -> d
 
 
 # ---------------------------------------------------------------------------------------------
+# SSH key generation/distribution and interactive consoles (see remote_admin.py) -- write-capable,
+# admin-only, never reachable from tools.py/the chat assistant. A human clicking a button in the
+# browser is the only caller any of this has.
+# ---------------------------------------------------------------------------------------------
+
+class GenerateKeyBody(BaseModel):
+    label: str = "SSH-Schlüssel (HomeAtlas)"
+
+
+@app.post("/api/systems/{system_id}/ssh-keys")
+async def generate_ssh_key(system_id: str, body: GenerateKeyBody, request: Request,
+                           user: dict = Depends(require_admin)) -> dict:
+    """Generates a new keypair and stores it as an ordinary `sshkey`-category account -- the
+    public line lives in the account's `notes` field (already unmasked by `_public_account`), so
+    no new field or reveal endpoint is needed to see it."""
+    system = db.get_system(system_id)
+    if system is None:
+        raise HTTPException(status_code=404, detail="Gerät nicht gefunden.")
+    private_pem, public_line = remote_admin.generate_keypair(comment=f"homeatlas@{system['name']}")
+    account = db.create_account({
+        "systemId": system_id, "label": body.label, "category": "sshkey", "username": "",
+        "secretEnc": crypto.encrypt(private_pem), "passphraseEnc": crypto.encrypt(""),
+        "url": "", "notes": public_line, "allowProbe": False, "port": 22,
+    })
+    ip, agent = _client(request)
+    db.log_access("sshkey.generate", user=user, ip=ip, user_agent=agent, detail=system["name"])
+    return {"account": _public_account(account), "publicKey": public_line}
+
+
+class DeployKeyBody(BaseModel):
+    loginAccountId: str
+    port: int = 0
+
+
+@app.post("/api/accounts/{account_id}/deploy")
+async def deploy_ssh_key(account_id: str, body: DeployKeyBody, request: Request,
+                         user: dict = Depends(require_admin)) -> dict:
+    """Installs an already-generated key's public half on its device, authenticating with a
+    *different*, already-trusted credential (`loginAccountId`) -- see remote_admin.deploy_public_key
+    for the read-modify-write mechanics."""
+    key_account = db.get_account(account_id)
+    if key_account is None or key_account.get("category") != "sshkey":
+        raise HTTPException(status_code=404, detail="SSH-Schlüssel nicht gefunden.")
+    login_account = db.get_account(body.loginAccountId)
+    if login_account is None:
+        raise HTTPException(status_code=404, detail="Login-Zugang nicht gefunden.")
+    if login_account.get("systemId") != key_account.get("systemId"):
+        raise HTTPException(status_code=400, detail="Der Login-Zugang gehört zu einem anderen Gerät.")
+    system = db.get_system(key_account["systemId"]) if key_account.get("systemId") else None
+    if system is None:
+        raise HTTPException(status_code=400, detail="Der Schlüssel ist keinem Gerät zugeordnet.")
+    host = (system.get("ip") or system.get("hostname") or "").strip()
+    if not host:
+        raise HTTPException(status_code=400, detail="Für dieses Gerät ist keine Adresse hinterlegt.")
+
+    result = await remote_admin.deploy_public_key(host, login_account, key_account["notes"], port=body.port)
+    ip, agent = _client(request)
+    db.log_access("sshkey.deploy", user=user, ip=ip, user_agent=agent, ok=result["ok"],
+                  detail=f"{system['name']} über {login_account['label']}")
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return {"ok": True, "changed": result["changed"]}
+
+
+def _ssh_eligible(account: dict) -> bool:
+    """Same eligibility test probe_auth.probe_system's SSH branch already uses. Deliberately NOT
+    gated on `allowProbe`: that flag's own docstring scopes it to the read-only auto-probe
+    feature specifically -- reusing it here would conflate two different consents an admin gave
+    for two different reasons."""
+    return account.get("category") == "sshkey" or (
+        account.get("category") == "login" and (account.get("port") or 0) in (22, 0)
+    )
+
+
+@app.websocket("/api/ws/systems/{system_id}/ssh-console")
+async def ssh_console(websocket: WebSocket, system_id: str) -> None:
+    user = await _ws_authenticate(websocket)
+    if user is None:
+        await websocket.close(code=1008)
+        return
+    account_id = websocket.query_params.get("accountId", "")
+    system, account = db.get_system(system_id), db.get_account(account_id)
+    if system is None or account is None or account.get("systemId") != system_id or not _ssh_eligible(account):
+        await websocket.close(code=1008)
+        return
+
+    host = (system.get("ip") or system.get("hostname") or "").strip()
+    if not host:
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+    ip, agent = _ws_client(websocket)
+    started = time.monotonic()
+    try:
+        connection, process = await remote_admin.open_ssh_pty(host, account)
+    except Exception as exc:  # noqa: BLE001 -- reported to the client, connection setup can fail
+        # in many ways (auth, network, host down) and all of them are just "console unavailable".
+        await websocket.send_json({"type": "error", "message": str(exc)})
+        await websocket.close(code=1011)
+        db.log_access("console.ssh.open", user=user, ip=ip, user_agent=agent, ok=False,
+                      detail=f"{system['name']}: {exc}")
+        return
+
+    db.log_access("console.ssh.open", user=user, ip=ip, user_agent=agent, detail=system["name"])
+    try:
+        await _relay_terminal(websocket, read=process.stdout.read, write=process.stdin.write,
+                              resize=process.change_terminal_size)
+    finally:
+        process.close()
+        connection.close()
+        db.log_access("console.ssh.close", user=user, ip=ip, user_agent=agent,
+                      detail=f"{system['name']} ({round(time.monotonic() - started)}s)")
+
+
+async def _relay_terminal(websocket: WebSocket, *, read, write, resize) -> None:
+    """Binary WS frames = raw terminal bytes, unmodified, both directions. Text WS frames = JSON
+    control messages -- currently only `{"type":"resize","cols":n,"rows":n}`. Two concurrent
+    tasks; either one finishing (EOF from the process, or the browser disconnecting) tears down
+    both, which unwinds the `finally` blocks in the caller and closes the underlying session."""
+    async def from_client() -> None:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                return
+            data = message.get("bytes")
+            if data is not None:
+                write(data)
+                continue
+            text = message.get("text")
+            if text is None:
+                continue
+            try:
+                control = json.loads(text)
+            except ValueError:
+                continue
+            if control.get("type") == "resize":
+                maybe_awaitable = resize(int(control.get("cols", 80)), int(control.get("rows", 24)))
+                if asyncio.iscoroutine(maybe_awaitable):
+                    await maybe_awaitable
+
+    async def from_process() -> None:
+        while True:
+            data = await read(4096)
+            if not data:
+                return
+            await websocket.send_bytes(data)
+
+    tasks = [asyncio.create_task(from_client()), asyncio.create_task(from_process())]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------------------------
+# Docker container control (see docker_admin.py) -- write-capable, admin-only, same posture as
+# the SSH console section above. Local containers only; see remote_admin.py for containers on
+# other hosts, reached over SSH.
+# ---------------------------------------------------------------------------------------------
+
+def _container_id(system: dict) -> str:
+    return ((system.get("extra") or {}).get("docker") or {}).get("containerId", "")
+
+
+_CONTAINER_ACTIONS = {
+    "start": docker_admin.start_container,
+    "stop": docker_admin.stop_container,
+    "restart": docker_admin.restart_container,
+}
+
+
+@app.post("/api/systems/{system_id}/container/{action}")
+async def container_action(system_id: str, action: str, request: Request,
+                           user: dict = Depends(require_admin)) -> dict:
+    if action not in _CONTAINER_ACTIONS:
+        raise HTTPException(status_code=404, detail="Unbekannte Aktion.")
+    system = db.get_system(system_id)
+    if system is None or system.get("kind") != "container":
+        raise HTTPException(status_code=404, detail="Container nicht gefunden.")
+    container_id = _container_id(system)
+    if not container_id:
+        raise HTTPException(status_code=400, detail="Keine Container-ID hinterlegt -- bitte erneut scannen.")
+
+    result = await _CONTAINER_ACTIONS[action](container_id)
+    ip, agent = _client(request)
+    db.log_access(f"container.{action}", user=user, ip=ip, user_agent=agent, ok=result["ok"], detail=system["name"])
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return {"ok": True}
+
+
+@app.get("/api/systems/{system_id}/container/logs")
+async def container_logs(system_id: str, tail: int = 200, _: dict = Depends(require_admin)):
+    system = db.get_system(system_id)
+    if system is None or system.get("kind") != "container":
+        raise HTTPException(status_code=404, detail="Container nicht gefunden.")
+    container_id = _container_id(system)
+    if not container_id:
+        raise HTTPException(status_code=400, detail="Keine Container-ID hinterlegt -- bitte erneut scannen.")
+    return StreamingResponse(docker_admin.stream_logs(container_id, tail), media_type="text/plain")
+
+
+@app.websocket("/api/ws/systems/{system_id}/docker-console")
+async def docker_console(websocket: WebSocket, system_id: str) -> None:
+    user = await _ws_authenticate(websocket)
+    if user is None:
+        await websocket.close(code=1008)
+        return
+    system = db.get_system(system_id)
+    container_id = _container_id(system) if system else ""
+    if system is None or system.get("kind") != "container" or not container_id:
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+    ip, agent = _ws_client(websocket)
+    started = time.monotonic()
+    try:
+        session = await docker_admin.open_exec_session(container_id)
+    except Exception as exc:  # noqa: BLE001 -- reported to the client; many ways this can fail
+        # (container has no shell, container gone, socket error) and all are "console unavailable".
+        await websocket.send_json({"type": "error", "message": str(exc)})
+        await websocket.close(code=1011)
+        db.log_access("console.docker.open", user=user, ip=ip, user_agent=agent, ok=False,
+                      detail=f"{system['name']}: {exc}")
+        return
+
+    db.log_access("console.docker.open", user=user, ip=ip, user_agent=agent, detail=system["name"])
+    try:
+        await _relay_terminal(websocket, read=session.read, write=session.write, resize=session.resize)
+    finally:
+        session.close()
+        db.log_access("console.docker.close", user=user, ip=ip, user_agent=agent,
+                      detail=f"{system['name']} ({round(time.monotonic() - started)}s)")
+
+
+# ---------------------------------------------------------------------------------------------
+# Remote Docker control (see remote_admin.py) -- same posture as the local section above, for
+# containers on a host other than the one HomeAtlas itself runs on, reached over SSH with a
+# stored credential. `accountId` is always required and re-validated per request (never trusted
+# from a prior call) -- same eligibility test as the SSH console.
+# ---------------------------------------------------------------------------------------------
+
+def _remote_host_and_account(system_id: str, account_id: str) -> tuple[dict, dict, str]:
+    system, account = db.get_system(system_id), db.get_account(account_id)
+    if system is None or account is None or account.get("systemId") != system_id or not _ssh_eligible(account):
+        raise HTTPException(status_code=404, detail="Gerät oder Zugang nicht gefunden.")
+    host = (system.get("ip") or system.get("hostname") or "").strip()
+    if not host:
+        raise HTTPException(status_code=400, detail="Für dieses Gerät ist keine Adresse hinterlegt.")
+    return system, account, host
+
+
+@app.get("/api/systems/{system_id}/remote-containers")
+async def list_remote_containers(system_id: str, accountId: str, _: dict = Depends(require_admin)) -> dict:
+    _system, account, host = _remote_host_and_account(system_id, accountId)
+    result = await remote_admin.list_remote_containers(host, account)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return {"containers": result["containers"]}
+
+
+@app.post("/api/systems/{system_id}/remote-containers/{container_id}/{action}")
+async def remote_container_action(system_id: str, container_id: str, action: str, accountId: str,
+                                  request: Request, user: dict = Depends(require_admin)) -> dict:
+    if action not in ("start", "stop", "restart"):
+        raise HTTPException(status_code=404, detail="Unbekannte Aktion.")
+    system, account, host = _remote_host_and_account(system_id, accountId)
+    result = await remote_admin.run_remote_docker_command(host, account, action, container_id)
+    ip, agent = _client(request)
+    db.log_access(f"container.remote.{action}", user=user, ip=ip, user_agent=agent, ok=result["ok"],
+                  detail=f"{system['name']}: {container_id[:12]}")
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return {"ok": True}
+
+
+@app.websocket("/api/ws/systems/{system_id}/remote-docker-console")
+async def remote_docker_console(websocket: WebSocket, system_id: str) -> None:
+    user = await _ws_authenticate(websocket)
+    if user is None:
+        await websocket.close(code=1008)
+        return
+    account_id = websocket.query_params.get("accountId", "")
+    container_id = websocket.query_params.get("containerId", "")
+    system, account = db.get_system(system_id), db.get_account(account_id)
+    if (system is None or account is None or account.get("systemId") != system_id
+            or not _ssh_eligible(account) or not container_id):
+        await websocket.close(code=1008)
+        return
+    host = (system.get("ip") or system.get("hostname") or "").strip()
+    if not host:
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+    ip, agent = _ws_client(websocket)
+    started = time.monotonic()
+    try:
+        connection, process = await remote_admin.open_remote_docker_exec(host, account, container_id)
+    except Exception as exc:  # noqa: BLE001 -- reported to the client, connection setup can fail
+        # in many ways (auth, network, host down, no docker on remote) -- all "console unavailable".
+        await websocket.send_json({"type": "error", "message": str(exc)})
+        await websocket.close(code=1011)
+        db.log_access("console.remote-docker.open", user=user, ip=ip, user_agent=agent, ok=False,
+                      detail=f"{system['name']}: {exc}")
+        return
+
+    db.log_access("console.remote-docker.open", user=user, ip=ip, user_agent=agent, detail=system["name"])
+    try:
+        await _relay_terminal(websocket, read=process.stdout.read, write=process.stdin.write,
+                              resize=process.change_terminal_size)
+    finally:
+        process.close()
+        connection.close()
+        db.log_access("console.remote-docker.close", user=user, ip=ip, user_agent=agent,
+                      detail=f"{system['name']} ({round(time.monotonic() - started)}s)")
+
+
+# ---------------------------------------------------------------------------------------------
 # Documentation
 # ---------------------------------------------------------------------------------------------
 
@@ -620,7 +1039,23 @@ async def probe_system(system_id: str, _: dict = Depends(require_admin)) -> dict
         db.update_system(system_id, {"extra": {**(system.get("extra") or {}), "probe": outcome["results"]}})
         if outcome.get("purpose") and not system.get("purpose"):
             db.update_system(system_id, {"purpose": outcome["purpose"]})
+        probe_auth.persist_config_backups(system, outcome)
     return {"outcome": outcome, "system": db.get_system(system_id)}
+
+
+@app.get("/api/systems/{system_id}/config-versions")
+async def list_config_versions(system_id: str, _: dict = Depends(current_user)) -> dict:
+    if db.get_system(system_id) is None:
+        raise HTTPException(status_code=404, detail="Gerät nicht gefunden.")
+    return {"versions": db.list_device_config_versions(system_id)}
+
+
+@app.get("/api/systems/{system_id}/config-versions/{version_id}")
+async def get_config_version(system_id: str, version_id: str, _: dict = Depends(current_user)) -> dict:
+    version = db.get_device_config_version(version_id)
+    if version is None or version["systemId"] != system_id:
+        raise HTTPException(status_code=404, detail="Version nicht gefunden.")
+    return {"version": {**version, "content": crypto.decrypt(version["content"])}}
 
 
 # ---------------------------------------------------------------------------------------------

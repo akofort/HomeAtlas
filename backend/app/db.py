@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -119,6 +120,20 @@ CREATE TABLE IF NOT EXISTS sessions (
     expiresAt TEXT NOT NULL
 );
 
+-- Long-lived credentials for the MCP server (see mcp_server.py) -- external LLM clients have no
+-- browser session to present, so they authenticate with one of these instead. Stored raw, same as
+-- session tokens above: server-generated, high-entropy, and a database compromise already means
+-- every session and password is exposed too, so hashing here buys nothing sessions don't already
+-- forgo.
+CREATE TABLE IF NOT EXISTS apiTokens (
+    id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    token TEXT NOT NULL UNIQUE,
+    createdAt TEXT NOT NULL,
+    lastUsedAt TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_apitokens_token ON apiTokens(token);
+
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -204,6 +219,21 @@ CREATE TABLE IF NOT EXISTS docPageVersions (
     createdAt TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_docversions_slug ON docPageVersions(slug, createdAt DESC);
+
+-- Backups of a device's own textual configuration (Mikrotik `/export`, Aruba `show
+-- running-config`, ...), view-only history modeled on docPageVersions. `content` is encrypted at
+-- rest (see probe_auth.persist_config_backups) -- unlike documentation text, a device export can
+-- contain secrets (SNMP community strings, RADIUS shared secrets, WiFi keys). Never written back
+-- to the device: see the read-only invariant in probe_auth.py's module docstring.
+CREATE TABLE IF NOT EXISTS deviceConfigVersions (
+    id TEXT PRIMARY KEY,
+    systemId TEXT NOT NULL,
+    label TEXT NOT NULL,
+    content TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    createdAt TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_configversions_system ON deviceConfigVersions(systemId, createdAt DESC);
 
 CREATE TABLE IF NOT EXISTS docPages (
     id TEXT PRIMARY KEY,
@@ -306,6 +336,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "scanEnableMdns": True,
     "scanEnableSsdp": True,
     "scanEnableDocker": True,
+    "scanEnableOmada": True,
     "scanEnableHttpBanner": True,
     "scanUseLlm": True,
     "scanExcludeIps": [],
@@ -313,6 +344,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # bridge. Addresses of hand-created devices are added automatically (see pipeline).
     "scanExtraTargets": [],
     "scanUseCredentials": True,
+    "scanAutoEnabled": False,
+    "scanAutoIntervalHours": 24,
+    "configVersionKeep": 50,
     # Live monitoring
     "monitorEnabled": True,
     "monitorIntervalSeconds": 10,
@@ -446,6 +480,45 @@ def delete_db_session(token: str) -> None:
         conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
 
 
+def create_api_token(label: str) -> dict:
+    """The raw token is returned here and only here -- the same one-time-reveal shape as the admin
+    bootstrap password in auth.py. `list_api_tokens` never selects the `token` column."""
+    token_id = _new_id()
+    token = secrets.token_urlsafe(32)
+    now = _now()
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO apiTokens(id, label, token, createdAt, lastUsedAt) VALUES(?,?,?,?,?)",
+            (token_id, label, token, now, None),
+        )
+    return {"id": token_id, "label": label, "token": token, "createdAt": now, "lastUsedAt": None}
+
+
+def list_api_tokens() -> list[dict]:
+    with _conn() as conn:
+        return _rows(conn.execute(
+            "SELECT id, label, createdAt, lastUsedAt FROM apiTokens ORDER BY createdAt DESC"
+        ))
+
+
+def delete_api_token(token_id: str) -> None:
+    with _conn() as conn:
+        conn.execute("DELETE FROM apiTokens WHERE id = ?", (token_id,))
+
+
+def touch_api_token(token: str) -> dict | None:
+    """Looked up on every MCP request (see mcp_server.py). Updates `lastUsedAt` on a hit so the
+    settings UI can show which tokens are actually in use versus long-forgotten."""
+    with _conn() as conn:
+        row = _row(conn.execute("SELECT * FROM apiTokens WHERE token = ?", (token,)).fetchone())
+        if row is None:
+            return None
+        now = _now()
+        conn.execute("UPDATE apiTokens SET lastUsedAt = ? WHERE id = ?", (now, row["id"]))
+        row["lastUsedAt"] = now
+        return row
+
+
 # --------------------------------------------------------------------------------------------
 # Systems (the inventory)
 # --------------------------------------------------------------------------------------------
@@ -536,6 +609,29 @@ def find_system_by_key(discovery_key: str) -> dict | None:
         return None
     with _conn() as conn:
         return _row(conn.execute("SELECT * FROM systems WHERE discoveryKey = ?", (discovery_key,)).fetchone())
+
+
+def link_containers_to_host(host_ip: str) -> int:
+    """Docker containers are discovered with the scanning host's own IP (see docker_probe.py) but
+    no link to the system row that represents that host. Called once per scan to fill that in, so
+    the network plan can nest a host's containers under it instead of showing a flat count with no
+    owner. Never touches a parentId a human already set by hand."""
+    if not host_ip:
+        return 0
+    with _conn() as conn:
+        host = conn.execute(
+            "SELECT id FROM systems WHERE ip = ? AND kind NOT IN ('container', 'vm') "
+            "ORDER BY CASE kind WHEN 'server' THEN 0 WHEN 'nas' THEN 1 WHEN 'pc' THEN 2 ELSE 3 END LIMIT 1",
+            (host_ip,),
+        ).fetchone()
+        if host is None:
+            return 0
+        cursor = conn.execute(
+            "UPDATE systems SET parentId = ?, updatedAt = ? "
+            "WHERE ip = ? AND discoverySource = 'docker' AND (parentId IS NULL OR parentId = '') AND id != ?",
+            (host["id"], _now(), host_ip, host["id"]),
+        )
+        return cursor.rowcount
 
 
 def upsert_discovered_system(found: dict) -> tuple[dict, bool]:
@@ -788,6 +884,54 @@ def reset_doc_page(slug: str) -> None:
 def delete_doc_page(slug: str) -> None:
     with _conn() as conn:
         conn.execute("DELETE FROM docPages WHERE slug = ?", (slug,))
+
+
+# --------------------------------------------------------------------------------------------
+# Device configuration backups
+# --------------------------------------------------------------------------------------------
+
+# Fallback only -- the effective value is "configVersionKeep" in settings (see SettingsPage.tsx),
+# read fresh on every call below so a changed setting applies to the very next backup.
+_CONFIG_VERSION_KEEP_DEFAULT = 50
+
+
+def save_device_config_version(system_id: str, label: str, content_enc: str, source: str) -> dict | None:
+    """`content_enc` must already be encrypted by the caller (see probe_auth.persist_config_backups)
+    -- this module stays as crypto-agnostic for device configs as it already is for account
+    secrets. The caller is also responsible for deciding whether the content actually changed
+    (comparing ciphertexts here would be meaningless: encryption is never deterministic)."""
+    keep = max(1, min(1000, int(get_settings().get("configVersionKeep") or _CONFIG_VERSION_KEEP_DEFAULT)))
+    with _conn() as conn:
+        version_id = _new_id()
+        conn.execute(
+            "INSERT INTO deviceConfigVersions(id, systemId, label, content, source, createdAt) "
+            "VALUES(?,?,?,?,?,?)",
+            (version_id, system_id, label, content_enc, source, _now()),
+        )
+        # Unbounded history would grow by a full device export every scan that changes anything.
+        conn.execute(
+            "DELETE FROM deviceConfigVersions WHERE systemId = ? AND label = ? AND id NOT IN "
+            "(SELECT id FROM deviceConfigVersions WHERE systemId = ? AND label = ? "
+            "ORDER BY createdAt DESC, rowid DESC LIMIT ?)",
+            (system_id, label, system_id, label, keep),
+        )
+        return _row(conn.execute("SELECT * FROM deviceConfigVersions WHERE id = ?", (version_id,)).fetchone())
+
+
+def list_device_config_versions(system_id: str) -> list[dict]:
+    """Without `content` -- callers that only need the list (to render a table, or to find the
+    latest version for a change check) should not have to decrypt every row to get it."""
+    with _conn() as conn:
+        return _rows(conn.execute(
+            "SELECT id, systemId, label, source, createdAt, length(content) AS size "
+            "FROM deviceConfigVersions WHERE systemId = ? ORDER BY createdAt DESC, rowid DESC",
+            (system_id,),
+        ))
+
+
+def get_device_config_version(version_id: str) -> dict | None:
+    with _conn() as conn:
+        return _row(conn.execute("SELECT * FROM deviceConfigVersions WHERE id = ?", (version_id,)).fetchone())
 
 
 # --------------------------------------------------------------------------------------------

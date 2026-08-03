@@ -5,16 +5,26 @@ what helps, **but never change anything**. That "never" has to be a property of 
 promise in a docstring, because the credentials involved are usually root or router-admin. Four
 things enforce it:
 
-1. **A hardcoded command allowlist.** `_SSH_COMMANDS` is a module constant. There is no setting,
-   no API parameter and no LLM tool that can add to it. Making it configurable would turn this
-   into a remote-execution feature with a nice UI, which is precisely what it must not be.
+1. **A hardcoded command allowlist.** `_SSH_COMMANDS` (and its platform variants,
+   `_SSH_COMMANDS_MIKROTIK`/`_SSH_COMMANDS_ARUBA`/`_SSH_COMMANDS_CISCO`) are module constants.
+   There is no setting, no API parameter and no LLM tool that can add to them. Making it
+   configurable would turn this into a remote-execution feature with a nice UI, which is
+   precisely what it must not be.
 2. **Every command is read-only** and non-interactive: no package manager, no service control, no
-   redirect, no `sudo`. Failures are expected and swallowed (`2>/dev/null`) so a missing binary
-   never turns into a retry with something more aggressive.
-3. **HTTP is GET-only**, and TR-064 uses only `GetInfo`-style SOAP actions -- the `Set*` half of
-   that API is never constructed.
+   redirect, no `sudo`, no RouterOS/ArubaOS/IOS config-mode command, no `/export show-sensitive`,
+   no `enable`.
+   Failures are expected and swallowed (`2>/dev/null`) so a missing binary never turns into a
+   retry with something more aggressive.
+3. **HTTP is GET-only**, TR-064 uses only `GetInfo`-style SOAP actions -- the `Set*` half of that
+   API is never constructed -- and SNMP (`probe_snmp`) only ever runs `snmpget`/`snmpwalk`, never
+   `snmpset`.
 4. **Opt-in per credential.** Nothing here runs unless a human ticked `allowProbe` on that
    specific stored credential (see `db.list_probe_accounts`).
+
+`persist_config_backups` is the one exception to "this module never touches storage": it saves a
+device's own config export as history (`db.deviceConfigVersions`), encrypted, since that text can
+carry secrets. There is deliberately no restore path back to the device -- that would mean writing
+configuration to hardware, which is exactly what this module exists to never do.
 
 Host keys are deliberately not verified: HomeAtlas has no trust store, and the alternative --
 refusing to connect to every device on first contact -- would make the feature useless on the very
@@ -29,7 +39,7 @@ import xml.etree.ElementTree as ElementTree
 
 import httpx
 
-from . import crypto
+from . import crypto, db
 
 _SSH_TIMEOUT = 15.0
 _HTTP_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
@@ -56,6 +66,14 @@ _SSH_COMMANDS: tuple[tuple[str, str, str], ...] = (
     ("services", "Laufende Dienste",
      "systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null "
      "| awk '{print $1}' | head -20"),
+    # Speculative, same as the "docker" line above: harmless empty output on any host that isn't
+    # running a TP-Link Omada Software Controller (official Linux installer's own backup path).
+    # Base64-encoded because the backup itself is a binary blob, not text -- deviceConfigVersions'
+    # `content` column is TEXT, same trick used for storing any binary secret as a string elsewhere
+    # in this app. `-w0` avoids line-wrapping so the whole thing round-trips as one field.
+    ("omada_backup", "Omada-Controller-Sicherung (neueste Datei, Base64)",
+     "ls -1t /opt/tplink/EAPController/data/backup/*.cfg 2>/dev/null | head -1 "
+     "| xargs -r base64 -w0 2>/dev/null"),
 )
 
 # What each command's presence suggests about the device's role, used to fill `purpose` when
@@ -66,6 +84,86 @@ _ROLE_HINTS: tuple[tuple[str, str, str], ...] = (
     ("virt", "lxc|docker", "Container"),
 )
 
+# Platform-specific read-only command sets, same shape and same invariant as `_SSH_COMMANDS`
+# above: a RouterOS, ArubaOS or Cisco IOS CLI does not understand POSIX shell, so probing a
+# switch/router with the Linux-oriented set would just fail silently and collect nothing useful.
+_SSH_COMMANDS_MIKROTIK: tuple[tuple[str, str, str], ...] = (
+    ("identity", "Geräte-Identität", "/system identity print"),
+    ("resource", "System", "/system resource print"),
+    ("routerboard", "Hardware", "/system routerboard print"),
+    ("vlan", "VLANs", "/interface vlan print detail without-paging"),
+    ("bridge_ports", "Bridge-Ports (VLAN-Zuordnung)", "/interface bridge port print detail without-paging"),
+    ("neighbors", "Nachbargeräte (LLDP/CDP/MNDP)", "/ip neighbor print detail without-paging"),
+    ("interfaces", "Schnittstellen", "/interface print detail without-paging"),
+    # Never "/export show-sensitive" -- that writes out stored PPPoE/WiFi passwords in cleartext,
+    # which would break the "secrets never exposed" invariant this whole module exists to uphold.
+    ("config_export", "Vollständige Konfiguration", "/export compact"),
+)
+
+_SSH_COMMANDS_ARUBA: tuple[tuple[str, str, str], ...] = (
+    # Classic ArubaOS-Switch (ProCurve-derived) CLI. ArubaOS-CX, the newer REST-first line, uses a
+    # different command grammar and is not covered here -- SNMP (see probe_snmp) is the fallback.
+    ("system", "System", "show system-information"),
+    ("vlan", "VLANs", "show vlan"),
+    ("vlan_ports", "VLAN-Port-Zuordnung", "show vlan ports all detail"),
+    ("neighbors", "Nachbargeräte (LLDP)", "show lldp info remote-device"),
+    ("interfaces", "Schnittstellen", "show interfaces brief"),
+    ("config_export", "Vollständige Konfiguration", "show running-config"),
+)
+
+_SSH_COMMANDS_CISCO: tuple[tuple[str, str, str], ...] = (
+    # Classic Cisco IOS/IOS-XE CLI. Assumes the SSH login already lands in privilege level 15 (no
+    # "enable" step) -- probe_ssh's one-shot-exec-per-command model has no way to answer an enable
+    # password prompt anyway, since each command below runs in its own fresh exec channel rather
+    # than a shared interactive shell.
+    # "| no-more" is IOS's own output modifier for suppressing the "--More--" pager, so pagination
+    # never needs a "terminal length 0" step beforehand -- that setting only lives for the duration
+    # of one exec channel here, which would be gone again by the next command anyway.
+    ("system", "System", "show version | no-more"),
+    ("vlan", "VLANs", "show vlan brief | no-more"),
+    ("neighbors", "Nachbargeräte (CDP)", "show cdp neighbors detail | no-more"),
+    ("interfaces", "Schnittstellen", "show interfaces status | no-more"),
+    ("config_export", "Vollständige Konfiguration", "show running-config | no-more"),
+)
+
+# Facts holding a full device config export -- picked up by `extract_config_backups` below and
+# fed into deviceConfigVersions. Kept separate from the general truncation limit (see probe_ssh)
+# because a whole router/switch config is the point of collecting it, not a side note.
+_CONFIG_BACKUP_KEYS = {"config_export", "omada_backup"}
+
+# Base64-encoded binary backups (currently just "omada_backup") need a much larger ceiling than
+# text config exports -- a few hundred KB of raw backup easily becomes >60000 base64 characters,
+# and unlike a truncated text config (still partially readable), a truncated base64 string decodes
+# to corrupt garbage. So these get their own, far larger limit, and a fact that still hits that
+# limit is dropped entirely rather than stored truncated -- a missing backup is safer than one that
+# silently doesn't restore.
+_BINARY_BACKUP_KEYS = {"omada_backup"}
+_BINARY_BACKUP_LIMIT = 4_000_000
+
+
+def _detect_platform(system: dict) -> str:
+    """String heuristic on what the device claims to be, same pattern as the FRITZ!Box check in
+    probe_system below -- an account's category never implies a device's platform."""
+    haystack = " ".join([
+        system.get("vendor", ""), system.get("model", ""), system.get("name", ""), system.get("os", ""),
+    ]).lower()
+    if "mikrotik" in haystack or "routeros" in haystack:
+        return "mikrotik"
+    if "aruba" in haystack:
+        return "aruba"
+    if "cisco" in haystack:
+        return "cisco"
+    return ""
+
+
+def _normalize_config_text(text: str) -> str:
+    """Strips comment lines before comparing two config exports for equality. Mikrotik's `/export`
+    starts with a comment line carrying the export's own timestamp, which would otherwise make
+    every scan look like a change and defeat the point of only keeping history when something
+    actually moved. The stored version keeps the original text -- only the comparison is blind to
+    these lines."""
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
 
 def _decode_secret(account: dict) -> tuple[str, str]:
     return crypto.decrypt(account.get("secretEnc") or ""), crypto.decrypt(account.get("passphraseEnc") or "")
@@ -75,8 +173,11 @@ def _decode_secret(account: dict) -> tuple[str, str]:
 # SSH
 # ---------------------------------------------------------------------------------------------
 
-async def probe_ssh(host: str, account: dict) -> dict:
-    """Runs the fixed read-only command set over SSH. Returns {"ok", "facts", "error"}."""
+async def probe_ssh(host: str, account: dict, platform: str = "") -> dict:
+    """Runs the fixed read-only command set over SSH. Returns {"ok", "facts", "error"}.
+
+    `platform` picks which command set applies -- Linux-oriented by default, or one of the
+    RouterOS/ArubaOS/Cisco IOS sets above once `_detect_platform` recognises the target device."""
     try:
         import asyncssh
     except ImportError:
@@ -108,10 +209,14 @@ async def probe_ssh(host: str, account: dict) -> dict:
     except (ValueError, KeyError) as exc:
         return {"ok": False, "error": f"Der hinterlegte SSH-Schlüssel ließ sich nicht lesen: {exc}", "facts": {}}
 
+    commands = {
+        "mikrotik": _SSH_COMMANDS_MIKROTIK, "aruba": _SSH_COMMANDS_ARUBA, "cisco": _SSH_COMMANDS_CISCO,
+    }.get(platform, _SSH_COMMANDS)
+
     facts: dict[str, dict] = {}
     try:
         async with asyncssh.connect(**connect_args) as connection:
-            for key_name, label, command in _SSH_COMMANDS:
+            for key_name, label, command in commands:
                 try:
                     result = await asyncio.wait_for(
                         connection.run(command, check=False), timeout=_SSH_TIMEOUT
@@ -121,7 +226,17 @@ async def probe_ssh(host: str, account: dict) -> dict:
                     continue
                 output = (result.stdout or "").strip()
                 if output:
-                    facts[key_name] = {"label": label, "value": output[:1200]}
+                    if key_name in _BINARY_BACKUP_KEYS:
+                        if len(output) >= _BINARY_BACKUP_LIMIT:
+                            continue  # would decode to garbage -- see _BINARY_BACKUP_LIMIT's docstring
+                        limit = _BINARY_BACKUP_LIMIT
+                    elif key_name in _CONFIG_BACKUP_KEYS:
+                        # A full device config export is the point of collecting it, not a side
+                        # note -- give it a much wider bound than the other, single-fact commands.
+                        limit = 60000
+                    else:
+                        limit = 1200
+                    facts[key_name] = {"label": label, "value": output[:limit]}
     except Exception as exc:  # noqa: BLE001 -- asyncssh raises a wide family of connection errors
         return {"ok": False, "error": f"SSH-Verbindung zu {host}:{port} fehlgeschlagen: {exc}", "facts": {}}
 
@@ -187,6 +302,68 @@ async def probe_http(url: str, account: dict) -> dict:
     return {"ok": False, "facts": {},
             "error": "Die Weboberfläche antwortet, hat die hinterlegten Zugangsdaten aber abgelehnt "
                      "(weder Basic- noch Digest-Anmeldung)."}
+
+
+# ---------------------------------------------------------------------------------------------
+# SNMP (v2c community string only), for switches that have no SSH management at all
+# ---------------------------------------------------------------------------------------------
+
+_SNMP_TIMEOUT = 10.0
+_SNMP_PORT = 161
+
+# (Schlüssel, Beschriftung, OID, ist_walk). Same allowlist posture as `_SSH_COMMANDS`: only
+# `snmpget`/`snmpwalk` are ever invoked, never `snmpset` -- there is no code path that can write.
+_SNMP_OIDS: tuple[tuple[str, str, str, bool], ...] = (
+    ("sysName", "Systemname", "1.3.6.1.2.1.1.5.0", False),
+    ("sysDescr", "Systembeschreibung", "1.3.6.1.2.1.1.1.0", False),
+    ("interfaces", "Schnittstellen", "1.3.6.1.2.1.2.2.1.2", True),  # IF-MIB ifDescr
+    ("lldpNeighbors", "Nachbargeräte (LLDP)", "1.0.8802.1.1.2.1.4.1.1", True),  # LLDP-MIB remote table
+    ("vlans", "VLANs (Q-BRIDGE-MIB)", "1.3.6.1.2.1.17.7.1.4.3.1", True),  # dot1qVlanStaticTable
+)
+
+
+async def _snmp_run(*args: str) -> str:
+    """Fixed argv via exec, never a shell string -- `args` are only ever the constants above plus
+    the target host/community, never anything composed from free-form user input."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:  # snmpget/snmpwalk not installed -- treated as "no output", like a missing
+        # binary already is in the SSH command loop.
+        return ""
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_SNMP_TIMEOUT)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return ""
+    return stdout.decode("utf-8", errors="replace").strip()
+
+
+async def probe_snmp(host: str, account: dict) -> dict:
+    """Walks a fixed OID set with the stored community string. Read-only by construction: an SNMP
+    SET has no counterpart anywhere in this function. Output is kept as raw walk text rather than
+    parsed into structured VLAN/neighbor tables -- formats vary enough between net-snmp versions
+    and vendor MIB implementations that a parser would be more fragile than useful here."""
+    community, _ = _decode_secret(account)
+    if not community:
+        return {"ok": False, "error": "Keine Community-Zeichenkette hinterlegt.", "facts": {}}
+    port = int(account.get("port") or 0) or _SNMP_PORT
+    target = f"{host}:{port}"
+
+    facts: dict[str, dict] = {}
+    for key, label, oid, is_walk in _SNMP_OIDS:
+        binary = "snmpwalk" if is_walk else "snmpget"
+        output = await _snmp_run(binary, "-v2c", "-c", community, "-t", "3", "-r", "1", target, oid)
+        if output and "Timeout" not in output and "No Such" not in output:
+            facts[key] = {"label": label, "value": output[:20000]}
+
+    if not facts:
+        return {"ok": False, "facts": {}, "error": (
+            f"Keine SNMP-Antwort von {target}. Community-Zeichenkette prüfen oder ob SNMP auf dem "
+            "Gerät aktiviert ist."
+        )}
+    return {"ok": True, "error": "", "facts": facts}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -333,6 +510,7 @@ async def probe_system(system: dict, accounts: list[dict]) -> dict:
     is_fritzbox = "fritz" in " ".join(
         [system.get("vendor", ""), system.get("model", ""), system.get("name", "")]
     ).lower()
+    platform = _detect_platform(system)
 
     # TR-064 works partly without a login, so it runs for AVM hardware regardless.
     if is_fritzbox or system.get("kind") == "router":
@@ -344,12 +522,21 @@ async def probe_system(system: dict, accounts: list[dict]) -> dict:
     for account in accounts:
         category = account.get("category")
         if category == "sshkey" or (category == "login" and (account.get("port") or 0) in (22, 0)):
-            if category == "sshkey" or system.get("kind") in ("server", "nas", "vm", "pc", "container"):
-                result = await probe_ssh(host, account)
+            # A detected Mikrotik/Aruba widens this beyond the usual Linux-host kinds -- a
+            # router/switch admin login is exactly the "login" shape SSH probing was built for,
+            # it just never had a matching platform to run non-Linux commands against before.
+            if category == "sshkey" or platform or system.get("kind") in ("server", "nas", "vm", "pc", "container"):
+                result = await probe_ssh(host, account, platform)
                 if result["ok"]:
                     results[f"ssh:{account['label']}"] = result
                 elif "ssh" not in results:
                     results[f"ssh:{account['label']}"] = result
+        if category == "snmp":
+            result = await probe_snmp(host, account)
+            if result["ok"]:
+                results[f"snmp:{account['label']}"] = result
+            elif "snmp" not in results:
+                results[f"snmp:{account['label']}"] = result
         url = account.get("url") or system.get("url")
         if url and category in ("login", "apikey"):
             result = await probe_http(url, account)
@@ -357,3 +544,39 @@ async def probe_system(system: dict, accounts: list[dict]) -> dict:
                 results[f"http:{account['label']}"] = result
 
     return {"ran": bool(results), "results": results, "purpose": _derive_purpose(results), "reason": ""}
+
+
+def extract_config_backups(system: dict, outcome: dict) -> list[tuple[str, str, str]]:
+    """(label, content, source) triples for any full-config-export fact in a probe outcome. Pure
+    function -- no db import, so this module stays exactly what its docstring claims: it reads
+    devices, it does not touch storage. The caller (main.py, pipeline.py) decides what to persist."""
+    backups: list[tuple[str, str, str]] = []
+    for source, result in outcome.get("results", {}).items():
+        if not result.get("ok"):
+            continue
+        for key, fact in result.get("facts", {}).items():
+            if key in _CONFIG_BACKUP_KEYS:
+                backups.append((f"{system.get('name', 'Gerät')} – {fact['label']}", fact["value"], source))
+    return backups
+
+
+def persist_config_backups(system: dict, outcome: dict) -> int:
+    """Stores any full-config-export facts from a probe outcome as a new deviceConfigVersions row
+    -- but only when the content actually changed (comparing normalized text, see
+    `_normalize_config_text`), so a scan that finds nothing different doesn't grow the history.
+    Called from both probe call sites (main.py's manual probe endpoint, pipeline.py's scheduled
+    scan) so the logic lives once. Content is encrypted before it ever reaches the database -- a
+    device export can carry secrets (SNMP community strings, RADIUS shared secrets, WiFi keys),
+    the same threat model as `accounts.secretEnc`. Returns how many new versions were written."""
+    saved = 0
+    for label, content, source in extract_config_backups(system, outcome):
+        existing = next((v for v in db.list_device_config_versions(system["id"]) if v["label"] == label), None)
+        changed = True
+        if existing is not None:
+            previous = db.get_device_config_version(existing["id"])
+            if previous is not None:
+                changed = _normalize_config_text(crypto.decrypt(previous["content"])) != _normalize_config_text(content)
+        if changed:
+            db.save_device_config_version(system["id"], label, crypto.encrypt(content), source)
+            saved += 1
+    return saved

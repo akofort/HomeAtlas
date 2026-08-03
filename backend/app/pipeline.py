@@ -8,11 +8,14 @@ documentation run each degrade to a warning on the scan, so a scan never ends wi
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import traceback
 
 import ipaddress
+from datetime import datetime, timedelta, timezone
 
-from . import classify, db, discovery, docker_probe, docs, oui, probe_auth
+from . import classify, crypto, db, discovery, docker_probe, docs, omada_probe, oui, probe_auth
 
 
 def _extra_targets(settings: dict, subnets_hint: list[str]) -> list[str]:
@@ -97,6 +100,8 @@ async def _probe_with_credentials(log) -> tuple[int, list[str]]:
         db.update_system(system["id"], patch)
         probed += 1
         log(f"Abgefragt: {system['name']} ({', '.join(outcome['results'])})")
+        if probe_auth.persist_config_backups(system, outcome):
+            log(f"Konfiguration von {system['name']} gesichert")
 
     if used_fallback:
         log(f"Standard-Zugang bei {used_fallback} Gerät(en) ohne eigenen Zugang versucht")
@@ -144,6 +149,21 @@ async def run_full_scan(scan_id: str) -> None:
             else:
                 log("Docker-Socket nicht eingebunden -- Container werden übersprungen")
 
+        if settings.get("scanEnableOmada", True):
+            omada_accounts = [a for a in db.list_accounts()
+                              if a.get("category") == "omada" and a.get("allowProbe")]
+            if omada_accounts:
+                progress("Omada-Geräte erfassen", 87, "Frage Omada Controller ab")
+            for account in omada_accounts:
+                client_id = account.get("username") or ""
+                client_secret = crypto.decrypt(account.get("secretEnc") or "")
+                omada_result = await omada_probe.probe(account.get("url") or "", client_id, client_secret)
+                if omada_result["ok"]:
+                    findings += omada_result["systems"]
+                    log(f"Omada ({account['label']}): {len(omada_result['systems'])} Geräte gefunden")
+                else:
+                    warnings.append(f"Omada Controller ({account['label']}): {omada_result['error']}")
+
         if settings.get("scanUseLlm", True):
             progress("Geräte einordnen (KI)", 89, "KI-Einordnung unbekannter Geräte")
             classifications, classify_warnings = await classify.classify(findings, settings, log)
@@ -162,6 +182,12 @@ async def run_full_scan(scan_id: str) -> None:
             updated += 0 if was_created else 1
         db.mark_systems_offline(seen_ids)
         log(f"Inventar: {created} neu, {updated} aktualisiert")
+
+        host_ip = result.get("hostIp", "")
+        if host_ip:
+            linked = db.link_containers_to_host(host_ip)
+            if linked:
+                log(f"{linked} Container dem Host {host_ip} zugeordnet")
 
         # Anything critical is worth watching continuously -- that is what "critical" means. Done
         # here rather than in the UI so it also covers devices a scan just promoted.
@@ -206,3 +232,64 @@ async def run_full_scan(scan_id: str) -> None:
     except Exception as exc:  # noqa: BLE001 -- background task; the failure has to land in the row
         db.update_scan(scan_id, log_line=f"FEHLER: {exc}\n{traceback.format_exc(limit=3)}")
         db.finish_scan(scan_id, "failed", {"error": str(exc), "warnings": warnings})
+
+
+# ---------------------------------------------------------------------------------------------
+# Scheduler -- an optional, opt-in timer around run_full_scan (which is also how config backups
+# happen, see probe_auth.persist_config_backups above). Same start/stop/loop shape as monitor.py's
+# Monitor: settings are re-read every tick, so flipping "scanAutoEnabled" or changing the interval
+# in SettingsPage takes effect within one poll, not only after a restart or the previous
+# (possibly day-long) interval elapses.
+# ---------------------------------------------------------------------------------------------
+
+# How often the loop wakes to check whether a scan is *due* -- not the scan interval itself.
+_SCHEDULER_POLL_SECONDS = 300
+
+
+class Scheduler:
+    def __init__(self) -> None:
+        self._task: asyncio.Task | None = None
+        self.last_error: str = ""
+
+    def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._loop())
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+
+    async def _loop(self) -> None:
+        while True:
+            try:
+                await self._maybe_run()
+                self.last_error = ""
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 -- the loop has to outlive any single failure
+                self.last_error = str(exc)
+            await asyncio.sleep(_SCHEDULER_POLL_SECONDS)
+
+    async def _maybe_run(self) -> None:
+        settings = db.get_settings()
+        if not settings.get("scanAutoEnabled", False):
+            return
+        if db.running_scan() is not None:
+            return  # a manual (or already-running automatic) scan takes priority -- never queue a second one
+        interval_hours = max(1, min(24 * 30, int(settings.get("scanAutoIntervalHours") or 24)))
+        latest = db.latest_scan()
+        if latest is not None:
+            started = datetime.strptime(latest["startedAt"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - started < timedelta(hours=interval_hours):
+                return  # last scan (manual or automatic) is still recent enough
+        scan_id = db.create_scan("automatisch (Zeitplan)")
+        await run_full_scan(scan_id)
+
+    def status(self) -> dict:
+        return {"running": self._task is not None and not self._task.done(), "lastError": self.last_error}
+
+
+scheduler = Scheduler()

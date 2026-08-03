@@ -101,6 +101,10 @@ async def probe(host_ip: str = "") -> dict:
             "url": f"http://{host_ip}:{published[0]}" if host_ip and published else "",
             "extra": {
                 "docker": {
+                    # Full ID, unlike discoveryKey's [:12] -- docker_admin.py's start/stop/restart/
+                    # exec actions need the exact ID, and Docker's actions API accepts short IDs
+                    # too but there is no reason to rely on that when the full one is right here.
+                    "containerId": container.get("Id", ""),
                     "image": container.get("Image", ""),
                     "imageId": (container.get("ImageID") or "")[:19],
                     "state": state,

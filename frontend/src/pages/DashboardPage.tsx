@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, type Dashboard, type DiagnosticResult } from "../lib/api";
 import { useAuth } from "../App";
+import { KindIcon } from "../lib/icons";
 
 export default function DashboardPage() {
   const { isAdmin } = useAuth();
@@ -176,7 +177,10 @@ export default function DashboardPage() {
                     .map(([kind, count]) => (
                       <tr key={kind}>
                         <td>
-                          <Link to={`/geraete?kind=${kind}`}>{data.kindLabels[kind] ?? kind}</Link>
+                          <Link to={`/geraete?kind=${kind}`} className="row" style={{ gap: 6, flexWrap: "nowrap" }}>
+                            <KindIcon kind={kind} className="muted" />
+                            {data.kindLabels[kind] ?? kind}
+                          </Link>
                         </td>
                         <td style={{ width: 1, textAlign: "right" }}>{count}</td>
                       </tr>

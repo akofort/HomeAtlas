@@ -25,10 +25,24 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     } catch {
       /* keep the status line */
     }
-    throw new ApiError(response.status, detail, response.headers.get("X-HomeAtlas-MFA") === "required");
+    const mfaHeader = response.headers.get("X-HomeAtlas-MFA");
+    if (mfaHeader === "enrollment-required") {
+      // The account's second factor was reset (by an admin) while this session was open
+      // elsewhere. A reload re-fetches /me and lets App.tsx route into the enrollment screen,
+      // instead of every subsequent action in this tab just failing with a confusing 403.
+      window.location.reload();
+    }
+    throw new ApiError(response.status, detail, mfaHeader === "required");
   }
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
+}
+
+// Same-origin WS URL for the interactive console routes. `path` already includes the leading
+// `/api/...` (unlike `request()`'s paths, which get it prepended). No token in the URL: a
+// same-origin WebSocket handshake carries the session cookie automatically, same as `fetch`.
+export function wsUrl(path: string): string {
+  return `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}${path}`;
 }
 
 const get = <T,>(path: string) => request<T>(path);
@@ -142,6 +156,7 @@ export interface System {
   monitorPorts: number[] | null;
   openPorts: number[] | null;
   services: ServiceInfo[] | null;
+  tags: string[] | null;
   extra: Record<string, any> | null;
   firstSeen: string;
   lastSeen: string;
@@ -176,6 +191,34 @@ export interface DocVersion {
   size: number;
   bodyMd?: string;
   manualMd?: string;
+}
+
+export interface RemoteContainer {
+  id: string;
+  name: string;
+  image: string;
+  state: string;
+  status: string;
+}
+
+export interface ApiToken {
+  id: string;
+  label: string;
+  createdAt: string;
+  lastUsedAt: string | null;
+  /** Only present in the response right after creation — never returned by the list endpoint. */
+  token?: string;
+}
+
+export interface ConfigVersion {
+  id: string;
+  systemId: string;
+  label: string;
+  source: string;
+  createdAt: string;
+  size: number;
+  /** Only present when fetched via getConfigVersion — the list endpoint omits it. */
+  content?: string;
 }
 
 export interface ProbeFact {
@@ -290,7 +333,6 @@ export const api = {
   passwordPolicy: () => get<PasswordPolicy>("/auth/password-policy"),
   mfaSetup: () => post<{ secret: string; uri: string; qrSvg: string }>("/auth/mfa/setup"),
   mfaConfirm: (code: string) => post<{ ok: boolean }>("/auth/mfa/confirm", { code }),
-  mfaDisable: (password: string) => post<{ ok: boolean }>("/auth/mfa/disable", { password }),
   logout: () => post<{ ok: boolean }>("/auth/logout"),
   me: () => get<{ user: User }>("/auth/me"),
   changePassword: (currentPassword: string, newPassword: string) =>
@@ -302,6 +344,7 @@ export const api = {
   updateUser: (id: string, body: { displayName?: string; role?: Role; newPassword?: string }) =>
     patch<{ user: User; changes: string[] }>(`/users/${id}`, body),
   deleteUser: (id: string) => del<{ ok: boolean }>(`/users/${id}`),
+  resetUserMfa: (id: string) => post<{ user: User }>(`/users/${id}/mfa/reset`),
 
   accessLog: (params: { limit?: number; action?: string; onlyFailures?: boolean } = {}) => {
     const query = new URLSearchParams();
@@ -334,12 +377,39 @@ export const api = {
   updateSystem: (id: string, body: Partial<System>) => patch<{ system: System }>(`/systems/${id}`, body),
   deleteSystem: (id: string) => del<{ ok: boolean }>(`/systems/${id}`),
   probeSystem: (id: string) => post<{ outcome: ProbeOutcome; system: System }>(`/systems/${id}/probe`),
+  listConfigVersions: (systemId: string) =>
+    get<{ versions: ConfigVersion[] }>(`/systems/${systemId}/config-versions`),
+  getConfigVersion: (systemId: string, id: string) =>
+    get<{ version: ConfigVersion }>(`/systems/${systemId}/config-versions/${id}`),
+
+  listMcpTokens: () => get<{ tokens: ApiToken[] }>("/settings/mcp-tokens"),
+  createMcpToken: (label: string) => post<{ token: ApiToken }>("/settings/mcp-tokens", { label }),
+  deleteMcpToken: (id: string) => del<{ ok: boolean }>(`/settings/mcp-tokens/${id}`),
 
   listAccounts: () => get<{ accounts: Account[] }>("/accounts"),
   createAccount: (body: Record<string, any>) => post<{ account: Account }>("/accounts", body),
   updateAccount: (id: string, body: Record<string, any>) => patch<{ account: Account }>(`/accounts/${id}`, body),
   revealSecret: (id: string) => get<{ secret: string }>(`/accounts/${id}/secret`),
   deleteAccount: (id: string) => del<{ ok: boolean }>(`/accounts/${id}`),
+  generateSshKey: (systemId: string, label: string) =>
+    post<{ account: Account; publicKey: string }>(`/systems/${systemId}/ssh-keys`, { label }),
+  deploySshKey: (accountId: string, loginAccountId: string, port = 0) =>
+    post<{ ok: boolean; changed: boolean }>(`/accounts/${accountId}/deploy`, { loginAccountId, port }),
+  sshConsoleWsUrl: (systemId: string, accountId: string) =>
+    wsUrl(`/api/ws/systems/${systemId}/ssh-console?accountId=${accountId}`),
+
+  startContainer: (id: string) => post<{ ok: boolean }>(`/systems/${id}/container/start`),
+  stopContainer: (id: string) => post<{ ok: boolean }>(`/systems/${id}/container/stop`),
+  restartContainer: (id: string) => post<{ ok: boolean }>(`/systems/${id}/container/restart`),
+  containerLogsUrl: (id: string) => `/api/systems/${id}/container/logs`,
+  dockerConsoleWsUrl: (systemId: string) => wsUrl(`/api/ws/systems/${systemId}/docker-console`),
+
+  listRemoteContainers: (systemId: string, accountId: string) =>
+    get<{ containers: RemoteContainer[] }>(`/systems/${systemId}/remote-containers?accountId=${accountId}`),
+  remoteContainerAction: (systemId: string, containerId: string, action: "start" | "stop" | "restart", accountId: string) =>
+    post<{ ok: boolean }>(`/systems/${systemId}/remote-containers/${containerId}/${action}?accountId=${accountId}`),
+  remoteDockerConsoleWsUrl: (systemId: string, accountId: string, containerId: string) =>
+    wsUrl(`/api/ws/systems/${systemId}/remote-docker-console?accountId=${accountId}&containerId=${containerId}`),
 
   listDocs: () => get<{ pages: Omit<DocPage, "bodyMd">[] }>("/docs"),
   getDoc: (slug: string) => get<{ page: DocPage }>(`/docs/${slug}`),

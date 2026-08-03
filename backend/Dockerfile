@@ -2,8 +2,9 @@ FROM python:3.12-slim
 
 # iproute2 -> `ip neigh` / `ip route` (ARP table and default gateway, the backbone of discovery)
 # iputils-ping + traceroute -> the live diagnostics the assistant runs
+# snmp -> snmpget/snmpwalk, for read-only SNMPv2c probing of switches (see probe_auth.probe_snmp)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends iproute2 iputils-ping traceroute \
+    && apt-get install -y --no-install-recommends iproute2 iputils-ping traceroute snmp \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

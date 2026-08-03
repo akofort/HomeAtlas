@@ -1,13 +1,29 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
-import { api, type DnsResult, type MonitorState } from "../lib/api";
+import { Link, useNavigate } from "react-router-dom";
+import { api, type DnsResult, type MonitorState, type System } from "../lib/api";
 import { useAuth } from "../App";
+import { KindIcon } from "../lib/icons";
+
+/** Alles, was der Plan oben NICHT einzeln zeichnet (siehe topology.py: nur Router/Netzwerk als
+ *  Backbone, plus was als "kritisch" markiert ist) landet hier ausklappbar, gruppiert nach Art --
+ *  dieselbe Aufteilung, die topology.py früher als Zählboxen ins SVG gemalt hat. */
+const DEVICE_GROUPS: [string, string[]][] = [
+  ["Server & Speicher", ["server", "nas"]],
+  ["Container & VMs", ["container", "vm"]],
+  ["Computer & Mobilgeräte", ["pc", "mobile"]],
+  ["Smart Home", ["smarthome", "iot"]],
+  ["Wärme, Klima & Energie", ["heating", "climate", "energy"]],
+  ["Drucker, Medien & Kameras", ["printer", "media", "camera"]],
+  ["Weitere Geräte", ["other"]],
+];
 
 /** Netzplan, Live-Überwachung und Diagnose auf einer Seite — die drei Dinge, die man ansieht,
  *  wenn man wissen will, wie es dem Netz gerade geht. */
 export default function PlanPage() {
   const { isAdmin } = useAuth();
+  const navigate = useNavigate();
   const [svg, setSvg] = useState("");
+  const [systems, setSystems] = useState<System[]>([]);
   const [monitor, setMonitor] = useState<MonitorState | null>(null);
   const [dns, setDns] = useState<DnsResult | null>(null);
   const [checking, setChecking] = useState("");
@@ -29,8 +45,17 @@ export default function PlanPage() {
       .then((r) => (r.ok ? r.text() : Promise.reject(new Error("Plan nicht verfügbar"))))
       .then(setSvg)
       .catch((e) => setError(e.message));
+    api.listSystems().then((r) => setSystems(r.systems)).catch((e) => setError(e.message));
     void loadMonitor();
   }, [loadMonitor]);
+
+  // Alles, was oben im Plan schon als Backbone (Router/Netzwerk) oder als "wichtiges Gerät"
+  // (Bedeutung "kritisch") gezeichnet wird, taucht hier nicht noch einmal auf -- siehe
+  // topology.py's render() für die exakt gespiegelte Regel.
+  const groupedSystems = DEVICE_GROUPS.map(([label, kinds]) => ({
+    label,
+    members: systems.filter((s) => kinds.includes(s.kind) && s.importance !== "critical"),
+  })).filter((g) => g.members.length > 0);
 
   // Poll while the tab is visible. A background tab that keeps hitting the API every few seconds
   // for hours is exactly the behaviour that drains a laptop battery for nothing.
@@ -58,6 +83,15 @@ export default function PlanPage() {
     } finally {
       setChecking("");
     }
+  }
+
+  // Hosts with containers/VMs are drawn once, marked `data-expand`, and get their children one
+  // click away instead of nested boxes -- see topology.py for why (forty container boxes is not
+  // a picture anyone reads).
+  function handlePlanClick(e: React.MouseEvent<HTMLDivElement>) {
+    const target = (e.target as Element).closest('[data-expand="1"]');
+    const id = target?.getAttribute("data-system-id");
+    if (id) navigate(`/geraete?parentId=${id}`);
   }
 
   async function runMonitorNow() {
@@ -106,13 +140,50 @@ export default function PlanPage() {
       <div className="card">
         <h2>Übersichtsplan</h2>
         <p className="muted" style={{ marginTop: -6 }}>
-          Von oben nach unten: Internet, Router, Verteilung, Server, Endgeräte. Automatisch aus dem
-          erzeugt, was HomeAtlas gefunden hat.
+          Internet, Router, Verteilung, dann als Nächstes die als „kritisch" markierten Geräte —
+          soweit bekannt mit ihrer tatsächlichen Verbindung (per LLDP erkannt), sonst am Netz
+          angehängt. Alles andere steht ausklappbar darunter. Kritische Server mit Container/VMs
+          zeigen nur sich selbst — ein Klick auf den Kasten öffnet die zugehörigen virtuellen Systeme.
         </p>
         {svg ? (
-          <div className="table-wrap" dangerouslySetInnerHTML={{ __html: svg }} />
+          <div className="table-wrap" onClick={handlePlanClick} dangerouslySetInnerHTML={{ __html: svg }} />
         ) : (
           <span className="spinner" />
+        )}
+
+        {groupedSystems.length > 0 && (
+          <div style={{ marginTop: 16 }}>
+            {groupedSystems.map(({ label, members }) => {
+              const online = members.filter((m) => m.status === "online").length;
+              return (
+                <details key={label} style={{ marginBottom: 8 }}>
+                  <summary style={{ cursor: "pointer", padding: "6px 0" }}>
+                    <strong>{members.length}</strong> {label} — {online > 0 ? `${online} erreichbar` : "keins erreichbar"}
+                  </summary>
+                  <div className="table-wrap" style={{ marginTop: 8 }}>
+                    <table>
+                      <tbody>
+                        {members.map((m) => (
+                          <tr key={m.id}>
+                            <td style={{ width: 1, whiteSpace: "nowrap" }}>
+                              <KindIcon kind={m.kind} className="muted" />
+                            </td>
+                            <td><Link to={`/geraete/${m.id}`}>{m.name}</Link></td>
+                            <td className="mono muted">{m.ip || "—"}</td>
+                            <td>
+                              <span className={`badge ${m.status === "online" ? "ok" : m.status === "offline" ? "danger" : ""}`}>
+                                {m.status === "online" ? "erreichbar" : m.status === "offline" ? "nicht erreichbar" : "unbekannt"}
+                              </span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+              );
+            })}
+          </div>
         )}
       </div>
 

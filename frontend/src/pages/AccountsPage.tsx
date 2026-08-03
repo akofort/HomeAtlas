@@ -6,6 +6,8 @@ const CATEGORIES: [string, string][] = [
   ["contract", "Vertrag / Kundenkonto"],
   ["login", "Anmeldung an Gerät oder Dienst"],
   ["sshkey", "SSH-Schlüssel"],
+  ["snmp", "SNMP (Community-Zeichenkette)"],
+  ["omada", "Omada Controller (Open API)"],
   ["wifi", "WLAN-Zugang"],
   ["apikey", "API-Schlüssel"],
   ["other", "Sonstiges"],
@@ -42,6 +44,8 @@ export default function AccountsPage() {
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [deployingId, setDeployingId] = useState<string | null>(null);
+  const [deployLoginId, setDeployLoginId] = useState("");
 
   async function reload() {
     const [a, s] = await Promise.all([api.listAccounts(), api.listSystems()]);
@@ -128,6 +132,40 @@ export default function AccountsPage() {
     }
   }
 
+  async function generateKey() {
+    if (!draft || !draft.systemId) return;
+    setBusy(true);
+    setError("");
+    try {
+      const { publicKey } = await api.generateSshKey(draft.systemId, draft.label.trim() || "SSH-Schlüssel (HomeAtlas)");
+      await reload();
+      setNotice(`Schlüssel erzeugt. Öffentlicher Teil: ${publicKey}`);
+      setDraft(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deployKey(account: Account) {
+    if (!deployLoginId) return;
+    setBusy(true);
+    setError("");
+    try {
+      const r = await api.deploySshKey(account.id, deployLoginId);
+      setNotice(r.changed
+        ? `Schlüssel auf „${systemName[account.systemId ?? ""] ?? "Gerät"}“ eingespielt.`
+        : `Schlüssel war dort schon hinterlegt.`);
+      setDeployingId(null);
+      setDeployLoginId("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function reveal(id: string) {
     try {
       const { secret } = await api.revealSecret(id);
@@ -202,14 +240,26 @@ export default function AccountsPage() {
               <div className="field-hint">Verträge und Online-Konten brauchen das nicht.</div>
             </div>
             <div className="field">
-              <label>Benutzername / Kundennummer</label>
+              <label>{draft.category === "omada" ? "Client-ID" : "Benutzername / Kundennummer"}</label>
               <input value={draft.username} autoComplete="off"
                      onChange={(e) => setDraft({ ...draft, username: e.target.value })} />
             </div>
             {draft.category === "sshkey" ? (
               <>
+                {!draft.id && (
+                  <div className="field" style={{ gridColumn: "1 / -1" }}>
+                    <button className="secondary" type="button" onClick={() => void generateKey()}
+                            disabled={busy || !draft.systemId}>
+                      {busy ? "Erzeuge…" : "Neuen Schlüssel erzeugen"}
+                    </button>
+                    <div className="field-hint">
+                      Erzeugt ein Ed25519-Schlüsselpaar für das oben gewählte Gerät und speichert es
+                      direkt — ersetzt die manuelle Eingabe unten. Braucht ein gewähltes Gerät.
+                    </div>
+                  </div>
+                )}
                 <div className="field" style={{ gridColumn: "1 / -1" }}>
-                  <label>Privater SSH-Schlüssel</label>
+                  <label>Privater SSH-Schlüssel (von Hand eintragen, falls schon vorhanden)</label>
                   <textarea
                     style={{ minHeight: 150 }}
                     spellCheck={false}
@@ -233,27 +283,38 @@ export default function AccountsPage() {
               </>
             ) : (
               <div className="field">
-                <label>Passwort</label>
+                <label>
+                  {draft.category === "snmp" ? "Community-Zeichenkette"
+                    : draft.category === "omada" ? "Client Secret" : "Passwort"}
+                </label>
                 <input type="password" autoComplete="new-password" value={draft.secret}
                        placeholder={draft.id ? "unverändert lassen" : ""}
                        onChange={(e) => setDraft({ ...draft, secret: e.target.value })} />
                 <div className="field-hint">
                   {draft.id
-                    ? "Leer lassen, um das gespeicherte Passwort beizubehalten."
+                    ? `Leer lassen, um ${draft.category === "snmp" ? "die gespeicherte Community-Zeichenkette"
+                        : draft.category === "omada" ? "das gespeicherte Client Secret" : "das gespeicherte Passwort"} beizubehalten.`
                     : "Wird verschlüsselt gespeichert."}
                 </div>
               </div>
             )}
             <div className="field">
-              <label>Adresse (optional)</label>
+              <label>Adresse{draft.category === "omada" ? "" : " (optional)"}</label>
               <input placeholder="https://…" value={draft.url}
                      onChange={(e) => setDraft({ ...draft, url: e.target.value })} />
+              {draft.category === "omada" && (
+                <div className="field-hint">
+                  Basis-Adresse des Controllers, z. B. https://192.168.1.10:8043 -- Client-ID und
+                  Client Secret werden unter Einstellungen → Plattform-Integration → Open API im
+                  Controller selbst angelegt.
+                </div>
+              )}
             </div>
-            {(draft.category === "sshkey" || draft.category === "login") && (
+            {(draft.category === "sshkey" || draft.category === "login" || draft.category === "snmp") && (
               <div className="field">
                 <label>Abweichender Port (optional)</label>
                 <input type="number" min={0} max={65535} value={draft.port || ""}
-                       placeholder="Standard (SSH: 22)"
+                       placeholder={draft.category === "snmp" ? "Standard (SNMP: 161)" : "Standard (SSH: 22)"}
                        onChange={(e) => setDraft({ ...draft, port: Number(e.target.value) })} />
               </div>
             )}
@@ -271,9 +332,10 @@ export default function AccountsPage() {
           </label>
           <div className="notice info" style={{ marginTop: 4 }}>
             HomeAtlas meldet sich damit am Gerät an und liest Eckdaten aus — Betriebssystem,
-            Laufzeit, Speicherplatz, laufende Container. Es werden <strong>ausschließlich</strong> fest
-            einprogrammierte Lesebefehle ausgeführt; nichts wird geändert, installiert oder neu
-            gestartet. Ohne diesen Haken bleibt der Zugang reine Ablage.
+            Laufzeit, Speicherplatz, laufende Container, bei Netzwerkgeräten auch VLANs und
+            Nachbargeräte per LLDP. Es werden <strong>ausschließlich</strong> fest einprogrammierte
+            Lesebefehle ausgeführt; nichts wird geändert, installiert oder neu gestartet. Ohne
+            diesen Haken bleibt der Zugang reine Ablage.
           </div>
 
           <div className="row">
@@ -353,7 +415,32 @@ export default function AccountsPage() {
                     </td>
                     <td style={{ whiteSpace: "nowrap", width: 1 }}>
                       <button className="secondary small" onClick={() => startEdit(a)}>Bearbeiten</button>{" "}
+                      {a.category === "sshkey" && a.systemId && (
+                        <>
+                          <button className="secondary small"
+                                  onClick={() => { setDeployingId(deployingId === a.id ? null : a.id); setDeployLoginId(""); }}>
+                            Auf Gerät einspielen
+                          </button>{" "}
+                        </>
+                      )}
                       <button className="danger small" onClick={() => void remove(a)}>Löschen</button>
+                      {deployingId === a.id && (
+                        <div className="row" style={{ marginTop: 8, flexWrap: "nowrap" }}>
+                          <select style={{ width: "auto" }} value={deployLoginId}
+                                  onChange={(e) => setDeployLoginId(e.target.value)}>
+                            <option value="">— Zugang zum Einloggen wählen —</option>
+                            {accounts
+                              .filter((other) => other.systemId === a.systemId && other.id !== a.id && other.hasSecret)
+                              .map((other) => (
+                                <option key={other.id} value={other.id}>{other.label}</option>
+                              ))}
+                          </select>
+                          <button className="secondary small" onClick={() => void deployKey(a)}
+                                  disabled={busy || !deployLoginId}>
+                            Einspielen
+                          </button>
+                        </div>
+                      )}
                     </td>
                   </tr>
                 ))}

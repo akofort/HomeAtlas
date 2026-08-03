@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useState } from "rea
 import { NavLink, Navigate, Route, Routes } from "react-router-dom";
 import { ApiError, api, type User } from "./lib/api";
 import LoginPage from "./pages/LoginPage";
+import MfaEnrollPage from "./pages/MfaEnrollPage";
 import SetupPage from "./pages/SetupPage";
 import DashboardPage from "./pages/DashboardPage";
 import InventoryPage from "./pages/InventoryPage";
@@ -83,6 +84,17 @@ export default function App() {
   if (!user) return <LoginPage onLoggedIn={() => void refresh()} />;
 
   const isAdmin = user.role === "ADMIN";
+
+  // The second factor is mandatory (the backend enforces this on every other route -- see
+  // main.py's `current_user`); this is just the matching UI. Comes before the setup wizard below:
+  // the account gets secured first, then the household gets configured.
+  if (!user.totpEnabled) {
+    return (
+      <AuthContext.Provider value={{ user, isAdmin, setUser, logout }}>
+        <MfaEnrollPage onDone={() => void refresh()} />
+      </AuthContext.Provider>
+    );
+  }
 
   // First run: an admin lands in the wizard until the household basics are recorded. Members are
   // let through -- they can't complete it anyway, and locking them out of a working app is worse.

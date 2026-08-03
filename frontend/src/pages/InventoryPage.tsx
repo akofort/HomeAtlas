@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, type System } from "../lib/api";
 import { useAuth } from "../App";
+import { KindIcon } from "../lib/icons";
 
 const STATUS_LABEL: Record<string, string> = {
   online: "erreichbar",
@@ -19,6 +20,7 @@ export default function InventoryPage() {
   const [loading, setLoading] = useState(true);
 
   const kind = searchParams.get("kind") ?? "";
+  const parentId = searchParams.get("parentId") ?? "";
 
   useEffect(() => {
     setLoading(true);
@@ -36,13 +38,19 @@ export default function InventoryPage() {
     const needle = query.trim().toLowerCase();
     return systems.filter((s) => {
       if (kind && s.kind !== kind) return false;
+      if (parentId && s.parentId !== parentId) return false;
       if (!needle) return true;
       return [s.name, s.hostname, s.ip, s.mac, s.vendor, s.model, s.location, s.purpose]
         .join(" ")
         .toLowerCase()
         .includes(needle);
     });
-  }, [systems, kind, query]);
+  }, [systems, kind, parentId, query]);
+
+  const parentSystem = useMemo(
+    () => (parentId ? systems.find((s) => s.id === parentId) : undefined),
+    [systems, parentId],
+  );
 
   const kinds = useMemo(
     () => Array.from(new Set(systems.map((s) => s.kind))).sort(),
@@ -74,6 +82,15 @@ export default function InventoryPage() {
       </div>
 
       {error && <div className="notice error">{error}</div>}
+
+      {parentId && (
+        <div className="notice info">
+          Zeigt Container und VMs auf <strong>{parentSystem?.name ?? "diesem Host"}</strong>.{" "}
+          <button className="secondary" style={{ marginLeft: 8 }} onClick={() => setSearchParams({})}>
+            Filter aufheben
+          </button>
+        </div>
+      )}
 
       <div className="card">
         <div className="row" style={{ marginBottom: 14 }}>
@@ -130,6 +147,12 @@ export default function InventoryPage() {
                       {s.importance === "critical" && (
                         <span className="badge warn" style={{ marginLeft: 8 }}>kritisch</span>
                       )}
+                      {(s.tags ?? []).some((t) => t.toLowerCase().includes("poe")) && (
+                        <span className="badge warn" style={{ marginLeft: 8 }}
+                              title="Funktioniert ohne PoE-fähigen Switch oder Injector nicht">
+                          ⚡ PoE
+                        </span>
+                      )}
                       {s.purpose && (
                         <div className="muted" style={{ fontSize: "0.83rem" }}>{s.purpose}</div>
                       )}
@@ -138,7 +161,12 @@ export default function InventoryPage() {
                       {s.ip || "—"}
                       {s.hostname && <div className="muted" style={{ fontSize: "0.8rem" }}>{s.hostname.split(".")[0]}</div>}
                     </td>
-                    <td>{kindLabels[s.kind] ?? s.kind}</td>
+                    <td>
+                      <span className="row" style={{ gap: 6, flexWrap: "nowrap" }}>
+                        <KindIcon kind={s.kind} className="muted" />
+                        {kindLabels[s.kind] ?? s.kind}
+                      </span>
+                    </td>
                     <td>{s.location || "—"}</td>
                     <td>
                       <span className={`badge ${s.status === "online" ? "ok" : s.status === "offline" ? "danger" : ""}`}>

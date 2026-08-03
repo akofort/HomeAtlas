@@ -1,8 +1,17 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, type Account, type ProbeResult, type System } from "../lib/api";
+import { api, type Account, type ConfigVersion, type ProbeResult, type RemoteContainer, type System } from "../lib/api";
 import { useAuth } from "../App";
 import Markdown from "../components/Markdown";
+import { KindIcon } from "../lib/icons";
+import Terminal from "../components/Terminal";
+
+/** Same eligibility test as backend/app/main.py's `_ssh_eligible` / probe_auth's SSH branch --
+ *  keep these in sync. */
+function sshEligible(a: Account): boolean {
+  const port = a.port || 0;
+  return a.category === "sshkey" || (a.category === "login" && (port === 0 || port === 22));
+}
 
 const KINDS = [
   "router", "network", "server", "nas", "container", "vm", "pc", "mobile", "printer",
@@ -24,6 +33,17 @@ export default function SystemDetailPage() {
   const [secrets, setSecrets] = useState<Record<string, string>>({});
   const [probing, setProbing] = useState(false);
   const [probeNotice, setProbeNotice] = useState<{ kind: "ok" | "error" | "info"; text: string } | null>(null);
+  const [configVersions, setConfigVersions] = useState<ConfigVersion[] | null>(null);
+  const [configPreview, setConfigPreview] = useState<ConfigVersion | null>(null);
+  const [consoleAccountId, setConsoleAccountId] = useState<string | null>(null);
+  const [keyGenBusy, setKeyGenBusy] = useState(false);
+  const [keyGenNotice, setKeyGenNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
+  const [containerBusy, setContainerBusy] = useState("");
+  const [containerNotice, setContainerNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
+  const [showLogs, setShowLogs] = useState(false);
+  const [logLines, setLogLines] = useState("");
+  const [showDockerConsole, setShowDockerConsole] = useState(false);
+  const logsAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     api
@@ -33,9 +53,48 @@ export default function SystemDetailPage() {
         setAccounts(r.accounts);
         setDerived(r.description);
         setMonitorPorts(r.monitorPortsEffective);
+        // Config backups only exist for routers/switches -- no point asking for anything else.
+        if (r.system.kind === "router" || r.system.kind === "network") {
+          api.listConfigVersions(id).then((cv) => setConfigVersions(cv.versions)).catch(() => setConfigVersions([]));
+        }
       })
       .catch((e) => setError(e.message));
   }, [id]);
+
+  async function showConfigVersion(version: ConfigVersion) {
+    if (configPreview?.id === version.id) {
+      setConfigPreview(null);
+      return;
+    }
+    try {
+      setConfigPreview((await api.getConfigVersion(id, version.id)).version);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function downloadConfigVersion(version: ConfigVersion) {
+    try {
+      const full = (await api.getConfigVersion(id, version.id)).version;
+      const content = full.content ?? "";
+      // Binary backups (e.g. an Omada Controller export) are stored as one unbroken Base64
+      // string -- everything else here is multi-line device config text, which no real Base64
+      // payload looks like, so this is a safe way to tell the two apart without a dedicated flag.
+      const isBase64 = content.length % 4 === 0 && /^[A-Za-z0-9+/]+=*$/.test(content);
+      const blob = isBase64
+        ? new Blob([Uint8Array.from(atob(content), (c) => c.charCodeAt(0))], { type: "application/octet-stream" })
+        : new Blob([content], { type: "text/plain" });
+      const safeName = full.label.replace(/[^\w.-]+/g, "_");
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${safeName}.${isBase64 ? "cfg" : "txt"}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
 
   async function save() {
     try {
@@ -64,6 +123,9 @@ export default function SystemDetailPage() {
     try {
       const { outcome, system: updated } = await api.probeSystem(id);
       setSystem(updated);
+      if (updated.kind === "router" || updated.kind === "network") {
+        void api.listConfigVersions(id).then((cv) => setConfigVersions(cv.versions));
+      }
       if (outcome.ran) {
         setProbeNotice({ kind: "ok", text: `Gerät ausgelesen über: ${Object.keys(outcome.results).join(", ")}` });
       } else {
@@ -86,6 +148,70 @@ export default function SystemDetailPage() {
     navigate("/geraete");
   }
 
+  async function runContainerAction(action: "start" | "stop" | "restart") {
+    if (action !== "start" && !window.confirm(
+      `Container wirklich ${action === "stop" ? "stoppen" : "neu starten"}? Der darauf laufende Dienst ist währenddessen nicht erreichbar.`,
+    )) return;
+    setContainerBusy(action);
+    setContainerNotice(null);
+    try {
+      if (action === "start") await api.startContainer(id);
+      else if (action === "stop") await api.stopContainer(id);
+      else await api.restartContainer(id);
+      const labels = { start: "gestartet", stop: "gestoppt", restart: "neu gestartet" } as const;
+      setContainerNotice({ kind: "ok", text: `Container ${labels[action]}.` });
+      const { system: updated } = await api.getSystem(id);
+      setSystem(updated);
+    } catch (e) {
+      setContainerNotice({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setContainerBusy("");
+    }
+  }
+
+  async function startLogs() {
+    setShowLogs(true);
+    setLogLines("");
+    const controller = new AbortController();
+    logsAbortRef.current = controller;
+    try {
+      const response = await fetch(api.containerLogsUrl(id), { credentials: "same-origin", signal: controller.signal });
+      const reader = response.body?.getReader();
+      if (!reader) return;
+      const decoder = new TextDecoder();
+      // Bounded: an unattended live tail left open for hours must not grow the tab's memory
+      // without limit -- keep only the most recent slice, same spirit as the backend's own
+      // truncation of tool results and probe facts.
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        setLogLines((current) => (current + decoder.decode(value, { stream: true })).slice(-20000));
+      }
+    } catch {
+      /* aborted by stopLogs(), or the connection dropped -- either way nothing to report */
+    }
+  }
+
+  function stopLogs() {
+    logsAbortRef.current?.abort();
+    setShowLogs(false);
+  }
+
+  async function generateKeyForThisDevice() {
+    setKeyGenBusy(true);
+    setKeyGenNotice(null);
+    try {
+      const { publicKey } = await api.generateSshKey(id, `SSH-Schlüssel (${system?.name ?? "HomeAtlas"})`);
+      const r = await api.getSystem(id);
+      setAccounts(r.accounts);
+      setKeyGenNotice({ kind: "ok", text: `Schlüssel erzeugt. Öffentlicher Teil: ${publicKey}` });
+    } catch (e) {
+      setKeyGenNotice({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setKeyGenBusy(false);
+    }
+  }
+
   if (error) return <div className="notice error">{error}</div>;
   if (!system) return <span className="spinner" />;
 
@@ -97,13 +223,21 @@ export default function SystemDetailPage() {
       <div className="page-header">
         <div>
           <Link to="/geraete" className="muted">← Zurück zu allen Geräten</Link>
-          <h1 style={{ marginTop: 8 }}>{system.name}</h1>
+          <h1 className="row" style={{ gap: 10, marginTop: 8 }}>
+            <KindIcon kind={system.kind} size={24} />
+            {system.name}
+          </h1>
           <p>{system.purpose || "Kein Zweck hinterlegt."}</p>
           <div className="row">
             <span className={`badge ${system.status === "online" ? "ok" : system.status === "offline" ? "danger" : ""}`}>
               {system.status === "online" ? "erreichbar" : system.status === "offline" ? "nicht erreichbar" : "Zustand unbekannt"}
             </span>
             {system.importance === "critical" && <span className="badge warn">kritisch fürs Haus</span>}
+            {(system.tags ?? []).some((t) => t.toLowerCase().includes("poe")) && (
+              <span className="badge warn" title="Funktioniert ohne PoE-fähigen Switch oder Injector nicht">
+                ⚡ benötigt PoE
+              </span>
+            )}
             {system.monitored === 1 && (
               <span className="badge" title={monitorPorts.length > 0 ? `Geprüft wird Port ${monitorPorts.join(", ")}` : "Geprüft wird per Ping"}>
                 überwacht · {monitorPorts.length > 0 ? `Port ${monitorPorts.join(", ")}` : "Ping"}
@@ -177,6 +311,19 @@ export default function SystemDetailPage() {
           <div className="field">
             <label>Interne Notiz</label>
             <input value={draft.notes ?? ""} onChange={(e) => setDraft({ ...draft, notes: e.target.value })} />
+          </div>
+          <div className="field">
+            <label>Schlagworte</label>
+            <input
+              placeholder="z. B. PoE, Dachboden"
+              value={(draft.tags ?? []).join(", ")}
+              onChange={(e) => setDraft({ ...draft, tags: e.target.value.split(",").map((s) => s.trim()).filter(Boolean) })}
+            />
+            <div className="field-hint">
+              Frei wählbar. Ein Schlagwort mit „PoE" markiert das Gerät als PoE-abhängig — es
+              funktioniert dann nur an einem PoE-fähigen Switch oder mit einem Injector, was als
+              Hinweis oben und im Geräte-Überblick angezeigt wird.
+            </div>
           </div>
 
           <label className="row" style={{ cursor: "pointer", fontWeight: 400, color: "var(--text)", marginBottom: 8 }}>
@@ -277,6 +424,50 @@ export default function SystemDetailPage() {
               </tbody>
             </table>
           </div>
+
+          {isAdmin && (
+            docker.containerId ? (
+              <>
+                {containerNotice && <div className={`notice ${containerNotice.kind}`}>{containerNotice.text}</div>}
+                <div className="row" style={{ marginTop: 12 }}>
+                  <button className="secondary" disabled={containerBusy !== ""} onClick={() => void runContainerAction("start")}>
+                    {containerBusy === "start" ? "Starte…" : "Starten"}
+                  </button>
+                  <button className="secondary" disabled={containerBusy !== ""} onClick={() => void runContainerAction("stop")}>
+                    {containerBusy === "stop" ? "Stoppe…" : "Stoppen"}
+                  </button>
+                  <button className="secondary" disabled={containerBusy !== ""} onClick={() => void runContainerAction("restart")}>
+                    {containerBusy === "restart" ? "Starte neu…" : "Neu starten"}
+                  </button>
+                  {!showLogs ? (
+                    <button className="secondary" onClick={() => void startLogs()}>Live-Logs</button>
+                  ) : (
+                    <button className="secondary" onClick={stopLogs}>Logs schließen</button>
+                  )}
+                  <button className="secondary" onClick={() => setShowDockerConsole((v) => !v)}>
+                    {showDockerConsole ? "Konsole schließen" : "Konsole öffnen"}
+                  </button>
+                </div>
+                {showLogs && (
+                  <pre className="mono" style={{
+                    marginTop: 12, maxHeight: 320, overflow: "auto", background: "#0b1120",
+                    color: "#d7dee8", padding: 12, borderRadius: 10, whiteSpace: "pre-wrap",
+                  }}>
+                    {logLines || "Warte auf Ausgabe…"}
+                  </pre>
+                )}
+                {showDockerConsole && (
+                  <div style={{ marginTop: 12 }}>
+                    <Terminal wsUrl={api.dockerConsoleWsUrl(id)} onClose={() => setShowDockerConsole(false)} />
+                  </div>
+                )}
+              </>
+            ) : (
+              <p className="muted" style={{ marginTop: 12, marginBottom: 0 }}>
+                Steuerung braucht die Container-ID aus einem neueren Scan — bitte einmal erneut scannen.
+              </p>
+            )
+          )}
         </div>
       )}
 
@@ -300,9 +491,14 @@ export default function SystemDetailPage() {
                           <th style={{ width: "28%" }}>{fact.label}</th>
                           <td>
                             {fact.value.includes("\n") ? (
-                              <pre className="mono" style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: "0.82rem" }}>
-                                {fact.value}
-                              </pre>
+                              <details>
+                                <summary className="muted" style={{ cursor: "pointer" }}>
+                                  {fact.value.split("\n").length} Zeilen — anzeigen
+                                </summary>
+                                <pre className="mono" style={{ margin: "8px 0 0", whiteSpace: "pre-wrap", fontSize: "0.82rem" }}>
+                                  {fact.value}
+                                </pre>
+                              </details>
                             ) : (
                               <span className="mono">{fact.value}</span>
                             )}
@@ -317,6 +513,56 @@ export default function SystemDetailPage() {
               )}
             </div>
           ))}
+        </div>
+      )}
+
+      {configVersions !== null && (system.kind === "router" || system.kind === "network") && (
+        <div className="card">
+          <h2>Konfigurationsverlauf</h2>
+          <p className="muted" style={{ marginTop: -6 }}>
+            Textkonfigurationen, die beim Auslesen des Geräts gesichert wurden — nur zum
+            Nachsehen, wird nie automatisch auf das Gerät zurückgeschrieben. Kann Zugangsdaten wie
+            Community-Strings enthalten, deshalb verschlüsselt gespeichert.
+          </p>
+          {configVersions.length === 0 ? (
+            <p className="muted" style={{ marginBottom: 0 }}>Noch keine Sicherung vorhanden.</p>
+          ) : (
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>Zeitpunkt</th><th>Bezeichnung</th><th>Quelle</th><th>Umfang</th><th /></tr>
+                </thead>
+                <tbody>
+                  {configVersions.map((v) => (
+                    <tr key={v.id}>
+                      <td className="muted">{new Date(v.createdAt).toLocaleString("de-DE")}</td>
+                      <td>{v.label}</td>
+                      <td className="muted">{v.source}</td>
+                      <td className="muted">{Math.round(v.size / 100) / 10} kB</td>
+                      <td style={{ whiteSpace: "nowrap", width: 1 }}>
+                        <button className="secondary" onClick={() => void showConfigVersion(v)}>
+                          {configPreview?.id === v.id ? "Einklappen" : "Ansehen"}
+                        </button>{" "}
+                        <button className="secondary" onClick={() => void downloadConfigVersion(v)}>
+                          Herunterladen
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {configPreview && (
+            <div style={{ marginTop: 12 }}>
+              <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                <button className="secondary" onClick={() => setConfigPreview(null)}>Einklappen</button>
+              </div>
+              <pre className="mono" style={{ marginTop: 4, whiteSpace: "pre-wrap", fontSize: "0.82rem" }}>
+                {configPreview.content}
+              </pre>
+            </div>
+          )}
         </div>
       )}
 
@@ -344,10 +590,16 @@ export default function SystemDetailPage() {
         <div className="card">
           <div className="row" style={{ justifyContent: "space-between", marginBottom: 12 }}>
             <h2 style={{ margin: 0 }}>Zugänge</h2>
-            <Link className="btn" to="/zugaenge" style={{ display: "inline-block", fontSize: "0.85rem", padding: "5px 11px" }}>
-              Zugänge verwalten
-            </Link>
+            <div className="row" style={{ flexWrap: "nowrap" }}>
+              <button className="secondary small" disabled={keyGenBusy} onClick={() => void generateKeyForThisDevice()}>
+                {keyGenBusy ? "Erzeuge…" : "SSH-Schlüssel erzeugen"}
+              </button>
+              <Link className="btn" to="/zugaenge" style={{ display: "inline-block", fontSize: "0.85rem", padding: "5px 11px" }}>
+                Zugänge verwalten
+              </Link>
+            </div>
           </div>
+          {keyGenNotice && <div className={`notice ${keyGenNotice.kind}`}>{keyGenNotice.text}</div>}
           {accounts.length === 0 ? (
             <p className="muted">
               Für dieses Gerät ist kein Zugang hinterlegt — unter <Link to="/zugaenge">Zugänge</Link> lässt
@@ -356,7 +608,7 @@ export default function SystemDetailPage() {
           ) : (
             <div className="table-wrap">
               <table>
-                <thead><tr><th>Bezeichnung</th><th>Benutzername</th><th>Passwort</th></tr></thead>
+                <thead><tr><th>Bezeichnung</th><th>Benutzername</th><th>Passwort</th><th /></tr></thead>
                 <tbody>
                   {accounts.map((a) => (
                     <tr key={a.id}>
@@ -371,14 +623,144 @@ export default function SystemDetailPage() {
                           <button className="secondary small" onClick={() => void reveal(a.id)}>Anzeigen</button>
                         )}
                       </td>
+                      <td style={{ width: 1, whiteSpace: "nowrap" }}>
+                        {sshEligible(a) && (
+                          <button className="secondary small" onClick={() => setConsoleAccountId(a.id)}>
+                            Konsole öffnen
+                          </button>
+                        )}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
           )}
+          {consoleAccountId && (
+            <div style={{ marginTop: 16 }}>
+              <Terminal
+                wsUrl={api.sshConsoleWsUrl(id, consoleAccountId)}
+                onClose={() => setConsoleAccountId(null)}
+              />
+            </div>
+          )}
         </div>
       )}
+
+      {isAdmin && accounts.some(sshEligible) && (
+        <RemoteContainersCard systemId={id} accounts={accounts.filter(sshEligible)} />
+      )}
     </>
+  );
+}
+
+/** Docker containers on a host reached over SSH -- for a host system (server/NAS/etc.) that isn't
+ *  itself modeled as a container, unlike the local "Container-Details" card above. Needs an
+ *  explicit "Laden" click rather than fetching on mount: unlike everything else on this page,
+ *  listing here means opening a real SSH connection to the device. */
+function RemoteContainersCard({ systemId, accounts }: { systemId: string; accounts: Account[] }) {
+  const [accountId, setAccountId] = useState(accounts[0]?.id ?? "");
+  const [containers, setContainers] = useState<RemoteContainer[] | null>(null);
+  const [busyId, setBusyId] = useState("");
+  const [consoleContainerId, setConsoleContainerId] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  async function load() {
+    if (!accountId) return;
+    setLoading(true);
+    setNotice(null);
+    try {
+      const r = await api.listRemoteContainers(systemId, accountId);
+      setContainers(r.containers);
+    } catch (e) {
+      setNotice({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+      setContainers(null);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function runAction(containerId: string, action: "start" | "stop" | "restart") {
+    if (action !== "start" && !window.confirm(
+      `Container wirklich ${action === "stop" ? "stoppen" : "neu starten"}?`,
+    )) return;
+    setBusyId(containerId + action);
+    setNotice(null);
+    try {
+      await api.remoteContainerAction(systemId, containerId, action, accountId);
+      await load();
+    } catch (e) {
+      setNotice({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusyId("");
+    }
+  }
+
+  return (
+    <div className="card">
+      <h2>Container auf diesem Host</h2>
+      <p className="muted" style={{ marginTop: -6 }}>
+        Über SSH mit einem der unten hinterlegten Zugänge abgefragt und gesteuert — für Docker-Hosts,
+        die nicht selbst als Container in HomeAtlas geführt werden (z. B. ein Proxmox- oder
+        Server-Host mit mehreren Containern).
+      </p>
+      <div className="row" style={{ marginBottom: 12 }}>
+        {accounts.length > 1 && (
+          <select style={{ width: "auto" }} value={accountId} onChange={(e) => setAccountId(e.target.value)}>
+            {accounts.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
+          </select>
+        )}
+        <button className="secondary" onClick={() => void load()} disabled={loading}>
+          {loading ? "Lade…" : containers === null ? "Container laden" : "Neu laden"}
+        </button>
+      </div>
+
+      {notice && <div className={`notice ${notice.kind}`}>{notice.text}</div>}
+
+      {containers !== null && (
+        containers.length === 0 ? (
+          <p className="muted">Keine Container auf diesem Host gefunden.</p>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>Name</th><th>Image</th><th>Zustand</th><th /></tr></thead>
+              <tbody>
+                {containers.map((c) => (
+                  <tr key={c.id}>
+                    <td>{c.name}</td>
+                    <td className="mono">{c.image}</td>
+                    <td>
+                      <span className={`badge ${c.state === "running" ? "ok" : ""}`}>{c.status}</span>
+                    </td>
+                    <td style={{ whiteSpace: "nowrap", width: 1 }}>
+                      <button className="secondary small" disabled={busyId !== ""}
+                              onClick={() => void runAction(c.id, "start")}>Starten</button>{" "}
+                      <button className="secondary small" disabled={busyId !== ""}
+                              onClick={() => void runAction(c.id, "stop")}>Stoppen</button>{" "}
+                      <button className="secondary small" disabled={busyId !== ""}
+                              onClick={() => void runAction(c.id, "restart")}>Neu starten</button>{" "}
+                      <button className="secondary small"
+                              onClick={() => setConsoleContainerId(consoleContainerId === c.id ? null : c.id)}>
+                        {consoleContainerId === c.id ? "Konsole schließen" : "Konsole"}
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )
+      )}
+
+      {consoleContainerId && (
+        <div style={{ marginTop: 16 }}>
+          <Terminal
+            wsUrl={api.remoteDockerConsoleWsUrl(systemId, accountId, consoleContainerId)}
+            onClose={() => setConsoleContainerId(null)}
+          />
+        </div>
+      )}
+    </div>
   );
 }
