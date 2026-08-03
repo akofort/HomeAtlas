@@ -289,6 +289,7 @@ export default function SettingsPage() {
             ["scanEnableHttpBanner", "Weboberflächen auslesen, um Geräte zu erkennen"],
             ["scanEnableDocker", "Docker-Container auf dem Server erfassen"],
             ["scanEnableOmada", "Access Points und Switches über den Omada Controller erfassen"],
+            ["scanEnableProxmox", "VMs und LXC-Container über Proxmox erfassen"],
             ["scanUseLlm", "KI zur Einordnung unbekannter Geräte und für die Doku-Texte nutzen"],
             ["scanUseCredentials", "Freigegebene Zugänge zum Auslesen der Geräte verwenden (nur lesend)"],
           ] as const).map(([key, label]) => (

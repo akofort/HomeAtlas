@@ -337,6 +337,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "scanEnableSsdp": True,
     "scanEnableDocker": True,
     "scanEnableOmada": True,
+    "scanEnableProxmox": True,
     "scanEnableHttpBanner": True,
     "scanUseLlm": True,
     "scanExcludeIps": [],

@@ -1219,6 +1219,12 @@ async def topology_svg(_: dict = Depends(current_user)) -> Response:
                     headers={"Cache-Control": "no-store"})
 
 
+@app.get("/api/topology-layer3.svg", response_class=PlainTextResponse)
+async def topology_layer3_svg(_: dict = Depends(current_user)) -> Response:
+    return Response(content=topology.render_layer3(), media_type="image/svg+xml",
+                    headers={"Cache-Control": "no-store"})
+
+
 @app.post("/api/diagnostics/dns")
 async def dns_diagnostic(body: dict = Body(default={}), _: dict = Depends(current_user)) -> dict:
     settings = db.get_settings()

@@ -443,3 +443,129 @@ def render(settings: dict | None = None) -> str:
         f'<rect width="{_W}" height="{height:.0f}" fill="{_COLORS["bg"]}"/>'
         f'{"".join(svg)}{legend}</svg>'
     )
+
+
+def _subnet_of(ip: str) -> str:
+    parts = ip.split(".")
+    return ".".join(parts[:3]) + ".0/24" if len(parts) == 4 and all(p.isdigit() for p in parts) else "unbekanntes Netz"
+
+
+def _subnet_sort_key(subnet: str) -> tuple:
+    if subnet == "unbekanntes Netz":
+        return (1, ())
+    return (0, tuple(int(p) for p in subnet.split("/")[0].split(".")))
+
+
+# Any dotted-quad that is itself a plausible subnet mask (255.255.255.0, 255.255.0.0, ...) rather
+# than a host address -- "show ip"/"show ip interface brief"/"/ip address print" all print masks
+# right next to the address they belong to, and this keeps them out of `_router_subnets` below.
+_MASK_OCTETS = {"0", "128", "192", "224", "240", "248", "252", "254", "255"}
+_IP_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+
+
+def _looks_like_mask(ip: str) -> bool:
+    return all(p in _MASK_OCTETS for p in ip.split("."))
+
+
+def _router_subnets(system: dict) -> set[str]:
+    """Every /24 this router has an interface address in, read from whichever platform-specific
+    "ip_addresses" fact probe_auth.py collected for it (Mikrotik/Aruba/Cisco), or the generic
+    Linux "ip" fact for a Linux-based router/gateway -- a coarse regex scan across formats rather
+    than a strict per-platform parser, since all that matters here is which subnets touch this
+    router, not the exact interface name or mask.
+
+    Falls back to the subnet implied by the router's own single stored `ip` when no such fact
+    exists (an unprobed router, or one behind a credential without allowProbe) -- a single-homed
+    guess is still better than dropping the router from the Layer-3 plan entirely.
+    """
+    probe = (system.get("extra") or {}).get("probe") or {}
+    texts = [facts[key]["value"]
+             for result in probe.values()
+             for facts in [(result or {}).get("facts") or {}]
+             for key in ("ip_addresses", "ip") if key in facts]
+
+    subnets: set[str] = set()
+    for text in texts:
+        for ip in _IP_RE.findall(text):
+            if _looks_like_mask(ip) or ip.startswith(("0.", "127.")) or ip == "255.255.255.255":
+                continue
+            subnets.add(_subnet_of(ip))
+    if not subnets and system.get("ip"):
+        subnets.add(_subnet_of(system["ip"]))
+    return subnets
+
+
+def render_layer3(settings: dict | None = None) -> str:
+    """Alternative view of the same inventory, grouped by IP subnet (/24) instead of by how
+    devices are physically wired -- useful once a household has more than one subnet or VLAN (a
+    guest network, an IoT VLAN on the same switches) where the physical `render()` above still
+    only shows one wire.
+
+    End-device subnet membership is derived purely from each system's own stored IP (this app has
+    no per-device VLAN tag to group by instead). Routers are placed more accurately: a router
+    probed over SSH gets listed under *every* subnet its own interface table shows an address in
+    (see `_router_subnets`), not just the one its single stored `ip` field happens to fall into --
+    that is what actually distinguishes a Layer-3 view from the physical one, since a router
+    bridging several VLANs is exactly the thing a single-IP model can't otherwise show.
+    """
+    settings = settings or db.get_settings()
+    all_systems = db.list_systems()
+    routers = [s for s in all_systems if s["kind"] == "router"]
+    others = [s for s in all_systems if s["kind"] != "router" and s.get("ip")]
+
+    by_subnet: dict[str, dict] = {}
+    for s in others:
+        by_subnet.setdefault(_subnet_of(s["ip"]), {"routers": [], "others": []})["others"].append(s)
+    for r in routers:
+        for subnet in _router_subnets(r):
+            by_subnet.setdefault(subnet, {"routers": [], "others": []})["routers"].append(r)
+
+    svg: list[str] = []
+    y = 40
+    svg.append(_label(40, y - 12, "Internet"))
+    internet_svg, internet_anchor = _row([{
+        "title": "Internet",
+        "subtitle": settings.get("homeName") and f"Zugang für {settings['homeName']}" or "",
+        "fill": _COLORS["boxAlt"],
+    }], y, box_w_max=220)
+    svg.append(internet_svg)
+    previous = internet_anchor[0]
+    y += _LAYER_GAP
+
+    for subnet in sorted(by_subnet, key=_subnet_sort_key):
+        group = by_subnet[subnet]
+        subnet_routers = group["routers"][:3]
+        subnet_others = group["others"]
+        total = len(subnet_others) + len({r["id"] for r in subnet_routers})
+
+        svg.append(_label(40, y - 12, f"{subnet} — {total} Gerät{'e' if total != 1 else ''}"))
+        items = [{"id": r["id"], "title": r["name"],
+                 "subtitle": (f"{r['ip']} · mehrere Netze" if len(_router_subnets(r)) > 1 else r["ip"]),
+                 "status": r["status"]} for r in subnet_routers]
+        if subnet_others:
+            online = sum(1 for m in subnet_others if m["status"] == "online")
+            items.append({
+                "title": f"{len(subnet_others)} weitere Geräte",
+                "subtitle": f"{online} erreichbar" if online else "keins erreichbar",
+                "fill": _COLORS["boxAlt"],
+            })
+        row_svg, anchors = _row(items, y)
+        svg.append(_edges(previous, anchors))
+        svg.append(row_svg)
+        y += _LAYER_GAP
+
+    if not by_subnet:
+        svg.append(
+            f'<text x="{_W / 2:.0f}" y="{y:.0f}" text-anchor="middle" fill="{_COLORS["muted"]}" '
+            f'font-size="14">Noch keine Geräte mit bekannter Adresse erfasst.</text>'
+        )
+        y += 40
+
+    height = y + 20
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {_W} {height:.0f}" '
+        f'width="100%" role="img" aria-label="Netzplan nach Subnetzen (Layer 3)" '
+        f'font-family="Segoe UI, system-ui, sans-serif">'
+        f'<rect width="{_W}" height="{height:.0f}" fill="{_COLORS["bg"]}"/>'
+        f'{"".join(svg)}</svg>'
+    )

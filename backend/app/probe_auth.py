@@ -95,6 +95,10 @@ _SSH_COMMANDS_MIKROTIK: tuple[tuple[str, str, str], ...] = (
     ("bridge_ports", "Bridge-Ports (VLAN-Zuordnung)", "/interface bridge port print detail without-paging"),
     ("neighbors", "Nachbargeräte (LLDP/CDP/MNDP)", "/ip neighbor print detail without-paging"),
     ("interfaces", "Schnittstellen", "/interface print detail without-paging"),
+    # Which subnet(s) this router actually has an address in -- topology.py's Layer-3 plan reads
+    # this to place a multi-homed router next to every subnet it bridges, not just the one its
+    # single stored `ip` field happens to fall into.
+    ("ip_addresses", "IP-Adressen je Schnittstelle", "/ip address print without-paging"),
     # Never "/export show-sensitive" -- that writes out stored PPPoE/WiFi passwords in cleartext,
     # which would break the "secrets never exposed" invariant this whole module exists to uphold.
     ("config_export", "Vollständige Konfiguration", "/export compact"),
@@ -108,6 +112,8 @@ _SSH_COMMANDS_ARUBA: tuple[tuple[str, str, str], ...] = (
     ("vlan_ports", "VLAN-Port-Zuordnung", "show vlan ports all detail"),
     ("neighbors", "Nachbargeräte (LLDP)", "show lldp info remote-device"),
     ("interfaces", "Schnittstellen", "show interfaces brief"),
+    # Same reasoning as Mikrotik's "ip_addresses" above -- which subnet(s) this device routes for.
+    ("ip_addresses", "IP-Adressen je VLAN", "show ip"),
     ("config_export", "Vollständige Konfiguration", "show running-config"),
 )
 
@@ -123,6 +129,8 @@ _SSH_COMMANDS_CISCO: tuple[tuple[str, str, str], ...] = (
     ("vlan", "VLANs", "show vlan brief | no-more"),
     ("neighbors", "Nachbargeräte (CDP)", "show cdp neighbors detail | no-more"),
     ("interfaces", "Schnittstellen", "show interfaces status | no-more"),
+    # Same reasoning as Mikrotik's "ip_addresses" above -- which subnet(s) this device routes for.
+    ("ip_addresses", "IP-Adressen je Schnittstelle", "show ip interface brief | no-more"),
     ("config_export", "Vollständige Konfiguration", "show running-config | no-more"),
 )
 
@@ -302,6 +310,154 @@ async def probe_http(url: str, account: dict) -> dict:
     return {"ok": False, "facts": {},
             "error": "Die Weboberfläche antwortet, hat die hinterlegten Zugangsdaten aber abgelehnt "
                      "(weder Basic- noch Digest-Anmeldung)."}
+
+
+# ---------------------------------------------------------------------------------------------
+# Home Assistant (REST API, Long-Lived Access Token)
+# ---------------------------------------------------------------------------------------------
+
+_HA_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
+_HA_AUTOMATION_LIMIT = 60  # bounds how many per-automation config fetches one probe makes
+
+# (Auslöser-Typ, deutsche Kurzform). Only the type is named, never the exact entity/condition --
+# enough for someone scanning documentation to know *what kind* of thing sets an automation off.
+_HA_TRIGGER_LABELS = {
+    "state": "Zustandsänderung", "numeric_state": "Messwert-Schwelle", "time": "Uhrzeit",
+    "time_pattern": "Zeitmuster", "sun": "Sonnenstand", "event": "Ereignis", "webhook": "Webhook",
+    "template": "Vorlage (Template)", "device": "Geräte-Trigger", "zone": "Zonen-Wechsel",
+    "geo_location": "Standort", "calendar": "Kalender", "mqtt": "MQTT",
+    "homeassistant": "Start/Beenden von Home Assistant", "tag": "NFC-Tag",
+    "persistent_notification": "Benachrichtigung",
+}
+_HA_SERVICE_LABELS = {
+    "turn_on": "einschalten", "turn_off": "ausschalten", "toggle": "umschalten",
+    "set_temperature": "Temperatur einstellen", "open_cover": "öffnen", "close_cover": "schließen",
+    "lock": "verriegeln", "unlock": "entriegeln", "notify": "benachrichtigen",
+    "send_message": "Nachricht senden",
+}
+
+
+def _ha_trigger_summary(triggers: object) -> str:
+    if not isinstance(triggers, list):
+        return ""
+    labels: list[str] = []
+    for trig in triggers:
+        if not isinstance(trig, dict):
+            continue
+        kind = trig.get("trigger") or trig.get("platform") or ""
+        label = _HA_TRIGGER_LABELS.get(kind, kind)
+        if label and label not in labels:
+            labels.append(label)
+    return ", ".join(labels)
+
+
+def _ha_action_summary(actions: object) -> str:
+    if not isinstance(actions, list):
+        return ""
+    labels: list[str] = []
+    for act in actions:
+        if not isinstance(act, dict):
+            continue
+        call = act.get("action") or act.get("service") or ""
+        if not call:
+            continue
+        domain, _, service = call.partition(".")
+        verb = _HA_SERVICE_LABELS.get(service, service)
+        label = f"{domain} {verb}".strip() if domain else verb
+        if label and label not in labels:
+            labels.append(label)
+    return ", ".join(labels)
+
+
+async def probe_homeassistant(url: str, account: dict) -> dict:
+    """Reads a Home Assistant instance's own REST API with a Long-Lived Access Token: which
+    automations are currently active, with a short description of what each does, and (if the KNX
+    integration is set up) its connection details. Read-only -- only GET is ever called; nothing
+    here can flip a switch, run a service, or edit an automation.
+
+    A native `description` an automation was given in its own config is always the best answer to
+    "what does this do" and is used verbatim when present -- only automations without one fall
+    back to a short, rule-based trigger/action summary. That fallback is deliberately modest (a
+    type/service list, not real natural-language understanding of arbitrary trigger/condition/
+    action trees), the same trade-off topology.py's neighbour parsers make elsewhere in this app.
+    """
+    token, _ = _decode_secret(account)
+    base_url = (url or "").rstrip("/")
+    if not base_url:
+        return {"ok": False, "error": "Keine Adresse für Home Assistant hinterlegt.", "facts": {}}
+    if not token:
+        return {"ok": False, "error": "Kein Zugriffstoken hinterlegt.", "facts": {}}
+
+    facts: dict[str, dict] = {}
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        async with httpx.AsyncClient(timeout=_HA_TIMEOUT, verify=False, headers=headers) as client:
+            response = await client.get(f"{base_url}/api/states")
+            response.raise_for_status()
+            states = response.json()
+            if not isinstance(states, list):
+                raise ValueError("Unerwartete Antwort (keine Liste).")
+
+            # The KNX integration's own diagnostic device exposes these as ordinary sensors --
+            # simpler and more portable than reading its config entry, and confirmed against a
+            # real KNX-enabled instance during development.
+            knx_states = {s["entity_id"]: s.get("state", "") for s in states
+                          if isinstance(s, dict) and "knx_interface" in s.get("entity_id", "")}
+            if knx_states:
+                def _knx(suffix: str) -> str:
+                    return next((v for k, v in knx_states.items() if k.endswith(suffix)), "")
+
+                knx_lines = ["KNX ist über die Home-Assistant-Integration angebunden.",
+                            f"Verbindungstyp: {_knx('connection_type') or 'unbekannt'}"]
+                if _knx("individual_address"):
+                    knx_lines.append(f"Physikalische Adresse: {_knx('individual_address')}")
+                if _knx("connected_since"):
+                    knx_lines.append(f"Verbunden seit: {_knx('connected_since')}")
+                facts["knx"] = {"label": "KNX-Anbindung", "value": "\n".join(knx_lines)}
+
+            automation_states = [
+                s for s in states
+                if isinstance(s, dict) and s.get("entity_id", "").startswith("automation.")
+                and s.get("state") == "on"
+            ][:_HA_AUTOMATION_LIMIT]
+
+            lines = []
+            for state in automation_states:
+                attrs = state.get("attributes") or {}
+                name = attrs.get("friendly_name") or state["entity_id"]
+                config_id = attrs.get("id")
+                description = ""
+                if config_id:
+                    try:
+                        config_response = await client.get(
+                            f"{base_url}/api/config/automation/config/{config_id}"
+                        )
+                        if config_response.status_code == 200:
+                            config = config_response.json()
+                            description = (config.get("description") or "").strip()
+                            if not description:
+                                trigger_text = _ha_trigger_summary(
+                                    config.get("triggers") or config.get("trigger") or [])
+                                action_text = _ha_action_summary(
+                                    config.get("actions") or config.get("action") or [])
+                                description = "; ".join(p for p in (
+                                    f"Auslöser: {trigger_text}" if trigger_text else "",
+                                    f"Aktion: {action_text}" if action_text else "",
+                                ) if p)
+                    except (httpx.HTTPError, ValueError):
+                        pass  # one automation's config failing must not drop the rest
+                lines.append(f"- {name}: {description}" if description else f"- {name}")
+
+            if lines:
+                facts["automations"] = {"label": f"Aktive Automationen ({len(lines)})",
+                                        "value": "\n".join(lines)[:20000]}
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        return {"ok": False, "error": f"Home Assistant nicht erreichbar: {exc}", "facts": {}}
+
+    if not facts:
+        return {"ok": False, "error": "Verbindung stand, aber keine aktiven Automationen oder "
+                                      "KNX-Daten gefunden.", "facts": {}}
+    return {"ok": True, "error": "", "facts": facts}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -537,6 +693,12 @@ async def probe_system(system: dict, accounts: list[dict]) -> dict:
                 results[f"snmp:{account['label']}"] = result
             elif "snmp" not in results:
                 results[f"snmp:{account['label']}"] = result
+        if category == "homeassistant":
+            result = await probe_homeassistant(account.get("url") or system.get("url"), account)
+            if result["ok"]:
+                results[f"ha:{account['label']}"] = result
+            elif "ha" not in results:
+                results[f"ha:{account['label']}"] = result
         url = account.get("url") or system.get("url")
         if url and category in ("login", "apikey"):
             result = await probe_http(url, account)

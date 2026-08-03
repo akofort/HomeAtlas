@@ -15,7 +15,7 @@ import traceback
 import ipaddress
 from datetime import datetime, timedelta, timezone
 
-from . import classify, crypto, db, discovery, docker_probe, docs, omada_probe, oui, probe_auth
+from . import classify, crypto, db, discovery, docker_probe, docs, omada_probe, oui, probe_auth, proxmox_probe
 
 
 def _extra_targets(settings: dict, subnets_hint: list[str]) -> list[str]:
@@ -164,6 +164,26 @@ async def run_full_scan(scan_id: str) -> None:
                 else:
                     warnings.append(f"Omada Controller ({account['label']}): {omada_result['error']}")
 
+        if settings.get("scanEnableProxmox", True):
+            proxmox_accounts = [a for a in db.list_accounts()
+                               if a.get("category") == "proxmox" and a.get("allowProbe")]
+            if proxmox_accounts:
+                progress("Proxmox-Gäste erfassen", 88, "Frage Proxmox-Host ab")
+            for account in proxmox_accounts:
+                token_id = account.get("username") or ""
+                token_secret = crypto.decrypt(account.get("secretEnc") or "")
+                proxmox_result = await proxmox_probe.probe(account.get("url") or "", token_id, token_secret)
+                if proxmox_result["ok"]:
+                    # The credential is attached to the Proxmox host's own system row -- so that's
+                    # exactly the right parent for every VM/LXC it just reported, even in a cluster
+                    # with several nodes at several addresses (see proxmox_probe.probe's docstring).
+                    for guest in proxmox_result["systems"]:
+                        guest["parentId"] = account.get("systemId") or None
+                    findings += proxmox_result["systems"]
+                    log(f"Proxmox ({account['label']}): {len(proxmox_result['systems'])} Gäste gefunden")
+                else:
+                    warnings.append(f"Proxmox-Host ({account['label']}): {proxmox_result['error']}")
+
         if settings.get("scanUseLlm", True):
             progress("Geräte einordnen (KI)", 89, "KI-Einordnung unbekannter Geräte")
             classifications, classify_warnings = await classify.classify(findings, settings, log)
@@ -172,6 +192,20 @@ async def run_full_scan(scan_id: str) -> None:
                 classify.apply(f, classifications[f["ip"]]) if f.get("ip") in classifications else f
                 for f in findings
             ]
+
+        # A name shared by several distinct devices in this scan reads as duplicates in the
+        # inventory even though each one is a real, separate device with its own MAC/IP/discovery
+        # key -- some devices (many Shelly units, for one) serve the exact same generic <title> on
+        # their local web UI, and the LLM step above can independently suggest the same generic
+        # name for visually-identical devices it never compares against each other. Fixed up once,
+        # here, after every source (network scan, Docker, Omada, Proxmox) and the LLM step have
+        # all had their say -- doing this any earlier just gets overwritten by a later step.
+        name_counts: dict[str, int] = {}
+        for f in findings:
+            name_counts[f["name"]] = name_counts.get(f["name"], 0) + 1
+        for f in findings:
+            if name_counts[f["name"]] > 1 and f.get("ip"):
+                f["name"] = f"{f['name']} ({f['ip'].rsplit('.', 1)[-1]})"
 
         progress("Inventar aktualisieren", 94, None)
         seen_ids: set[str] = set()

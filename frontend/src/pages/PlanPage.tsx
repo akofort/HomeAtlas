@@ -23,6 +23,7 @@ export default function PlanPage() {
   const { isAdmin } = useAuth();
   const navigate = useNavigate();
   const [svg, setSvg] = useState("");
+  const [planView, setPlanView] = useState<"physical" | "layer3">("physical");
   const [systems, setSystems] = useState<System[]>([]);
   const [monitor, setMonitor] = useState<MonitorState | null>(null);
   const [dns, setDns] = useState<DnsResult | null>(null);
@@ -41,10 +42,15 @@ export default function PlanPage() {
   useEffect(() => {
     // The SVG is fetched as text rather than put in an <img src>: an <img> would need its own
     // authenticated request, and inline markup can inherit the page's colours.
-    fetch("/api/topology.svg", { credentials: "same-origin" })
+    const path = planView === "layer3" ? "/api/topology-layer3.svg" : "/api/topology.svg";
+    setSvg("");
+    fetch(path, { credentials: "same-origin" })
       .then((r) => (r.ok ? r.text() : Promise.reject(new Error("Plan nicht verfügbar"))))
       .then(setSvg)
       .catch((e) => setError(e.message));
+  }, [planView]);
+
+  useEffect(() => {
     api.listSystems().then((r) => setSystems(r.systems)).catch((e) => setError(e.message));
     void loadMonitor();
   }, [loadMonitor]);
@@ -138,12 +144,36 @@ export default function PlanPage() {
       )}
 
       <div className="card">
-        <h2>Übersichtsplan</h2>
-        <p className="muted" style={{ marginTop: -6 }}>
-          Internet, Router, Verteilung, dann als Nächstes die als „kritisch" markierten Geräte —
-          soweit bekannt mit ihrer tatsächlichen Verbindung (per LLDP erkannt), sonst am Netz
-          angehängt. Alles andere steht ausklappbar darunter. Kritische Server mit Container/VMs
-          zeigen nur sich selbst — ein Klick auf den Kasten öffnet die zugehörigen virtuellen Systeme.
+        <div className="row" style={{ justifyContent: "space-between" }}>
+          <h2 style={{ margin: 0 }}>Übersichtsplan</h2>
+          <div className="row" style={{ gap: 4 }}>
+            <button className={planView === "physical" ? "" : "secondary"}
+                    onClick={() => setPlanView("physical")}>
+              Physisch
+            </button>
+            <button className={planView === "layer3" ? "" : "secondary"}
+                    onClick={() => setPlanView("layer3")}>
+              Layer 3 (Subnetze)
+            </button>
+          </div>
+        </div>
+        <p className="muted" style={{ marginTop: 6 }}>
+          {planView === "layer3" ? (
+            <>
+              Alle Geräte mit bekannter Adresse, gruppiert nach IP-Subnetz (/24) — nützlich, sobald
+              mehr als ein Netz/VLAN im Einsatz ist (z. B. Gäste- oder IoT-Netz). Ein per
+              Zugangsdaten ausgelesener Router erscheint in jedem Subnetz, in dem er selbst eine
+              Adresse trägt (aus den Schnittstellen-IPs, nicht nur der einen hinterlegten Adresse)
+              — für alle anderen Geräte zählt weiterhin nur die eine bekannte IP.
+            </>
+          ) : (
+            <>
+              Internet, Router, Verteilung, dann als Nächstes die als „kritisch" markierten Geräte —
+              soweit bekannt mit ihrer tatsächlichen Verbindung (per LLDP erkannt), sonst am Netz
+              angehängt. Alles andere steht ausklappbar darunter. Kritische Server mit Container/VMs
+              zeigen nur sich selbst — ein Klick auf den Kasten öffnet die zugehörigen virtuellen Systeme.
+            </>
+          )}
         </p>
         {svg ? (
           <div className="table-wrap" onClick={handlePlanClick} dangerouslySetInnerHTML={{ __html: svg }} />

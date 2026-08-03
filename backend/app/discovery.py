@@ -254,6 +254,51 @@ async def http_banner(ip: str, open_ports: list[int]) -> dict:
     return {}
 
 
+_SHELLY_TIMEOUT = httpx.Timeout(4.0, connect=2.0)
+
+
+async def shelly_identity(ip: str) -> dict | None:
+    """A Shelly device's own name and exact model, read from its local API -- unlike the generic
+    HTML <title> `http_banner` sees (many Shelly units all serve the literal "Shelly Web Admin",
+    which is what made several genuinely different devices look like duplicates in the inventory),
+    this is the one thing that actually tells them apart.
+
+    `/shelly` answers on every generation without credentials even when the rest of the device's
+    API needs a password -- Shelly designed it that way for exactly this kind of discovery, so no
+    stored account is required here. Gen2+ devices then get a second, richer call for the name a
+    person gave the device in the Shelly app; Gen1 keeps that name in `/settings` instead.
+
+    Returns None for anything that doesn't answer like a Shelly at all (including "nothing on port
+    80"), so a caller can safely try this against every device without first being sure."""
+    try:
+        async with httpx.AsyncClient(timeout=_SHELLY_TIMEOUT) as client:
+            response = await client.get(f"http://{ip}/shelly")
+            if response.status_code != 200:
+                return None
+            info = response.json()
+            if not isinstance(info, dict) or not any(k in info for k in ("type", "model", "app")):
+                return None
+
+            name = None
+            model = info.get("model") or info.get("type") or ""
+            if int(info.get("gen") or 1) >= 2:
+                try:
+                    device_info = (await client.get(f"http://{ip}/rpc/Shelly.GetDeviceInfo")).json()
+                    name = (device_info.get("name") or "").strip() or None
+                    model = device_info.get("model") or model
+                except (httpx.HTTPError, ValueError):
+                    pass
+            else:
+                try:
+                    settings = (await client.get(f"http://{ip}/settings")).json()
+                    name = (settings.get("name") or "").strip() or None
+                except (httpx.HTTPError, ValueError):
+                    pass
+            return {"name": name, "model": model, "mac": info.get("mac", "")}
+    except (httpx.HTTPError, ValueError, OSError):
+        return None
+
+
 # ---------------------------------------------------------------------------------------------
 # mDNS / Bonjour
 # ---------------------------------------------------------------------------------------------
@@ -624,6 +669,26 @@ async def discover(settings: dict, progress: ProgressFn, extra_targets: list[str
             alive[ip] = []
             port_results.setdefault(ip, [])
 
+    # Phase 4b -- Shelly's own local API, for the handful of devices already flagged as a Shelly
+    # by vendor/banner/mDNS text above. A dedicated batch (not folded into http_banner) because it
+    # asks a second, Shelly-specific question -- "what exactly are you, what did the owner call
+    # you" -- that only makes sense once something already looks like a Shelly.
+    shelly_candidates = [
+        ip for ip in alive
+        if "shelly" in " ".join([
+            oui.lookup(arp.get(ip, "")), banners.get(ip, {}).get("title", ""),
+            banners.get(ip, {}).get("server", ""),
+            *(e.get("type", "") + " " + e.get("name", "") for e in mdns.get(ip, [])),
+        ]).lower()
+    ]
+    shelly_identities: dict[str, dict] = {}
+    if shelly_candidates:
+        progress("Shelly-Geräte auslesen", 78, None)
+        results = await asyncio.gather(*(shelly_identity(ip) for ip in shelly_candidates), return_exceptions=True)
+        for candidate_ip, result in zip(shelly_candidates, results):
+            if isinstance(result, dict) and result:
+                shelly_identities[candidate_ip] = result
+
     gateway = default_gateway()
     findings = []
     for ip in sorted(alive, key=lambda a: ipaddress.ip_address(a)):
@@ -651,6 +716,18 @@ async def discover(settings: dict, progress: ProgressFn, extra_targets: list[str
             sources.append("http")
 
         name = _best_name(ip, hostname, device_mdns, device_ssdp, banner, vendor)
+        shelly = shelly_identities.get(ip)
+        if shelly:
+            # The name the owner gave the device in the Shelly app beats everything else -- it is
+            # exactly the kind of identifying detail `_best_name`'s generic sources cannot see.
+            # Without one, the exact model ("Shelly Plus 1PM") still beats the identical <title>
+            # every other unit on the same firmware serves.
+            name = shelly["name"][:80] if shelly.get("name") else f"Shelly {shelly['model']}" if shelly.get("model") else name
+            # `model` may already hold the bare vendor guess "Shelly" from `_guess`'s signature
+            # table (not a real model, just a placeholder) -- the exact model code from the
+            # device itself replaces that, same as it would replace an empty field.
+            if shelly.get("model") and model in ("", "Shelly"):
+                model = shelly["model"][:100]
         # Curated manufacturer documentation, matched across everything known about the device.
         # Anything not covered here is left to the LLM in classify.py, whose suggestions are
         # link-checked before they are stored.
@@ -684,6 +761,11 @@ async def discover(settings: dict, progress: ProgressFn, extra_targets: list[str
                 "guessConfident": confident,
             },
         })
+
+    # Name disambiguation (several devices sharing one generic name, e.g. many Shelly units all
+    # serving the literal <title>"Shelly Web Admin"</title>) happens once in pipeline.py, on the
+    # final merged+classified findings list -- doing it here would just get overwritten by
+    # classify.apply()'s own (possibly just as generic) name suggestion a few steps later.
 
     return {
         "findings": findings,

@@ -8,6 +8,8 @@ const CATEGORIES: [string, string][] = [
   ["sshkey", "SSH-Schlüssel"],
   ["snmp", "SNMP (Community-Zeichenkette)"],
   ["omada", "Omada Controller (Open API)"],
+  ["homeassistant", "Home Assistant (Long-Lived Access Token)"],
+  ["proxmox", "Proxmox VE (API-Token)"],
   ["wifi", "WLAN-Zugang"],
   ["apikey", "API-Schlüssel"],
   ["other", "Sonstiges"],
@@ -240,7 +242,11 @@ export default function AccountsPage() {
               <div className="field-hint">Verträge und Online-Konten brauchen das nicht.</div>
             </div>
             <div className="field">
-              <label>{draft.category === "omada" ? "Client-ID" : "Benutzername / Kundennummer"}</label>
+              <label>
+                {draft.category === "omada" ? "Client-ID"
+                  : draft.category === "proxmox" ? "Token-ID (z. B. root@pam!homeatlas)"
+                  : "Benutzername / Kundennummer"}
+              </label>
               <input value={draft.username} autoComplete="off"
                      onChange={(e) => setDraft({ ...draft, username: e.target.value })} />
             </div>
@@ -285,7 +291,10 @@ export default function AccountsPage() {
               <div className="field">
                 <label>
                   {draft.category === "snmp" ? "Community-Zeichenkette"
-                    : draft.category === "omada" ? "Client Secret" : "Passwort"}
+                    : draft.category === "omada" ? "Client Secret"
+                    : draft.category === "homeassistant" ? "Zugriffstoken (Long-Lived Access Token)"
+                    : draft.category === "proxmox" ? "Token-Secret (UUID)"
+                    : "Passwort"}
                 </label>
                 <input type="password" autoComplete="new-password" value={draft.secret}
                        placeholder={draft.id ? "unverändert lassen" : ""}
@@ -293,13 +302,22 @@ export default function AccountsPage() {
                 <div className="field-hint">
                   {draft.id
                     ? `Leer lassen, um ${draft.category === "snmp" ? "die gespeicherte Community-Zeichenkette"
-                        : draft.category === "omada" ? "das gespeicherte Client Secret" : "das gespeicherte Passwort"} beizubehalten.`
-                    : "Wird verschlüsselt gespeichert."}
+                        : draft.category === "omada" ? "das gespeicherte Client Secret"
+                        : draft.category === "homeassistant" ? "das gespeicherte Zugriffstoken"
+                        : draft.category === "proxmox" ? "das gespeicherte Token-Secret"
+                        : "das gespeicherte Passwort"} beizubehalten.`
+                    : draft.category === "homeassistant"
+                      ? "Wird verschlüsselt gespeichert. Erzeugt im Profil des HA-Benutzers unter „Long-Lived Access Tokens“."
+                      : draft.category === "proxmox"
+                        ? "Wird verschlüsselt gespeichert. Erzeugt unter Datacenter → Berechtigungen → API-Tokens."
+                        : "Wird verschlüsselt gespeichert."}
                 </div>
               </div>
             )}
             <div className="field">
-              <label>Adresse{draft.category === "omada" ? "" : " (optional)"}</label>
+              <label>
+                Adresse{["omada", "homeassistant", "proxmox"].includes(draft.category) ? "" : " (optional)"}
+              </label>
               <input placeholder="https://…" value={draft.url}
                      onChange={(e) => setDraft({ ...draft, url: e.target.value })} />
               {draft.category === "omada" && (
@@ -307,6 +325,18 @@ export default function AccountsPage() {
                   Basis-Adresse des Controllers, z. B. https://192.168.1.10:8043 -- Client-ID und
                   Client Secret werden unter Einstellungen → Plattform-Integration → Open API im
                   Controller selbst angelegt.
+                </div>
+              )}
+              {draft.category === "proxmox" && (
+                <div className="field-hint">
+                  Basis-Adresse des Proxmox-Hosts, z. B. https://192.168.1.20:8006. Dieser Zugang
+                  sollte am Proxmox-Host selbst (als „Gehört zu welchem Gerät?“) hängen, damit
+                  gefundene VMs/Container dort eingeordnet werden.
+                </div>
+              )}
+              {draft.category === "homeassistant" && (
+                <div className="field-hint">
+                  Basis-Adresse von Home Assistant, z. B. http://192.168.1.5:8123.
                 </div>
               )}
             </div>

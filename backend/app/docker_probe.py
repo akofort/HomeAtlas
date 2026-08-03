@@ -79,6 +79,7 @@ async def probe(host_ip: str = "") -> dict:
     for container in containers:
         labels = container.get("Labels") or {}
         project = labels.get("com.docker.compose.project", "")
+        service = labels.get("com.docker.compose.service", "")
         name = _clean_name(container.get("Names"))
         mounts = [
             m.get("Name") or m.get("Source") or ""
@@ -87,8 +88,16 @@ async def probe(host_ip: str = "") -> dict:
         ]
         state = container.get("State", "")
         published = _published_ports(container)
+        # The container's own ID changes on every recreate (a rebuild, `docker compose up
+        # --build`, even a plain restart-with-new-image) -- keying on it here made every redeploy
+        # of a compose-managed container add a brand-new "duplicate" row instead of updating the
+        # existing one. Compose project+service survives a recreate; a container's own --name
+        # (used for the handful of non-compose containers) is just as stable. Only a bare `docker
+        # run` container with no name at all falls back to its ID, and even that keeps the ID
+        # constant across rescans since nothing there recreates it.
+        stable_key = f"{project}:{service}" if project and service else name or container.get("Id", "")[:12]
         systems.append({
-            "discoveryKey": f"docker:{container.get('Id', '')[:12]}",
+            "discoveryKey": f"docker:{stable_key}",
             "kind": "container",
             "name": name,
             "ip": host_ip,
@@ -110,7 +119,7 @@ async def probe(host_ip: str = "") -> dict:
                     "state": state,
                     "status": container.get("Status", ""),
                     "composeProject": project,
-                    "composeService": labels.get("com.docker.compose.service", ""),
+                    "composeService": service,
                     "restartPolicy": labels.get("restart", ""),
                     "portMappings": _port_mappings(container),
                     "volumes": mounts,

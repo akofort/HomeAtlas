@@ -10,6 +10,10 @@ const STATUS_LABEL: Record<string, string> = {
   unknown: "unbekannt",
 };
 
+type SortKey = "name" | "ip" | "kind" | "location" | "status";
+
+const STATUS_ORDER: Record<string, number> = { online: 0, unknown: 1, offline: 2 };
+
 export default function InventoryPage() {
   const { isAdmin } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -18,6 +22,24 @@ export default function InventoryPage() {
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+  // null = "unsorted" -- the order the API already returns (critical devices first, see
+  // db.list_systems), which a column sort deliberately overrides until reset back to null.
+  const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" } | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
+
+  function toggleSort(key: SortKey) {
+    setSort((current) => {
+      if (!current || current.key !== key) return { key, dir: "asc" };
+      if (current.dir === "asc") return { key, dir: "desc" };
+      return null;
+    });
+  }
+
+  function sortIndicator(key: SortKey) {
+    if (!sort || sort.key !== key) return "";
+    return sort.dir === "asc" ? " ▲" : " ▼";
+  }
 
   const kind = searchParams.get("kind") ?? "";
   const parentId = searchParams.get("parentId") ?? "";
@@ -36,7 +58,7 @@ export default function InventoryPage() {
 
   const visible = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    return systems.filter((s) => {
+    const filtered = systems.filter((s) => {
       if (kind && s.kind !== kind) return false;
       if (parentId && s.parentId !== parentId) return false;
       if (!needle) return true;
@@ -45,7 +67,53 @@ export default function InventoryPage() {
         .toLowerCase()
         .includes(needle);
     });
-  }, [systems, kind, parentId, query]);
+    if (!sort) return filtered; // natural order -- critical devices already first, see list_systems
+    const sign = sort.dir === "asc" ? 1 : -1;
+    const value = (s: System): string | number => {
+      switch (sort.key) {
+        case "ip": return s.ip || "";
+        case "kind": return kindLabels[s.kind] ?? s.kind;
+        case "location": return s.location || "";
+        case "status": return STATUS_ORDER[s.status] ?? 1;
+        default: return s.name.toLowerCase();
+      }
+    };
+    return [...filtered].sort((a, b) => {
+      const va = value(a), vb = value(b);
+      return va < vb ? -sign : va > vb ? sign : 0;
+    });
+  }, [systems, kind, parentId, query, sort, kindLabels]);
+
+  function toggleSelected(id: string) {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleSelectAllVisible() {
+    setSelected((current) => {
+      const allSelected = visible.length > 0 && visible.every((s) => current.has(s.id));
+      if (allSelected) return new Set();
+      return new Set(visible.map((s) => s.id));
+    });
+  }
+
+  async function deleteSelected() {
+    if (selected.size === 0) return;
+    if (!window.confirm(`${selected.size} Gerät${selected.size === 1 ? "" : "e"} wirklich löschen?`)) return;
+    setBulkBusy(true);
+    try {
+      await Promise.all([...selected].map((id) => api.deleteSystem(id)));
+      setSystems((current) => current.filter((s) => !selected.has(s.id)));
+      setSelected(new Set());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBulkBusy(false);
+    }
+  }
 
   const parentSystem = useMemo(
     () => (parentId ? systems.find((s) => s.id === parentId) : undefined),
@@ -114,6 +182,19 @@ export default function InventoryPage() {
           </select>
         </div>
 
+        {isAdmin && selected.size > 0 && (
+          <div className="row notice info" style={{ marginBottom: 14, alignItems: "center" }}>
+            <strong>{selected.size}</strong> ausgewählt
+            <button className="danger" style={{ marginLeft: "auto" }} disabled={bulkBusy}
+                    onClick={() => void deleteSelected()}>
+              {bulkBusy ? "Lösche…" : "Ausgewählte löschen"}
+            </button>
+            <button className="secondary" onClick={() => setSelected(new Set())} disabled={bulkBusy}>
+              Auswahl aufheben
+            </button>
+          </div>
+        )}
+
         {loading ? (
           <span className="spinner" />
         ) : visible.length === 0 ? (
@@ -130,16 +211,29 @@ export default function InventoryPage() {
             <table>
               <thead>
                 <tr>
-                  <th>Gerät</th>
-                  <th>Adresse</th>
-                  <th>Art</th>
-                  <th>Standort</th>
-                  <th>Zustand</th>
+                  {isAdmin && (
+                    <th style={{ width: 1 }}>
+                      <input type="checkbox" style={{ width: "auto" }}
+                             checked={visible.length > 0 && visible.every((s) => selected.has(s.id))}
+                             onChange={toggleSelectAllVisible} />
+                    </th>
+                  )}
+                  <th style={{ cursor: "pointer" }} onClick={() => toggleSort("name")}>Gerät{sortIndicator("name")}</th>
+                  <th style={{ cursor: "pointer" }} onClick={() => toggleSort("ip")}>Adresse{sortIndicator("ip")}</th>
+                  <th style={{ cursor: "pointer" }} onClick={() => toggleSort("kind")}>Art{sortIndicator("kind")}</th>
+                  <th style={{ cursor: "pointer" }} onClick={() => toggleSort("location")}>Standort{sortIndicator("location")}</th>
+                  <th style={{ cursor: "pointer" }} onClick={() => toggleSort("status")}>Zustand{sortIndicator("status")}</th>
                 </tr>
               </thead>
               <tbody>
                 {visible.map((s) => (
                   <tr key={s.id}>
+                    {isAdmin && (
+                      <td>
+                        <input type="checkbox" style={{ width: "auto" }} checked={selected.has(s.id)}
+                               onChange={() => toggleSelected(s.id)} />
+                      </td>
+                    )}
                     <td>
                       <Link to={`/geraete/${s.id}`}>
                         <strong>{s.name}</strong>
