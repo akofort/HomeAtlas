@@ -16,7 +16,10 @@ import traceback
 import ipaddress
 from datetime import datetime, timedelta, timezone
 
-from . import classify, crypto, db, discovery, docker_probe, docs, omada_probe, oui, probe_auth, proxmox_probe
+from . import (
+    adguard_probe, classify, crypto, db, discovery, docker_probe, docs, omada_probe, oui, probe_auth,
+    proxmox_probe,
+)
 
 
 def _extra_targets(settings: dict, subnets_hint: list[str]) -> list[str]:
@@ -101,6 +104,11 @@ async def _probe_with_credentials(log) -> tuple[int, list[str], dict[str, str], 
             if not result.get("ok") and result.get("error"):
                 warnings.append(f"{system['name']} ({label}): {result['error']}")
                 db.add_device_error_event(system["id"], "error", f"{label}: {result['error']}")
+            # Set even on an otherwise-ok result (e.g. probe_ssh's per-command timeouts) -- a
+            # switch whose config export timed out while its other commands succeeded still needs
+            # that specific failure visible on the device, not just buried in an overall "ok".
+            for warning in result.get("warnings") or []:
+                db.add_device_error_event(system["id"], "warning", f"{label}: {warning}")
         if not outcome["ran"]:
             continue
 
@@ -352,6 +360,30 @@ async def run_full_scan(scan_id: str) -> None:
                     warnings.append(f"Proxmox-Host ({account['label']}): {proxmox_result['error']}")
                     if account.get("systemId"):
                         db.add_device_error_event(account["systemId"], "error", proxmox_result["error"])
+
+        if settings.get("scanEnableAdguard", True):
+            adguard_accounts = [a for a in db.list_accounts()
+                                if a.get("category") == "adguard" and a.get("allowProbe")]
+            if adguard_accounts:
+                progress("AdGuard Home erfassen", 88, "Frage AdGuard Home ab")
+            for account in adguard_accounts:
+                username = account.get("username") or ""
+                password = crypto.decrypt(account.get("secretEnc") or "")
+                adguard_result = await adguard_probe.probe(account.get("url") or "", username, password)
+                if adguard_result["ok"]:
+                    findings += adguard_result["systems"]
+                    log(f"AdGuard Home ({account['label']}): {len(adguard_result['systems'])} "
+                        "Client(s)/Lease(s) übernommen")
+                    if account.get("systemId") and adguard_result.get("stats"):
+                        host = db.get_system(account["systemId"])
+                        if host is not None:
+                            db.update_system(account["systemId"], {
+                                "extra": {**(host.get("extra") or {}), "adguard": adguard_result["stats"]},
+                            })
+                else:
+                    warnings.append(f"AdGuard Home ({account['label']}): {adguard_result['error']}")
+                    if account.get("systemId"):
+                        db.add_device_error_event(account["systemId"], "error", adguard_result["error"])
 
         if settings.get("scanUseLlm", True):
             progress("Geräte einordnen (KI)", 89, "KI-Einordnung unbekannter Geräte")

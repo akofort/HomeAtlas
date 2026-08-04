@@ -10,6 +10,7 @@ const CATEGORIES: [string, string][] = [
   ["omada", "Omada Controller (Open API)"],
   ["homeassistant", "Home Assistant (Long-Lived Access Token)"],
   ["proxmox", "Proxmox VE (API-Token)"],
+  ["adguard", "AdGuard Home (Basic Auth)"],
   ["wifi", "WLAN-Zugang"],
   ["apikey", "API-Schlüssel"],
   ["other", "Sonstiges"],
@@ -316,7 +317,7 @@ export default function AccountsPage() {
             )}
             <div className="field">
               <label>
-                Adresse{["omada", "homeassistant", "proxmox"].includes(draft.category) ? "" : " (optional)"}
+                Adresse{["omada", "homeassistant", "proxmox", "adguard"].includes(draft.category) ? "" : " (optional)"}
               </label>
               <input placeholder="https://…" value={draft.url}
                      onChange={(e) => setDraft({ ...draft, url: e.target.value })} />
@@ -337,6 +338,13 @@ export default function AccountsPage() {
               {draft.category === "homeassistant" && (
                 <div className="field-hint">
                   Basis-Adresse von Home Assistant, z. B. http://192.168.1.5:8123.
+                </div>
+              )}
+              {draft.category === "adguard" && (
+                <div className="field-hint">
+                  Basis-Adresse von AdGuard Home, z. B. http://192.168.1.2:3000 -- Benutzername und
+                  Passwort sind die des AdGuard-Administrators (dieselben wie für die
+                  Weboberfläche).
                 </div>
               )}
             </div>

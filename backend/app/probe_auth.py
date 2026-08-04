@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import re
 import xml.etree.ElementTree as ElementTree
+from datetime import datetime
 
 import httpx
 
@@ -195,6 +196,16 @@ _SSH_COMMANDS_TPLINK: tuple[tuple[str, str, str], ...] = (
     ("config_export", "Vollständige Konfiguration", _TPLINK_DISABLE_PAGING + "show running-config"),
 )
 
+# Embedded switch CLIs (ArubaOS-Switch/-CX, Cisco IOS, TP-Link JetStream) commonly only run their
+# vendor command parser -- and, critically, only honour the pager-disable command folded into the
+# same exec payload above -- when the SSH session actually has a pseudo-terminal attached; without
+# one, some vendors' sshd either returns nothing at all for these commands or still paginates
+# "show running-config" despite "no page"/"no clipaging" having been sent, since paging state is
+# itself tied to the (non-existent) tty. RouterOS/Mikrotik is deliberately excluded: it disables
+# paging per-command via its own "without-paging" flag rather than a stateful session command, so
+# it never needed a pty in the first place, and the plain Linux command set doesn't either.
+_PTY_PLATFORMS = {"aruba", "arubacx", "cisco", "tplink"}
+
 # Facts holding a full device config export -- picked up by `extract_config_backups` below and
 # fed into deviceConfigVersions. Kept separate from the general truncation limit (see probe_ssh)
 # because a whole router/switch config is the point of collecting it, not a side note.
@@ -299,17 +310,31 @@ async def probe_ssh(host: str, account: dict, platform: str = "") -> dict:
         "arubacx": _SSH_COMMANDS_ARUBA_CX, "cisco": _SSH_COMMANDS_CISCO,
         "tplink": _SSH_COMMANDS_TPLINK,
     }.get(platform, _SSH_COMMANDS)
+    # See _PTY_PLATFORMS' own comment -- vt100 is the lowest-common-denominator terminal type every
+    # vendor CLI below already understands from a plain SSH client connecting.
+    term_type = "vt100" if platform in _PTY_PLATFORMS else None
 
     facts: dict[str, dict] = {}
+    # Per-command failures a human troubleshooting this device would want to know about --
+    # surfaced via probe_system's returned dict and, from there, logged against the device by
+    # pipeline.py, rather than silently disappearing into the generic "continue" below the way an
+    # expected/harmless failure (missing binary, no permission) already does.
+    warnings: list[str] = []
     try:
         async with asyncssh.connect(**connect_args) as connection:
             for key_name, label, command in commands:
                 try:
                     result = await asyncio.wait_for(
-                        connection.run(command, check=False), timeout=_SSH_TIMEOUT
+                        connection.run(command, check=False, term_type=term_type), timeout=_SSH_TIMEOUT
                     )
+                except asyncio.TimeoutError:
+                    warnings.append(
+                        f"„{label}“ hat innerhalb von {_SSH_TIMEOUT:.0f} Sekunden nicht geantwortet "
+                        "(SSH-Prompt hängt vermutlich an einer Pager- oder Bestätigungsabfrage)."
+                    )
+                    continue
                 except Exception:  # noqa: BLE001 -- one command failing (missing binary, no
-                    # permission, timeout) must not abort the probe; the rest is still worth having.
+                    # permission) must not abort the probe; the rest is still worth having.
                     continue
                 output = (result.stdout or "").strip()
                 if output:
@@ -328,8 +353,11 @@ async def probe_ssh(host: str, account: dict, platform: str = "") -> dict:
         return {"ok": False, "error": f"SSH-Verbindung zu {host}:{port} fehlgeschlagen: {exc}", "facts": {}}
 
     if not facts:
-        return {"ok": False, "error": "Verbindung stand, aber kein Befehl lieferte eine Ausgabe.", "facts": {}}
-    return {"ok": True, "error": "", "facts": facts}
+        error = "Verbindung stand, aber kein Befehl lieferte eine Ausgabe."
+        if warnings:
+            error += " " + " ".join(warnings)
+        return {"ok": False, "error": error, "facts": {}, "warnings": warnings}
+    return {"ok": True, "error": "", "facts": facts, "warnings": warnings}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -476,6 +504,18 @@ def _ha_action_summary(actions: object) -> str:
     return ", ".join(labels)
 
 
+def _ha_format_last_triggered(value: str) -> str:
+    """Best-effort "DD.MM.YYYY HH:MM" rendering of HA's ISO-8601 `last_triggered` attribute --
+    falls back to the raw value on anything that doesn't parse rather than dropping it, since even
+    an unparsed timestamp is more useful to someone reading the doc than silence."""
+    if not value:
+        return ""
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%d.%m.%Y %H:%M")
+    except ValueError:
+        return value
+
+
 async def _ha_self_check(client: httpx.AsyncClient, base_url: str) -> str:
     """Confirms the endpoint actually is a Home Assistant instance answering this token, before
     anything else is asked of it. HA's root `/api/` route -- unlike `/api/states` -- exists purely
@@ -574,6 +614,10 @@ async def probe_homeassistant(url: str, account: dict) -> dict:
                 attrs = state.get("attributes") or {}
                 name = attrs.get("friendly_name") or state["entity_id"]
                 status = "ein" if state.get("state") == "on" else "aus"
+                # HA's own automation.* state always carries this attribute (null if it has never
+                # fired) -- reading it straight off the state avoids a second per-automation call
+                # for something the /api/states response already has.
+                last_triggered = attrs.get("last_triggered") or ""
                 config_id = attrs.get("id")
                 description = ""
                 if config_id:
@@ -596,7 +640,11 @@ async def probe_homeassistant(url: str, account: dict) -> dict:
                                     ) if p)
                     except (httpx.HTTPError, ValueError):
                         pass  # one automation's config failing must not drop the rest
-                lines.append(f"- {name} ({status}): {description}" if description else f"- {name} ({status})")
+                line = f"- {name} ({status}): {description}" if description else f"- {name} ({status})"
+                triggered_text = _ha_format_last_triggered(last_triggered)
+                if triggered_text:
+                    line += f" [zuletzt ausgelöst: {triggered_text}]"
+                lines.append(line)
 
             if lines:
                 facts["automations"] = {"label": f"Automationen ({len(lines)})",

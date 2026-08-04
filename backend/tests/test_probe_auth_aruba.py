@@ -66,9 +66,11 @@ class _FakeConnection:
     def __init__(self, responses: dict[str, str]):
         self.responses = responses
         self.commands: list[str] = []
+        self.term_types: list[str | None] = []
 
-    async def run(self, command: str, check: bool = False):
+    async def run(self, command: str, check: bool = False, term_type: str | None = None):
         self.commands.append(command)
+        self.term_types.append(term_type)
         for needle, output in self.responses.items():
             if needle in command:
                 return _FakeRunResult(output)
@@ -133,3 +135,45 @@ def test_probe_ssh_aruba_config_backup_survives_a_slow_paged_reply(monkeypatch):
 
     assert result["facts"]["config_export"]["value"] == long_config
     assert "interface 99" in result["facts"]["config_export"]["value"]
+
+
+def test_probe_ssh_requests_a_pty_for_aruba_platform(monkeypatch):
+    connection = _FakeConnection({"show running-config": "hostname SW1\n"})
+    monkeypatch.setattr(asyncssh, "connect", lambda **kwargs: _FakeConnectContextManager(connection))
+    monkeypatch.setattr(probe_auth, "_decode_secret", lambda account: ("hunter2", ""))
+
+    asyncio.run(probe_auth.probe_ssh("10.0.0.20", _account(), platform="aruba"))
+
+    assert connection.term_types
+    assert all(t == "vt100" for t in connection.term_types)
+
+
+def test_probe_ssh_does_not_request_a_pty_for_plain_linux_hosts(monkeypatch):
+    connection = _FakeConnection({"hostname": "server1\n"})
+    monkeypatch.setattr(asyncssh, "connect", lambda **kwargs: _FakeConnectContextManager(connection))
+    monkeypatch.setattr(probe_auth, "_decode_secret", lambda account: ("hunter2", ""))
+
+    asyncio.run(probe_auth.probe_ssh("10.0.0.30", _account(), platform=""))
+
+    assert connection.term_types
+    assert all(t is None for t in connection.term_types)
+
+
+def test_probe_ssh_logs_a_clear_warning_when_a_command_times_out(monkeypatch):
+    class _TimeoutConnection(_FakeConnection):
+        async def run(self, command, check=False, term_type=None):
+            self.commands.append(command)
+            self.term_types.append(term_type)
+            if "show running-config" in command:
+                raise asyncio.TimeoutError()
+            return await super().run(command, check=check, term_type=term_type)
+
+    connection = _TimeoutConnection({"show system-information": "System Name: SW1"})
+    monkeypatch.setattr(asyncssh, "connect", lambda **kwargs: _FakeConnectContextManager(connection))
+    monkeypatch.setattr(probe_auth, "_decode_secret", lambda account: ("hunter2", ""))
+
+    result = asyncio.run(probe_auth.probe_ssh("10.0.0.23", _account(), platform="aruba"))
+
+    assert result["ok"]  # other commands still succeeded
+    assert "config_export" not in result["facts"]
+    assert any("nicht geantwortet" in w for w in result["warnings"])

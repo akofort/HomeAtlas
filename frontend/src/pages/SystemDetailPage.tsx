@@ -228,6 +228,11 @@ export default function SystemDetailPage() {
   // Populated by pipeline.py after a scan with a Home Assistant credential -- see
   // probe_auth.extract_printer_supplies / pipeline._apply_printer_supplies.
   const printerSupplies = (system.extra?.printerSupplies ?? []) as { name: string; percent: number }[];
+  // Populated by pipeline.py after a scan with an AdGuard Home credential attached to this system
+  // -- see adguard_probe.probe / pipeline.py's "AdGuard Home erfassen" step.
+  const adguard = system.extra?.adguard as {
+    protectionEnabled?: boolean; queries?: number; blocked?: number; blockedPercent?: number;
+  } | undefined;
 
   return (
     <>
@@ -448,6 +453,41 @@ export default function SystemDetailPage() {
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {adguard && (
+        <div className="card">
+          <h2>AdGuard Home</h2>
+          <p className="muted" style={{ marginTop: -6 }}>
+            DNS-Filterung -- Stand vom letzten Netzwerk-Scan.
+          </p>
+          <div className="table-wrap">
+            <table>
+              <tbody>
+                <tr>
+                  <th style={{ width: "45%" }}>Schutz</th>
+                  <td>
+                    <span className={`badge ${adguard.protectionEnabled ? "ok" : "danger"}`}>
+                      {adguard.protectionEnabled ? "aktiv" : "deaktiviert"}
+                    </span>
+                  </td>
+                </tr>
+                {adguard.queries !== undefined && (
+                  <tr><th>DNS-Anfragen</th><td className="mono">{adguard.queries.toLocaleString("de-DE")}</td></tr>
+                )}
+                {adguard.blocked !== undefined && (
+                  <tr>
+                    <th>Blockiert</th>
+                    <td className="mono">
+                      {adguard.blocked.toLocaleString("de-DE")}
+                      {adguard.blockedPercent !== undefined ? ` (${adguard.blockedPercent}%)` : ""}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
 

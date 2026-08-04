@@ -93,3 +93,45 @@ def test_states_call_rejected_after_self_check_passed_still_reports_auth_error(m
     result = asyncio.run(probe_auth.probe_homeassistant("http://ha.local:8123", {}))
     assert not result["ok"]
     assert "Zugriffstoken abgelehnt" in result["error"]
+
+
+def test_automation_line_includes_last_triggered_when_present(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/":
+            return httpx.Response(200, json={"message": "API running"})
+        if request.url.path.endswith("/api/states"):
+            return httpx.Response(200, json=[
+                {"entity_id": "automation.a", "state": "on", "attributes": {
+                    "friendly_name": "Abendlicht", "id": "1", "last_triggered": "2026-08-01T18:30:00+00:00",
+                }},
+            ])
+        return httpx.Response(404)
+
+    _fake_client(monkeypatch, handler)
+    result = asyncio.run(probe_auth.probe_homeassistant("http://ha.local:8123", {}))
+    assert result["ok"]
+    line = result["facts"]["automations"]["value"]
+    assert "zuletzt ausgelöst: 01.08.2026 18:30" in line
+
+
+def test_automation_line_omits_last_triggered_when_never_fired(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/":
+            return httpx.Response(200, json={"message": "API running"})
+        if request.url.path.endswith("/api/states"):
+            return httpx.Response(200, json=[
+                {"entity_id": "automation.b", "state": "off", "attributes": {
+                    "friendly_name": "Nachtmodus", "id": "2", "last_triggered": None,
+                }},
+            ])
+        return httpx.Response(404)
+
+    _fake_client(monkeypatch, handler)
+    result = asyncio.run(probe_auth.probe_homeassistant("http://ha.local:8123", {}))
+    assert result["ok"]
+    assert "zuletzt ausgelöst" not in result["facts"]["automations"]["value"]
+
+
+def test_format_last_triggered_falls_back_to_raw_value_on_bad_input():
+    assert probe_auth._ha_format_last_triggered("not-a-date") == "not-a-date"
+    assert probe_auth._ha_format_last_triggered("") == ""

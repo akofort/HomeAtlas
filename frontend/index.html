@@ -6,8 +6,14 @@
     <meta name="theme-color" content="#0b1120" />
     <meta name="description" content="Die Dokumentation deines Heimnetzes – automatisch erstellt, in verständlicher Sprache." />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-    <link rel="apple-touch-icon" href="/icon.svg" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <link rel="manifest" href="/manifest.webmanifest" />
+    <!-- iOS/Safari ignores the manifest's "display": "standalone" -- these three are the only way
+         to get a standalone (no browser chrome) launch from "Zum Home-Bildschirm hinzufügen" there. -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="HomeAtlas" />
     <title>HomeAtlas</title>
   </head>
   <body>
