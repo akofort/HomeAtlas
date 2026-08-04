@@ -191,6 +191,22 @@ export interface Account {
   updatedAt: string;
   hasSecret: boolean;
   hasPassphrase: boolean;
+  /** Number of group/multi-device targets (see AccountAssignment) beyond the single system
+   *  `systemId` points at. Only populated by GET /accounts (the accounts list); absent from
+   *  responses scoped to one system's own accounts, which don't need it. */
+  assignmentCount?: number;
+}
+
+/** One group/multi-device target a credential profile additionally applies to, beyond its own
+ *  `systemId` -- e.g. every device of a given kind ("router"), a subnet, or a further specific
+ *  system. Resolved automatically at scan time (see the backend's db.list_probe_accounts) -- a
+ *  device never needs the credential directly attached to be probed with it. */
+export interface AccountAssignment {
+  id: string;
+  accountId: string;
+  targetType: "system" | "kind" | "subnet";
+  targetValue: string;
+  createdAt: string;
 }
 
 export interface DocVersion {
@@ -405,6 +421,9 @@ export const api = {
   updateAccount: (id: string, body: Record<string, any>) => patch<{ account: Account }>(`/accounts/${id}`, body),
   revealSecret: (id: string) => get<{ secret: string }>(`/accounts/${id}/secret`),
   deleteAccount: (id: string) => del<{ ok: boolean }>(`/accounts/${id}`),
+  listAccountAssignments: (id: string) => get<{ assignments: AccountAssignment[] }>(`/accounts/${id}/assignments`),
+  setAccountAssignments: (id: string, assignments: { targetType: string; targetValue: string }[]) =>
+    put<{ assignments: AccountAssignment[] }>(`/accounts/${id}/assignments`, assignments),
   generateSshKey: (systemId: string, label: string) =>
     post<{ account: Account; publicKey: string }>(`/systems/${systemId}/ssh-keys`, { label }),
   deploySshKey: (accountId: string, loginAccountId: string, port = 0) =>

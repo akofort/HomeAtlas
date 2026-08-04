@@ -114,3 +114,72 @@ def test_probe_leaves_importance_unset_when_not_tagged_critical(monkeypatch):
     assert "importance" not in vm
     assert vm["status"] == "offline"
     assert vm["discoveryKey"] == "proxmox:pve:vm:102"
+
+
+def _fake_client(monkeypatch, routes: dict) -> None:
+    transport = httpx.MockTransport(_handler(routes))
+
+    class _FakeAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = transport
+            kwargs.pop("verify", None)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(proxmox_probe.httpx, "AsyncClient", _FakeAsyncClient)
+
+
+def test_list_guests_requires_address():
+    result = asyncio.run(proxmox_probe.list_guests("", "root@pam!token", "secret"))
+    assert not result["ok"]
+    assert "Adresse" in result["error"]
+
+
+def test_list_guests_requires_token():
+    result = asyncio.run(proxmox_probe.list_guests("https://pve.local:8006", "", ""))
+    assert not result["ok"]
+    assert "Token" in result["error"]
+
+
+def test_list_guests_never_calls_docker_and_returns_vm_and_lxc(monkeypatch):
+    routes = {
+        "/api2/json/nodes": httpx.Response(200, json={"data": [{"node": "pve"}]}),
+        "/api2/json/nodes/pve/qemu": httpx.Response(200, json={"data": [
+            {"vmid": 101, "name": "nextcloud-vm", "status": "running"},
+        ]}),
+        "/api2/json/nodes/pve/lxc": httpx.Response(200, json={"data": [
+            {"vmid": 102, "name": "pihole", "status": "stopped"},
+        ]}),
+    }
+    _fake_client(monkeypatch, routes)
+
+    result = asyncio.run(proxmox_probe.list_guests("https://pve.local:8006", "root@pam!token", "secret"))
+
+    assert result["ok"]
+    by_name = {c["name"]: c for c in result["containers"]}
+    assert by_name["nextcloud-vm"]["state"] == "running"
+    assert by_name["nextcloud-vm"]["image"] == "VM (QEMU/KVM) · Node pve"
+    assert by_name["pihole"]["state"] == "stopped"
+    assert by_name["pihole"]["image"] == "LXC-Container · Node pve"
+    # No fact/field here is ever a Docker command or image name -- this is the REST path meant to
+    # replace "docker ps" over SSH on a host that has no Docker CLI at all.
+    assert all("docker" not in str(v).lower() for c in result["containers"] for v in c.values())
+
+
+def test_list_guests_reports_unreachable_host(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    transport = httpx.MockTransport(handler)
+
+    class _FakeAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = transport
+            kwargs.pop("verify", None)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(proxmox_probe.httpx, "AsyncClient", _FakeAsyncClient)
+
+    result = asyncio.run(proxmox_probe.list_guests("https://pve.local:8006", "root@pam!token", "secret"))
+
+    assert not result["ok"]
+    assert "nicht erreichbar" in result["error"]

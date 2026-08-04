@@ -184,3 +184,57 @@ async def probe(base_url: str, token_id: str, token_secret: str) -> dict:
             return {"ok": True, "error": "", "systems": systems}
     except (httpx.HTTPError, ValueError, KeyError) as exc:
         return {"ok": False, "error": f"Proxmox-Host nicht erreichbar: {exc}", "systems": []}
+
+
+_KIND_LABEL = {"vm": "VM (QEMU/KVM)", "container": "LXC-Container"}
+
+
+async def list_guests(base_url: str, token_id: str, token_secret: str) -> dict:
+    """Returns {"ok", "error", "containers": [...]}. A lean node/VM/LXC listing for the "VMs &
+    LXC-Container laden" button on a Proxmox host's own device page in the UI -- unlike `probe()`
+    above, this never touches the inventory and skips the per-guest `/config` round trip (MAC/IP/
+    notes/tags), since the button only needs name/kind/status, not everything a full scan collects.
+
+    `containers` entries share their shape (id/name/image/state/status) with remote_admin.
+    list_remote_containers' Docker listing so the frontend can render both with one table -- but
+    Docker is never involved on the Proxmox path: this is the primary source main.py's
+    `list_remote_containers` route uses for a system with a "proxmox"-category account attached,
+    with `remote_admin.list_remote_proxmox_guests` (native `pct list`/`qm list` over SSH) only as
+    its fallback when this call itself fails. Neither path ever runs a `docker` command against a
+    Proxmox host -- it has no Docker CLI at all."""
+    base_url = (base_url or "").rstrip("/")
+    if not base_url:
+        return {"ok": False, "error": "Keine Adresse für den Proxmox-Host hinterlegt.", "containers": []}
+    if not token_id or not token_secret:
+        return {"ok": False, "error": "API-Token-ID oder -Secret fehlt.", "containers": []}
+
+    headers = {"Authorization": f"PVEAPIToken={token_id}={token_secret}"}
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, headers=headers) as client:
+            nodes = (await _get(client, base_url, "/nodes")).get("data") or []
+
+            containers = []
+            for node_entry in nodes:
+                node = node_entry.get("node", "")
+                if not node:
+                    continue
+                for kind, path in (("vm", "qemu"), ("container", "lxc")):
+                    try:
+                        guests = (await _get(client, base_url, f"/nodes/{node}/{path}")).get("data") or []
+                    except (httpx.HTTPError, ValueError):
+                        continue  # one node/guest-type failing must not drop the rest
+                    for guest in guests:
+                        vmid = guest.get("vmid")
+                        if vmid is None:
+                            continue
+                        status = guest.get("status") or "unbekannt"
+                        containers.append({
+                            "id": f"{node}/{path}/{vmid}",
+                            "name": guest.get("name") or f"{'VM' if kind == 'vm' else 'LXC'} {vmid}",
+                            "image": f"{_KIND_LABEL[kind]} · Node {node}",
+                            "state": "running" if status == "running" else "stopped",
+                            "status": status,
+                        })
+            return {"ok": True, "error": "", "containers": containers}
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        return {"ok": False, "error": f"Proxmox-Host nicht erreichbar: {exc}", "containers": []}

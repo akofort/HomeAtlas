@@ -202,6 +202,74 @@ async def list_remote_containers(host: str, account: dict, port: int = 0) -> dic
     return {"ok": True, "error": "", "containers": containers}
 
 
+def _parse_pct_list(text: str) -> list[dict]:
+    """LXC containers from `pct list`'s own table (`VMID  Status  [Lock]  Name` -- the Lock column
+    only appears when a guest currently has one). Column count therefore varies, so this reads the
+    first token as VMID, the second as Status, and the *last* as Name rather than assuming a fixed
+    width -- LXC hostnames don't contain spaces, so "last token" is always the name regardless of
+    whether Lock was present."""
+    containers = []
+    for line in text.splitlines()[1:]:  # [0] is the header row
+        parts = line.split()
+        if len(parts) < 3 or not parts[0].isdigit():
+            continue
+        vmid, status, name = parts[0], parts[1], parts[-1]
+        containers.append({
+            "id": f"lxc/{vmid}", "name": name, "image": "LXC-Container",
+            "state": "running" if status == "running" else "stopped", "status": status,
+        })
+    return containers
+
+
+def _parse_qm_list(text: str) -> list[dict]:
+    """VMs from `qm list`'s own fixed-column table: VMID, Name, Status, Mem(MB), Bootdisk(GB), PID."""
+    containers = []
+    for line in text.splitlines()[1:]:  # [0] is the header row
+        parts = line.split()
+        if len(parts) < 3 or not parts[0].isdigit():
+            continue
+        vmid, name, status = parts[0], parts[1], parts[2]
+        containers.append({
+            "id": f"qemu/{vmid}", "name": name, "image": "VM (QEMU/KVM)",
+            "state": "running" if status == "running" else "stopped", "status": status,
+        })
+    return containers
+
+
+async def list_remote_proxmox_guests(host: str, account: dict, port: int = 0) -> dict:
+    """LXC containers (`pct list`) and VMs (`qm list`) on a Proxmox host, reached over SSH with a
+    stored credential -- the SSH fallback for main.py's `list_remote_containers` route when
+    `proxmox_probe.list_guests`'s REST call fails (or no Proxmox API token is stored at all, only
+    an SSH login). Deliberately never `docker ps` -- a Proxmox host manages VMs/containers through
+    `pct`/`qm`, not Docker, and has no Docker CLI installed at all; that mismatch is exactly the bug
+    this function exists to avoid ("bash: line 1: docker: command not found")."""
+    import asyncssh
+
+    try:
+        connect_args = _connect_args(host, account, port)
+    except (ValueError, KeyError) as exc:
+        return {"ok": False, "error": f"Der hinterlegte Zugang ließ sich nicht lesen: {exc}", "containers": []}
+
+    try:
+        async with asyncssh.connect(**connect_args) as connection:
+            lxc_result = await connection.run("pct list", check=False)
+            vm_result = await connection.run("qm list", check=False)
+    except Exception as exc:  # noqa: BLE001 -- connection errors are an expected, reportable outcome
+        return {"ok": False, "error": f"Verbindung zu {host} fehlgeschlagen: {exc}", "containers": []}
+
+    if lxc_result.exit_status != 0 and vm_result.exit_status != 0:
+        stderr = (lxc_result.stderr or vm_result.stderr or "").strip()
+        return {"ok": False, "containers": [], "error": (
+            stderr or "„pct list“/„qm list“ fehlgeschlagen -- ist dies wirklich ein Proxmox-Host?"
+        )}
+
+    containers = (
+        (_parse_pct_list(lxc_result.stdout or "") if lxc_result.exit_status == 0 else [])
+        + (_parse_qm_list(vm_result.stdout or "") if vm_result.exit_status == 0 else [])
+    )
+    return {"ok": True, "error": "", "containers": containers}
+
+
 async def run_remote_docker_command(host: str, account: dict, action: str, container_id: str, port: int = 0) -> dict:
     """`action` must be one of `_DOCKER_ACTIONS` -- hardcoded, never taken from free text, same
     allowlist discipline as probe_auth's `_SSH_COMMANDS`. `container_id` is always shell-quoted."""

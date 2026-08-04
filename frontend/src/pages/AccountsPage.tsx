@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, type Account, type System } from "../lib/api";
+import { api, type Account, type AccountAssignment, type System } from "../lib/api";
 
 const CATEGORIES: [string, string][] = [
   ["contract", "Vertrag / Kundenkonto"],
@@ -40,7 +40,11 @@ const emptyDraft = (): Draft => ({
 export default function AccountsPage() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [systems, setSystems] = useState<System[]>([]);
+  const [kindLabels, setKindLabels] = useState<Record<string, string>>({});
   const [draft, setDraft] = useState<Draft | null>(null);
+  const [assignments, setAssignments] = useState<AccountAssignment[]>([]);
+  const [assignType, setAssignType] = useState<"kind" | "subnet" | "system">("kind");
+  const [assignValue, setAssignValue] = useState("");
   const [secrets, setSecrets] = useState<Record<string, string>>({});
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
@@ -54,6 +58,7 @@ export default function AccountsPage() {
     const [a, s] = await Promise.all([api.listAccounts(), api.listSystems()]);
     setAccounts(a.accounts);
     setSystems(s.systems);
+    setKindLabels(s.kindLabels);
   }
 
   useEffect(() => {
@@ -80,6 +85,7 @@ export default function AccountsPage() {
 
   function startEdit(account: Account) {
     setNotice("");
+    setAssignments([]);
     setDraft({
       id: account.id,
       systemId: account.systemId ?? "",
@@ -95,6 +101,45 @@ export default function AccountsPage() {
       allowProbe: Boolean(account.allowProbe),
       port: account.port ?? 0,
     });
+    api.listAccountAssignments(account.id).then((r) => setAssignments(r.assignments)).catch(() => {});
+  }
+
+  async function addAssignment() {
+    if (!draft?.id || !assignValue.trim()) return;
+    setBusy(true);
+    setError("");
+    try {
+      const next = [
+        ...assignments.map((a) => ({ targetType: a.targetType, targetValue: a.targetValue })),
+        { targetType: assignType, targetValue: assignValue.trim() },
+      ];
+      const r = await api.setAccountAssignments(draft.id, next);
+      setAssignments(r.assignments);
+      setAssignValue("");
+      await reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeAssignment(assignment: AccountAssignment) {
+    if (!draft?.id) return;
+    setBusy(true);
+    setError("");
+    try {
+      const next = assignments
+        .filter((a) => a.id !== assignment.id)
+        .map((a) => ({ targetType: a.targetType, targetValue: a.targetValue }));
+      const r = await api.setAccountAssignments(draft.id, next);
+      setAssignments(r.assignments);
+      await reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function save() {
@@ -200,7 +245,7 @@ export default function AccountsPage() {
             übergeben — er sieht nur, <em>dass</em> ein Zugang hinterlegt ist.
           </p>
         </div>
-        {!draft && <button onClick={() => { setNotice(""); setDraft(emptyDraft()); }}>+ Neuer Zugang</button>}
+        {!draft && <button onClick={() => { setNotice(""); setAssignments([]); setDraft(emptyDraft()); }}>+ Neuer Zugang</button>}
       </div>
 
       {error && <div className="notice error">{error}</div>}
@@ -376,6 +421,65 @@ export default function AccountsPage() {
             diesen Haken bleibt der Zugang reine Ablage.
           </div>
 
+          {draft.id ? (
+            <div style={{ marginBottom: 16 }}>
+              <label>Gilt zusätzlich für</label>
+              <div className="field-hint" style={{ marginTop: -2, marginBottom: 8 }}>
+                Ein einzelner Zugang kann über „Gehört zu welchem Gerät?“ hinaus auch für eine ganze
+                Gerätekategorie, ein Subnetz oder weitere einzelne Geräte gelten — beim nächsten Scan
+                wird er dort automatisch mitverwendet (sofern oben „zum Auslesen verwenden“ gesetzt ist).
+              </div>
+              {assignments.length > 0 && (
+                <ul style={{ margin: "0 0 8px", padding: 0, listStyle: "none" }}>
+                  {assignments.map((a) => (
+                    <li key={a.id} className="row" style={{ marginBottom: 4, gap: 6 }}>
+                      <span className="badge">
+                        {a.targetType === "kind" ? `Gerätekategorie: ${kindLabels[a.targetValue] ?? a.targetValue}`
+                          : a.targetType === "subnet" ? `Subnetz: ${a.targetValue}`
+                          : `Gerät: ${systemName[a.targetValue] ?? a.targetValue}`}
+                      </span>
+                      <button type="button" className="secondary small" disabled={busy}
+                              onClick={() => void removeAssignment(a)}>Entfernen</button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <div className="row" style={{ flexWrap: "nowrap" }}>
+                <select style={{ width: "auto" }} value={assignType}
+                        onChange={(e) => { setAssignType(e.target.value as typeof assignType); setAssignValue(""); }}>
+                  <option value="kind">Gerätekategorie</option>
+                  <option value="subnet">Subnetz</option>
+                  <option value="system">Weiteres Gerät</option>
+                </select>
+                {assignType === "kind" ? (
+                  <select style={{ width: "auto" }} value={assignValue} onChange={(e) => setAssignValue(e.target.value)}>
+                    <option value="">— wählen —</option>
+                    {Object.entries(kindLabels).map(([kind, label]) => (
+                      <option key={kind} value={kind}>{label}</option>
+                    ))}
+                  </select>
+                ) : assignType === "subnet" ? (
+                  <input placeholder="z. B. 192.168.2.0/24" value={assignValue}
+                         onChange={(e) => setAssignValue(e.target.value)} />
+                ) : (
+                  <select style={{ width: "auto" }} value={assignValue} onChange={(e) => setAssignValue(e.target.value)}>
+                    <option value="">— Gerät wählen —</option>
+                    {systems.filter((s) => s.id !== draft.systemId).map((s) => (
+                      <option key={s.id} value={s.id}>{s.name}</option>
+                    ))}
+                  </select>
+                )}
+                <button type="button" className="secondary small" disabled={busy || !assignValue.trim()}
+                        onClick={() => void addAssignment()}>Hinzufügen</button>
+              </div>
+            </div>
+          ) : (
+            <div className="notice info" style={{ marginBottom: 16 }}>
+              Zuordnung zu weiteren Geräten/Gerätekategorien/Subnetzen ist nach dem ersten Speichern
+              verfügbar.
+            </div>
+          )}
+
           <div className="row">
             <button onClick={() => void save()} disabled={busy || !draft.label.trim()}>
               {busy ? "Speichere…" : "Speichern"}
@@ -422,6 +526,12 @@ export default function AccountsPage() {
                           liest aus
                         </span>
                       ) : null}
+                      {(a.assignmentCount ?? 0) > 0 && (
+                        <span className="badge" style={{ marginLeft: 8 }}
+                              title="Gilt zusätzlich für weitere Gerätekategorien/Subnetze/Geräte">
+                          gilt für {a.assignmentCount} weitere
+                        </span>
+                      )}
                       {a.url && (
                         <div style={{ fontSize: "0.83rem" }}>
                           <a href={a.url} target="_blank" rel="noreferrer">{a.url}</a>

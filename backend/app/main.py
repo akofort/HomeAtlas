@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 
 from . import (auth, crypto, db, diagnostics, docker_admin, docker_probe, docs, llm_providers,
                mcp_server, model_catalog, monitor as monitor_module, oui, pipeline, probe_auth,
-               remote_admin, security, topology, tools)
+               proxmox_probe, remote_admin, security, topology, tools)
 
 logger = logging.getLogger("homeatlas")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -580,7 +580,11 @@ def _public_account(account: dict) -> dict:
 
 @app.get("/api/accounts")
 async def list_accounts(_: dict = Depends(require_admin)) -> dict:
-    return {"accounts": [_public_account(a) for a in db.list_accounts()]}
+    assignment_counts = db.count_assignments_by_account()
+    return {"accounts": [
+        {**_public_account(a), "assignmentCount": assignment_counts.get(a["id"], 0)}
+        for a in db.list_accounts()
+    ]}
 
 
 @app.post("/api/accounts")
@@ -622,6 +626,35 @@ async def reveal_secret(account_id: str, request: Request, user: dict = Depends(
 async def delete_account(account_id: str, _: dict = Depends(require_admin)) -> dict:
     db.delete_account(account_id)
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------------------------
+# Account (credential-profile) assignments -- lets one account additionally apply to a whole
+# device kind or subnet, beyond the single system its own `systemId` points at. See
+# db.list_probe_accounts for how a scan resolves these back to a concrete credential per device;
+# no secret is ever part of an assignment row, so nothing here needs the same "never returned in
+# plaintext" care the account routes above take.
+# ---------------------------------------------------------------------------------------------
+
+class AccountAssignmentBody(BaseModel):
+    targetType: str
+    targetValue: str
+
+
+@app.get("/api/accounts/{account_id}/assignments")
+async def list_account_assignments(account_id: str, _: dict = Depends(require_admin)) -> dict:
+    if db.get_account(account_id) is None:
+        raise HTTPException(status_code=404, detail="Zugang nicht gefunden.")
+    return {"assignments": db.list_account_assignments(account_id)}
+
+
+@app.put("/api/accounts/{account_id}/assignments")
+async def set_account_assignments(account_id: str, body: list[AccountAssignmentBody],
+                                  _: dict = Depends(require_admin)) -> dict:
+    if db.get_account(account_id) is None:
+        raise HTTPException(status_code=404, detail="Zugang nicht gefunden.")
+    assignments = db.set_account_assignments(account_id, [b.model_dump() for b in body])
+    return {"assignments": assignments}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -881,8 +914,32 @@ def _remote_host_and_account(system_id: str, account_id: str) -> tuple[dict, dic
     return system, account, host
 
 
+def _proxmox_account(system_id: str) -> dict | None:
+    """The "proxmox"-category account attached to this system, if any -- the same signal
+    proxmox_probe.py/pipeline.py already treat as "this system row IS the Proxmox host" (see
+    AccountsPage.tsx's own hint to attach that credential to the host itself). Used to route
+    `list_remote_containers` and its action/console counterparts to the pct/qm/REST path instead
+    of Docker -- a Proxmox host has no Docker CLI at all, see remote_admin.list_remote_proxmox_
+    guests' docstring for the bug this avoids."""
+    return next((a for a in db.list_accounts(system_id) if a.get("category") == "proxmox"), None)
+
+
 @app.get("/api/systems/{system_id}/remote-containers")
-async def list_remote_containers(system_id: str, accountId: str, _: dict = Depends(require_admin)) -> dict:
+async def list_remote_containers(system_id: str, accountId: str = "", _: dict = Depends(require_admin)) -> dict:
+    proxmox_account = _proxmox_account(system_id)
+    if proxmox_account is not None:
+        token_id = proxmox_account.get("username") or ""
+        token_secret = crypto.decrypt(proxmox_account.get("secretEnc") or "")
+        result = await proxmox_probe.list_guests(proxmox_account.get("url") or "", token_id, token_secret)
+        if not result["ok"] and accountId:
+            # REST unreachable/misconfigured -- fall back to the native pct/qm CLI over SSH rather
+            # than ever trying the generic Docker path below, which does not exist on this host.
+            _system, account, host = _remote_host_and_account(system_id, accountId)
+            result = await remote_admin.list_remote_proxmox_guests(host, account)
+        if not result["ok"]:
+            raise HTTPException(status_code=400, detail=result["error"])
+        return {"containers": result["containers"]}
+
     _system, account, host = _remote_host_and_account(system_id, accountId)
     result = await remote_admin.list_remote_containers(host, account)
     if not result["ok"]:
@@ -895,6 +952,11 @@ async def remote_container_action(system_id: str, container_id: str, action: str
                                   request: Request, user: dict = Depends(require_admin)) -> dict:
     if action not in ("start", "stop", "restart"):
         raise HTTPException(status_code=404, detail="Unbekannte Aktion.")
+    if _proxmox_account(system_id) is not None:
+        raise HTTPException(status_code=400, detail=(
+            "Docker-Aktionen sind auf einem Proxmox-Host nicht möglich -- VMs/LXC-Container werden "
+            "über Proxmox selbst gesteuert (Weboberfläche oder pct/qm)."
+        ))
     system, account, host = _remote_host_and_account(system_id, accountId)
     result = await remote_admin.run_remote_docker_command(host, account, action, container_id)
     ip, agent = _client(request)
@@ -915,7 +977,7 @@ async def remote_docker_console(websocket: WebSocket, system_id: str) -> None:
     container_id = websocket.query_params.get("containerId", "")
     system, account = db.get_system(system_id), db.get_account(account_id)
     if (system is None or account is None or account.get("systemId") != system_id
-            or not _ssh_eligible(account) or not container_id):
+            or not _ssh_eligible(account) or not container_id or _proxmox_account(system_id) is not None):
         await websocket.close(code=1008)
         return
     host = (system.get("ip") or system.get("hostname") or "").strip()
