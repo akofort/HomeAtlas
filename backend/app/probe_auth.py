@@ -35,6 +35,7 @@ by the user. This is stated in the README rather than hidden.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import xml.etree.ElementTree as ElementTree
 from datetime import datetime
@@ -42,6 +43,11 @@ from datetime import datetime
 import httpx
 
 from . import crypto, db
+
+# Diagnostic-only -- never used to decide behaviour, just to make an otherwise-invisible fallback
+# decision (see `merge_brother_toner_levels`) traceable in the server log. Child of "homeatlas" so
+# it inherits main.py's `logging.basicConfig` formatting/level without configuring its own handler.
+_logger = logging.getLogger("homeatlas.probe_auth")
 
 _SSH_TIMEOUT = 15.0
 _HTTP_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
@@ -768,26 +774,33 @@ _PRINTER_MIB_LEVEL_OID = "1.3.6.1.2.1.43.11.1.1.9"  # prtMarkerSuppliesLevel
 _PRINTER_MIB_MAX_OID = "1.3.6.1.2.1.43.11.1.1.8"    # prtMarkerSuppliesMaxCapacity
 _PRINTER_MIB_TYPE_OID = "1.3.6.1.2.1.43.11.1.1.5"   # prtMarkerSuppliesType
 
-# RFC 3805 PrtMarkerSuppliesTypeTC's "toner" value. Everything else the table reports -- drum/OPC
-# units (9), transfer belts (20), waste toner (4), fusers (15), ... -- is real information but not
-# a toner level, and used to end up mixed into the same list `parse_printer_mib_supplies` fed to
-# the toner gauge: a printer that happily reports drum/belt life through the standard table (many
-# do) while leaving its *toner* rows at RFC 3805's -3/-2 sentinels (Brother firmware commonly does,
-# see `_BROTHER_TONER_OIDS` below) looked like it had working toner data when what was actually
-# showing was drum/belt wear -- and, worse, silently pre-empted the Brother-specific fallback below
-# since "some usable row" was already true. Filtering by this column strictly separates the two.
+# RFC 3805 PrtMarkerSuppliesTypeTC's "toner" value -- used to keep drum/OPC units (9), transfer
+# belts (20), waste toner (4), fusers (15), ... out of `parse_printer_mib_maintenance_supplies`'s
+# sibling function `merge_brother_toner_levels`/`_standard_mib_toner_fallback` matches by colour
+# name instead of this column (see their own docstrings for why), but `consumables_maintenance`
+# still needs to know what to leave out of "everything that isn't toner".
 _PRINTER_MIB_TYPE_TONER = "3"
 
+# RFC 3805 sentinels specific to prtMarkerSuppliesLevel (the -1/-2/-3 family means something
+# slightly different on other Printer-MIB columns, but this is the one relevant here): a negative
+# value is a *status code*, never a percentage, and must never be fed into the level/capacity
+# division below no matter how "valid-looking" the surrounding data is. Kept only for log
+# messages -- the actual skip-negative-values behaviour lives in `_percent_from_level_capacity`
+# regardless of whether a given code is in this table or not.
+_PRINTER_MIB_LEVEL_STATUS = {"-1": "unbekannt", "-2": "Normal/OK", "-3": "Toner niedrig (Low)"}
+
 # Brother's private enterprise MIB (1.3.6.1.4.1.2435): one plain-integer (0-100) OID per toner
-# colour, queried directly rather than walked. Used only when the standard Printer-MIB above has no
-# usable *toner* row -- Brother firmware commonly leaves prtMarkerSuppliesLevel/MaxCapacity at
-# -3/-2 ("not used"/"unknown", RFC 3805) for toner specifically, even while reporting real
-# percentages for drum/belt through the same table.
-_BROTHER_TONER_OIDS: tuple[tuple[str, str], ...] = (
-    ("Toner Schwarz", "1.3.6.1.4.1.2435.2.3.9.4.2.1.5.5.8.0"),
-    ("Toner Magenta", "1.3.6.1.4.1.2435.2.3.9.4.2.1.5.5.9.0"),
-    ("Toner Cyan", "1.3.6.1.4.1.2435.2.3.9.4.2.1.5.5.10.0"),
-    ("Toner Gelb", "1.3.6.1.4.1.2435.2.3.9.4.2.1.5.5.11.0"),
+# colour, queried directly rather than walked. (Anzeigename, OID, Suchwort). The search word is
+# used to find that colour's own row in the *standard* Printer-MIB table (`prtMarkerSuppliesDescription`
+# text is vendor free text but is written in English regardless of the device's UI language, e.g.
+# "Magenta Toner Cartridge" -- matching against the German display name would never hit) for
+# `merge_brother_toner_levels`'s fallback -- see its own docstring for when and why that fallback
+# fires.
+_BROTHER_TONER_OIDS: tuple[tuple[str, str, str], ...] = (
+    ("Toner Schwarz", "1.3.6.1.4.1.2435.2.3.9.4.2.1.5.5.8.0", "black"),
+    ("Toner Magenta", "1.3.6.1.4.1.2435.2.3.9.4.2.1.5.5.9.0", "magenta"),
+    ("Toner Cyan", "1.3.6.1.4.1.2435.2.3.9.4.2.1.5.5.10.0", "cyan"),
+    ("Toner Gelb", "1.3.6.1.4.1.2435.2.3.9.4.2.1.5.5.11.0", "yellow"),
 )
 
 
@@ -813,20 +826,37 @@ def _parse_printer_mib_walk(text: str, base_oid: str) -> dict[str, str]:
     return values
 
 
-def _printer_mib_percent_supplies(
-    descr_text: str, level_text: str, max_text: str, type_text: str, *,
-    only_types: set[str] | None = None, exclude_types: set[str] | None = None,
+def _percent_from_level_capacity(level_raw: str | None, capacity_raw: str | None) -> float | None:
+    """0-100 percent from one Printer-MIB row's raw prtMarkerSuppliesLevel/MaxCapacity strings, or
+    None when either is missing/unparseable, or Level is negative -- RFC 3805 defines negative
+    Level values as status codes (-1 unknown, -2 "Normal/OK" on this device's firmware, -3 "Toner
+    niedrig" -- see `_PRINTER_MIB_LEVEL_STATUS`), never a literal reading, so `-3 / capacity * 100`
+    must never be computed as if it were one. A non-positive capacity is likewise not a real
+    "supply holds this much" figure (0, or RFC 3805's own -1/-2 sentinels on that column) and is
+    rejected the same way. Shared by the type-filtered whole-table parse below and Brother's
+    per-colour toner fallback, so the two never disagree on what counts as a real reading."""
+    if level_raw is None or capacity_raw is None:
+        return None
+    try:
+        level, capacity = int(level_raw), int(capacity_raw)
+    except ValueError:
+        return None
+    if level < 0 or capacity <= 0:
+        return None
+    return max(0.0, min(100.0, round(level * 100 / capacity, 1)))
+
+
+def parse_printer_mib_maintenance_supplies(
+    descr_text: str, level_text: str, max_text: str, type_text: str,
 ) -> list[dict]:
-    """Shared (name, percent) computation over one Printer-MIB (RFC 3805) supplies-table walk,
-    matched by the row index shared across the four separate `snmpwalk` outputs (description,
-    level, max capacity, type). `only_types`/`exclude_types` filter by prtMarkerSuppliesType (see
-    `_PRINTER_MIB_TYPE_TONER`) -- a row whose type wasn't read at all (`type_text` came back empty,
-    or that specific index is missing from it) is excluded by `only_types` but kept by
-    `exclude_types`, i.e. an unknown type never gets counted as toner, but is still surfaced as
-    maintenance info since drum/belt/etc. don't need type certainty the way a toner gauge does.
-    Negative level/capacity values are RFC-defined sentinels (-1 unknown, -2 unrestricted/no fixed
-    capacity, -3 not used), not real readings, and are skipped -- a printer reporting only
-    sentinels for its toner rows is exactly the case `_BROTHER_TONER_OIDS` exists for."""
+    """(name, percent) pairs for every supply the standard Printer-MIB reports that ISN'T toner --
+    drums/OPC units, transfer belts, waste-toner boxes, fusers, and so on -- matched by the row
+    index shared across the four separate `snmpwalk` outputs (description, level, max capacity,
+    type). Optional, supplementary "how worn is this part" context (see `_snmp_printer_supplies`'s
+    `consumables_maintenance`) -- unlike toner_levels (see `merge_brother_toner_levels`, which
+    matches toner by colour name rather than this column), it is never wired to a "running low,
+    reorder" gauge, so a row whose type is unknown/wasn't read at all is kept rather than dropped:
+    there is no toner gauge here to accidentally miscolour."""
     descriptions = _parse_printer_mib_walk(descr_text, _PRINTER_MIB_DESCR_OID)
     levels = _parse_printer_mib_walk(level_text, _PRINTER_MIB_LEVEL_OID)
     capacities = _parse_printer_mib_walk(max_text, _PRINTER_MIB_MAX_OID)
@@ -834,54 +864,23 @@ def _printer_mib_percent_supplies(
 
     supplies: list[dict] = []
     for index, level_raw in levels.items():
-        supply_type = types.get(index)
-        if only_types is not None and supply_type not in only_types:
+        if types.get(index) == _PRINTER_MIB_TYPE_TONER:
             continue
-        if exclude_types is not None and supply_type in exclude_types:
-            continue
-        capacity_raw = capacities.get(index)
-        if capacity_raw is None:
-            continue
-        try:
-            level, capacity = int(level_raw), int(capacity_raw)
-        except ValueError:
-            continue
-        if level < 0 or capacity <= 0:
+        percent = _percent_from_level_capacity(level_raw, capacities.get(index))
+        if percent is None:
             continue
         name = descriptions.get(index) or f"Verbrauchsmaterial {index}"
-        percent = max(0.0, min(100.0, round(level * 100 / capacity, 1)))
         supplies.append({"name": name, "percent": percent})
     return supplies
-
-
-def parse_printer_mib_supplies(descr_text: str, level_text: str, max_text: str, type_text: str) -> list[dict]:
-    """(name, percent) pairs for toner only (prtMarkerSuppliesType == 3, RFC 3805) from a standard
-    Printer-MIB supplies-table walk. Strictly type-filtered rather than "everything the table
-    reports": some printers happily report real drum/transfer-belt percentages through this same
-    table while leaving their *toner* rows at RFC 3805 sentinels (see `_BROTHER_TONER_OIDS`), and
-    without this filter those non-toner readings used to end up in the toner gauge -- see
-    `_PRINTER_MIB_TYPE_TONER`'s own comment."""
-    return _printer_mib_percent_supplies(descr_text, level_text, max_text, type_text,
-                                         only_types={_PRINTER_MIB_TYPE_TONER})
-
-
-def parse_printer_mib_maintenance_supplies(
-    descr_text: str, level_text: str, max_text: str, type_text: str,
-) -> list[dict]:
-    """(name, percent) pairs for every supply the standard Printer-MIB reports that ISN'T toner --
-    drums/OPC units, transfer belts, waste-toner boxes, fusers, and so on. Optional, supplementary
-    "how worn is this part" context (see `_snmp_printer_supplies`'s `consumables_maintenance`) --
-    unlike toner_levels, it is never wired to a "running low, reorder" gauge, so an unknown/
-    unfiltered type is kept rather than dropped."""
-    return _printer_mib_percent_supplies(descr_text, level_text, max_text, type_text,
-                                         exclude_types={_PRINTER_MIB_TYPE_TONER})
 
 
 def _parse_brother_toner_reply(text: str) -> float | None:
     """Percentage from one Brother `brInfoTonerLevel*`-style OID reply -- a plain `INTEGER: <0-100>`
     `snmpget` reply, not a packed blob. None for anything that isn't a usable in-range integer
     (missing OID, "No Such Object", a negative or >100 value some firmware uses as its own
-    not-applicable sentinel)."""
+    not-applicable sentinel). A reply of exactly 0 is still returned here (this function only
+    checks "is this a syntactically valid percentage") -- whether 0 should actually be trusted or
+    treated as a misread is `merge_brother_toner_levels`'s decision, not this parser's."""
     match = re.search(r"INTEGER:\s*(-?\d+)", text)
     if not match:
         return None
@@ -889,28 +888,88 @@ def _parse_brother_toner_reply(text: str) -> float | None:
     return float(value) if 0 <= value <= 100 else None
 
 
-def parse_brother_toner_levels(readings: dict[str, str]) -> list[dict]:
-    """(name, percent) pairs from Brother's direct per-colour toner-level OIDs (`_BROTHER_TONER_
-    OIDS`), keyed by the same label each was queried under. This is the toner_levels fallback for
-    when the standard Printer-MIB's toner rows are all RFC 3805 sentinels -- known behaviour on
-    Brother firmware that otherwise reports real drum/belt percentages through the standard table
-    (see `parse_printer_mib_supplies`)."""
+def _describe_level(level_raw: str | None) -> str:
+    """Raw prtMarkerSuppliesLevel value plus, for the RFC 3805 status codes, what it actually means
+    -- e.g. "-3 (Toner niedrig (Low))" -- so a log line naming it doesn't require looking up
+    `_PRINTER_MIB_LEVEL_STATUS` by hand to understand."""
+    if level_raw is None:
+        return "kein Wert"
+    status = _PRINTER_MIB_LEVEL_STATUS.get(level_raw)
+    return f"{level_raw} ({status})" if status else level_raw
+
+
+def _standard_mib_toner_fallback(
+    descr_text: str, level_text: str, max_text: str, keyword: str,
+) -> tuple[float | None, dict[str, str | None]]:
+    """(percent, raw) for the one Printer-MIB supplies-table row whose own description contains
+    `keyword` (English colour name, case-insensitive) -- `merge_brother_toner_levels`'s fallback
+    when Brother's direct OID for that colour gave nothing trustworthy. Matching by description
+    text rather than an exact key is inherently a best guess (`prtMarkerSuppliesDescription` is
+    vendor free text -- "Magenta Toner Cartridge", a TN-xxx part number, ...), the same trade-off
+    `pipeline._match_printer_supplies` already accepts for Home Assistant sensor names. `raw`
+    always carries {"index", "level", "maxCapacity"}, even when no percent could be computed, so
+    the exact reading behind a dropped or fallback value is loggable, not just the final number."""
+    descriptions = _parse_printer_mib_walk(descr_text, _PRINTER_MIB_DESCR_OID)
+    levels = _parse_printer_mib_walk(level_text, _PRINTER_MIB_LEVEL_OID)
+    capacities = _parse_printer_mib_walk(max_text, _PRINTER_MIB_MAX_OID)
+
+    index = next((i for i, name in descriptions.items() if keyword.lower() in name.lower()), None)
+    if index is None:
+        return None, {"index": None, "level": None, "maxCapacity": None}
+    raw = {"index": index, "level": levels.get(index), "maxCapacity": capacities.get(index)}
+    return _percent_from_level_capacity(raw["level"], raw["maxCapacity"]), raw
+
+
+def merge_brother_toner_levels(
+    readings: dict[str, str], descr_text: str, level_text: str, max_text: str,
+) -> list[dict]:
+    """Final (name, percent) list for the four Brother toner colours (`_BROTHER_TONER_OIDS`,
+    `readings` keyed by the same label each was queried under). The direct per-colour OID wins when
+    it gives a usable, *nonzero* reading. When it comes back missing or exactly 0 -- Brother
+    firmware is known to occasionally misreport one colour that way even while the other three read
+    correctly, which is the concrete bug this exists to fix (Magenta showing as a false 0.0%) --
+    the same colour's standard Printer-MIB row is tried instead (`_standard_mib_toner_fallback`,
+    matched by colour name, independent of whatever the *other* colours' direct OIDs returned).
+    Every fallback decision is logged with the raw SNMP index/level/maxCapacity behind it, so a
+    wrong-looking percentage is traceable to the exact reading that produced it rather than only
+    visible after the fact in the UI. On devices that don't answer these Brother-private OIDs at
+    all (any non-Brother printer), every reading is empty/"No Such Object", `_parse_brother_toner_
+    reply` returns None for all four, and this transparently becomes a per-colour version of the
+    standard-Printer-MIB read -- the Brother-specific step never has to be skipped explicitly."""
+    keywords = {label: keyword for label, _oid, keyword in _BROTHER_TONER_OIDS}
     supplies: list[dict] = []
-    for label, _oid in _BROTHER_TONER_OIDS:
-        percent = _parse_brother_toner_reply(readings.get(label, ""))
+    for label, raw_text in readings.items():
+        percent = _parse_brother_toner_reply(raw_text)
+        if percent is None or percent == 0:
+            fallback_percent, raw = _standard_mib_toner_fallback(
+                descr_text, level_text, max_text, keywords.get(label, label))
+            _logger.info(
+                "Toner %s: direkte Brother-OID lieferte %s -- Fallback über Printer-MIB "
+                "(Index=%s, Level=%s, MaxCapacity=%s) -> %s",
+                label, "keinen Wert" if percent is None else "0",
+                raw["index"], _describe_level(raw["level"]), raw["maxCapacity"],
+                "kein Wert" if fallback_percent is None else f"{fallback_percent}%",
+            )
+            # Always overwritten, never merely "if it improves on the old value" -- an untrusted 0
+            # from the direct OID must not survive as the final answer just because the fallback
+            # also came up empty; "no data" (None, dropped below) beats a value already known to be
+            # unreliable.
+            percent = fallback_percent
         if percent is not None:
             supplies.append({"name": label, "percent": percent})
     return supplies
 
 
 async def _snmp_printer_supplies(target: str, community: str) -> dict[str, list[dict]]:
-    """Returns {"toner_levels": [...], "consumables_maintenance": [...]}. Standard Printer-MIB
-    first for both (type-filtered, see `parse_printer_mib_supplies`/`parse_printer_mib_maintenance_
-    supplies`); Brother's direct per-colour OIDs (`parse_brother_toner_levels`) only as a
-    toner_levels fallback, and only when the standard table's toner rows were unusable.
-    consumables_maintenance has no vendor-specific fallback -- drum/belt wear is supplementary
-    context, not worth a private-OID reverse-engineering effort the way toner (the thing that
-    actually blocks printing) is."""
+    """Returns {"toner_levels": [...], "consumables_maintenance": [...]}. toner_levels always goes
+    through the per-colour Brother-OID-with-Printer-MIB-fallback merge (`merge_brother_toner_
+    levels`) -- Brother's private OIDs are harmless no-ops on non-Brother hardware (an unanswered
+    OID falls straight through to that same colour's standard-MIB row), so this one path covers
+    both cases rather than an all-or-nothing "try the whole standard table, else try Brother
+    wholesale" that let one bad colour (Magenta reading 0%) hide the other three, or a bad standard
+    row hide an otherwise-fine Brother reading. consumables_maintenance has no vendor-specific
+    fallback -- drum/belt wear is supplementary context, not worth a private-OID effort the way
+    toner (the thing that actually blocks printing) is."""
     descr = await _snmp_run("snmpwalk", "-v2c", "-c", community, "-t", "3", "-r", "1", "-O", "n",
                             target, _PRINTER_MIB_DESCR_OID)
     level = await _snmp_run("snmpwalk", "-v2c", "-c", community, "-t", "3", "-r", "1", "-O", "n",
@@ -920,15 +979,13 @@ async def _snmp_printer_supplies(target: str, community: str) -> dict[str, list[
     type_ = await _snmp_run("snmpwalk", "-v2c", "-c", community, "-t", "3", "-r", "1", "-O", "n",
                             target, _PRINTER_MIB_TYPE_OID)
 
-    toner = parse_printer_mib_supplies(descr, level, maxcap, type_)
     maintenance = parse_printer_mib_maintenance_supplies(descr, level, maxcap, type_)
 
-    if not toner:
-        readings = {
-            label: await _snmp_run("snmpget", "-v2c", "-c", community, "-t", "3", "-r", "1", target, oid)
-            for label, oid in _BROTHER_TONER_OIDS
-        }
-        toner = parse_brother_toner_levels(readings)
+    readings = {
+        label: await _snmp_run("snmpget", "-v2c", "-c", community, "-t", "3", "-r", "1", target, oid)
+        for label, oid, _keyword in _BROTHER_TONER_OIDS
+    }
+    toner = merge_brother_toner_levels(readings, descr, level, maxcap)
 
     return {"toner_levels": toner, "consumables_maintenance": maintenance}
 
