@@ -96,8 +96,14 @@ async def probe(host_ip: str = "") -> dict:
         # run` container with no name at all falls back to its ID, and even that keeps the ID
         # constant across rescans since nothing there recreates it.
         stable_key = f"{project}:{service}" if project and service else name or container.get("Id", "")[:12]
+        # Before compose project+service became the key, every container was keyed on its own ID
+        # (see the note above) -- an installation upgrading across that change would otherwise fail
+        # to find its existing row by the new key and duplicate every compose-managed container.
+        # This lets db.upsert_discovered_system fall back to the old key and migrate the row in place.
+        legacy_key = f"docker:{container.get('Id', '')[:12]}"
         systems.append({
             "discoveryKey": f"docker:{stable_key}",
+            "legacyDiscoveryKeys": [legacy_key],
             "kind": "container",
             "name": name,
             "ip": host_ip,

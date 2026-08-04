@@ -14,6 +14,15 @@ type SortKey = "name" | "ip" | "kind" | "location" | "status";
 
 const STATUS_ORDER: Record<string, number> = { online: 0, unknown: 1, offline: 2 };
 
+// Pads each octet so string comparison of the result orders IPv4 addresses numerically
+// (plain string comparison would put "10" before "2"). Falls back to the raw value for
+// anything that isn't a dotted-quad, which still sorts consistently even if not numerically.
+function ipSortKey(ip: string): string {
+  const parts = ip.split(".");
+  if (parts.length !== 4 || !parts.every((p) => /^\d{1,3}$/.test(p))) return ip;
+  return parts.map((p) => p.padStart(3, "0")).join(".");
+}
+
 export default function InventoryPage() {
   const { isAdmin } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -71,7 +80,7 @@ export default function InventoryPage() {
     const sign = sort.dir === "asc" ? 1 : -1;
     const value = (s: System): string | number => {
       switch (sort.key) {
-        case "ip": return s.ip || "";
+        case "ip": return ipSortKey(s.ip || "");
         case "kind": return kindLabels[s.kind] ?? s.kind;
         case "location": return s.location || "";
         case "status": return STATUS_ORDER[s.status] ?? 1;
@@ -104,15 +113,24 @@ export default function InventoryPage() {
     if (selected.size === 0) return;
     if (!window.confirm(`${selected.size} Gerät${selected.size === 1 ? "" : "e"} wirklich löschen?`)) return;
     setBulkBusy(true);
-    try {
-      await Promise.all([...selected].map((id) => api.deleteSystem(id)));
-      setSystems((current) => current.filter((s) => !selected.has(s.id)));
-      setSelected(new Set());
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBulkBusy(false);
+    const ids = [...selected];
+    // allSettled, not all -- one failing delete (a stale row already gone server-side, a timeout)
+    // must not stop the successful ones from being reflected in the UI.
+    const results = await Promise.allSettled(ids.map((id) => api.deleteSystem(id)));
+    const deletedIds = new Set(ids.filter((_, i) => results[i].status === "fulfilled"));
+    if (deletedIds.size > 0) {
+      setSystems((current) => current.filter((s) => !deletedIds.has(s.id)));
+      setSelected((current) => {
+        const next = new Set(current);
+        deletedIds.forEach((id) => next.delete(id));
+        return next;
+      });
     }
+    const failedCount = results.length - deletedIds.size;
+    setError(failedCount > 0
+      ? `${failedCount} Gerät${failedCount === 1 ? "" : "e"} konnten nicht gelöscht werden.`
+      : "");
+    setBulkBusy(false);
   }
 
   const parentSystem = useMemo(

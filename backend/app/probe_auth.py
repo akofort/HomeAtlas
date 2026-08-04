@@ -434,16 +434,17 @@ async def probe_homeassistant(url: str, account: dict) -> dict:
                         )
                         if config_response.status_code == 200:
                             config = config_response.json()
-                            description = (config.get("description") or "").strip()
-                            if not description:
-                                trigger_text = _ha_trigger_summary(
-                                    config.get("triggers") or config.get("trigger") or [])
-                                action_text = _ha_action_summary(
-                                    config.get("actions") or config.get("action") or [])
-                                description = "; ".join(p for p in (
-                                    f"Auslöser: {trigger_text}" if trigger_text else "",
-                                    f"Aktion: {action_text}" if action_text else "",
-                                ) if p)
+                            if isinstance(config, dict):
+                                description = (config.get("description") or "").strip()
+                                if not description:
+                                    trigger_text = _ha_trigger_summary(
+                                        config.get("triggers") or config.get("trigger") or [])
+                                    action_text = _ha_action_summary(
+                                        config.get("actions") or config.get("action") or [])
+                                    description = "; ".join(p for p in (
+                                        f"Auslöser: {trigger_text}" if trigger_text else "",
+                                        f"Aktion: {action_text}" if action_text else "",
+                                    ) if p)
                     except (httpx.HTTPError, ValueError):
                         pass  # one automation's config failing must not drop the rest
                 lines.append(f"- {name}: {description}" if description else f"- {name}")

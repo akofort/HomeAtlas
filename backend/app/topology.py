@@ -464,7 +464,15 @@ _IP_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
 
 
 def _looks_like_mask(ip: str) -> bool:
-    return all(p in _MASK_OCTETS for p in ip.split("."))
+    """A real subnet mask is a contiguous run of 1-bits followed by 0-bits (255.255.255.0,
+    255.255.0.0, ...) -- checking each octet is individually a valid mask byte isn't enough, since
+    e.g. 224.0.0.128 or 128.192.240.0 pass that test octet-by-octet while being ordinary host
+    addresses, not masks."""
+    parts = ip.split(".")
+    if not all(p in _MASK_OCTETS for p in parts):
+        return False
+    bits = "".join(f"{int(p):08b}" for p in parts)
+    return "01" not in bits
 
 
 def _router_subnets(system: dict) -> set[str]:
@@ -486,7 +494,11 @@ def _router_subnets(system: dict) -> set[str]:
 
     subnets: set[str] = set()
     for text in texts:
-        for ip in _IP_RE.findall(text):
+        # ArubaOS's "show ip" prints a "Default Gateway" line alongside the VLAN interface table --
+        # that address belongs to whatever device is upstream, not to this router's own interfaces,
+        # so lines naming it are excluded before the regex scan picks up every dotted-quad in sight.
+        filtered = "\n".join(line for line in text.splitlines() if "gateway" not in line.lower())
+        for ip in _IP_RE.findall(filtered):
             if _looks_like_mask(ip) or ip.startswith(("0.", "127.")) or ip == "255.255.255.255":
                 continue
             subnets.add(_subnet_of(ip))
@@ -536,7 +548,7 @@ def render_layer3(settings: dict | None = None) -> str:
         group = by_subnet[subnet]
         subnet_routers = group["routers"][:3]
         subnet_others = group["others"]
-        total = len(subnet_others) + len({r["id"] for r in subnet_routers})
+        total = len(subnet_others) + len({r["id"] for r in group["routers"]})
 
         svg.append(_label(40, y - 12, f"{subnet} — {total} Gerät{'e' if total != 1 else ''}"))
         items = [{"id": r["id"], "title": r["name"],

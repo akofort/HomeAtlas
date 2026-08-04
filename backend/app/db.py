@@ -643,8 +643,18 @@ def upsert_discovered_system(found: dict) -> tuple[dict, bool]:
     may only refresh the volatile facts (ip, status, ports, evidence) -- otherwise every rescan
     would wipe the human-written `name`, `location` and `descriptionMd`, which is the actual value
     the app accumulates over time.
+
+    `legacyDiscoveryKeys`, if present, is a list of discoveryKey values a prober used to emit for
+    this same device before its key scheme changed (see docker_probe.py's compose-based key). It
+    is only ever a lookup fallback -- never written to the row -- so that an installation upgrading
+    across the scheme change merges into its existing row instead of duplicating it.
     """
     existing = find_system_by_key(found.get("discoveryKey", ""))
+    if existing is None:
+        for legacy_key in found.get("legacyDiscoveryKeys") or ():
+            existing = find_system_by_key(legacy_key)
+            if existing is not None:
+                break
     now = _now()
     if existing is None:
         created = create_system({**found, "discovered": 1, "firstSeen": now, "lastSeen": now})
@@ -657,6 +667,7 @@ def upsert_discovered_system(found: dict) -> tuple[dict, bool]:
         "services": found.get("services"),
         "extra": {**(existing.get("extra") or {}), **(found.get("extra") or {})},
         "lastSeen": now,
+        "discoveryKey": found.get("discoveryKey") or existing["discoveryKey"],
     }
     if not existing["confirmed"]:
         for field in ("kind", "name", "hostname", "mac", "vendor", "model", "os", "location",

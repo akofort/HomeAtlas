@@ -203,9 +203,16 @@ async def run_full_scan(scan_id: str) -> None:
         name_counts: dict[str, int] = {}
         for f in findings:
             name_counts[f["name"]] = name_counts.get(f["name"], 0) + 1
+        # The IP's last octet alone still collides for Docker containers, which all share their
+        # host's IP -- a running count within the (name, suffix) group keeps every entry unique
+        # even when two containers on the same host end up with the same LLM-suggested name.
+        group_counts: dict[tuple[str, str], int] = {}
         for f in findings:
             if name_counts[f["name"]] > 1 and f.get("ip"):
-                f["name"] = f"{f['name']} ({f['ip'].rsplit('.', 1)[-1]})"
+                suffix = f["ip"].rsplit(".", 1)[-1]
+                group_counts[(f["name"], suffix)] = group_counts.get((f["name"], suffix), 0) + 1
+                occurrence = group_counts[(f["name"], suffix)]
+                f["name"] = f"{f['name']} ({suffix}{f'-{occurrence}' if occurrence > 1 else ''})"
 
         progress("Inventar aktualisieren", 94, None)
         seen_ids: set[str] = set()

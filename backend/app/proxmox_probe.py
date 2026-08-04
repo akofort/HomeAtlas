@@ -13,6 +13,7 @@ login -- and its `url` the Proxmox host's own base address. See AccountsPage.tsx
 """
 from __future__ import annotations
 
+import asyncio
 import re
 
 import httpx
@@ -22,11 +23,11 @@ from . import oui
 _TIMEOUT = httpx.Timeout(15.0, connect=5.0)
 
 # qemu (VM) net config lines look like "virtio=AA:BB:...,bridge=vmbr0,...", LXC's like
-# "name=eth0,bridge=vmbr0,hwaddr=AA:BB:...,ip=192.168.1.50/24,...". One regex covers both NIC-model
-# keys and LXC's "hwaddr" by matching whichever key precedes the MAC.
-_NET_MAC_RE = re.compile(
-    r"(?:virtio|e1000e?|rtl8139|vmxnet3|hwaddr)=([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})", re.IGNORECASE,
-)
+# "name=eth0,bridge=vmbr0,hwaddr=AA:BB:...,ip=192.168.1.50/24,...". Rather than enumerate every
+# NIC-model key Proxmox accepts (virtio, e1000/e1000e, rtl8139, vmxnet3/vmxnet, pcnet, ne2k_pci,
+# i82551, e1000-82545em, ...) or LXC's "hwaddr", this matches the MAC itself -- net0 has exactly
+# one, regardless of which key precedes it.
+_NET_MAC_RE = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
 _NET_IP_RE = re.compile(r"\bip=(\d{1,3}(?:\.\d{1,3}){3})(?:/\d+)?")
 
 
@@ -83,11 +84,12 @@ async def probe(base_url: str, token_id: str, token_secret: str) -> dict:
                         guests = (await _get(client, base_url, f"/nodes/{node}/{path}")).get("data") or []
                     except (httpx.HTTPError, ValueError):
                         continue  # one node/guest-type failing must not drop the rest
-                    for guest in guests:
-                        vmid = guest.get("vmid")
-                        if vmid is None:
-                            continue
-                        mac, ip = await _guest_net_info(client, base_url, node, kind, int(vmid))
+                    valid_guests = [g for g in guests if g.get("vmid") is not None]
+                    net_infos = await asyncio.gather(*(
+                        _guest_net_info(client, base_url, node, kind, int(g["vmid"])) for g in valid_guests
+                    ))
+                    for guest, (mac, ip) in zip(valid_guests, net_infos):
+                        vmid = guest["vmid"]
                         memory_mb = round((guest.get("maxmem") or 0) / 1048576) or None
                         systems.append({
                             "discoveryKey": f"mac:{mac}" if mac else f"proxmox:{node}:{kind}:{vmid}",
