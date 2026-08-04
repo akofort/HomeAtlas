@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import traceback
 
 import ipaddress
@@ -49,16 +50,25 @@ def _extra_targets(settings: dict, subnets_hint: list[str]) -> list[str]:
     return targets
 
 
-async def _probe_with_credentials(log) -> tuple[int, list[str]]:
+async def _probe_with_credentials(log) -> tuple[int, list[str], dict[str, str], list[dict]]:
     """Logs into the devices whose stored credentials were explicitly cleared for it and records
     what it read. Strictly read-only -- see probe_auth.
 
     Facts learned here are written into `extra.probe` for display, and are additionally used to
     fill `purpose`, `os` and `model` **only where those are still empty**. An authenticated read is
     more authoritative than a port guess, but it must not overwrite what a human typed.
+
+    The third return value is every IP->MAC pair read from a router's own ARP/host-list table
+    (see probe_auth.extract_arp_entries) -- routers only, since that is the one place such a table
+    covers the whole LAN rather than just what this host itself could see. The fourth is every
+    printer toner/ink reading Home Assistant reported (see probe_auth.extract_printer_supplies) --
+    gathered from whichever system the HA credential is attached to (usually the smart-home hub,
+    not a printer itself), which is why matching them to a printer happens separately afterwards.
     """
     warnings: list[str] = []
     probed = 0
+    learned_arp: dict[str, str] = {}
+    printer_supplies: list[dict] = []
     settings = db.get_settings()
     used_fallback = 0
 
@@ -102,10 +112,138 @@ async def _probe_with_credentials(log) -> tuple[int, list[str]]:
         log(f"Abgefragt: {system['name']} ({', '.join(outcome['results'])})")
         if probe_auth.persist_config_backups(system, outcome):
             log(f"Konfiguration von {system['name']} gesichert")
+        if system.get("kind") == "router":
+            learned_arp.update(probe_auth.extract_arp_entries(outcome))
+        printer_supplies += probe_auth.extract_printer_supplies(outcome)
 
     if used_fallback:
         log(f"Standard-Zugang bei {used_fallback} Gerät(en) ohne eigenen Zugang versucht")
-    return probed, warnings
+    return probed, warnings, learned_arp, printer_supplies
+
+
+async def _learn_devices_from_arp(learned_arp: dict[str, str], log) -> int:
+    """Adds inventory entries for IP/MAC pairs a router's own ARP or host-list table revealed that
+    the network sweep itself never saw -- a sleeping device, one behind a firewall that blocks the
+    scan's own pings/port probes, or simply on a segment this host can reach an SSH/TR-064
+    credential for but not ping directly. Each new entry gets the same reverse-DNS naming
+    discovery.py already gives every device it finds itself, rather than sitting unnamed until a
+    later full scan happens to rediscover it on its own.
+    """
+    if not learned_arp:
+        return 0
+    known_macs = {s["mac"] for s in db.list_systems() if s.get("mac")}
+    known_ips = {s["ip"] for s in db.list_systems() if s.get("ip")}
+    new_pairs = {ip: mac for ip, mac in learned_arp.items()
+                 if mac not in known_macs and ip not in known_ips}
+    if not new_pairs:
+        return 0
+
+    hostnames = dict(zip(new_pairs, await asyncio.gather(
+        *(discovery.reverse_dns(ip) for ip in new_pairs))))
+    for ip, mac in new_pairs.items():
+        vendor = oui.lookup(mac)
+        hostname = hostnames.get(ip, "")
+        name = (hostname.split(".")[0][:80] if hostname
+                else f"{vendor.split()[0]} ({ip.rsplit('.', 1)[-1]})" if vendor else ip)
+        db.upsert_discovered_system({
+            "discoveryKey": f"mac:{mac}",
+            "kind": "other",
+            "name": name,
+            "hostname": hostname,
+            "ip": ip,
+            "mac": mac,
+            "vendor": vendor,
+            "purpose": ("Über die ARP-/Host-Tabelle des Gateways gefunden, aber noch nicht "
+                        "vollständig eingeordnet -- der nächste Netzwerk-Scan füllt den Rest, "
+                        "sobald das Gerät selbst antwortet."),
+            "status": "online",
+            "importance": "normal",
+            "discovered": 1,
+            "discoverySource": "gateway-arp",
+            "openPorts": [],
+            "services": [],
+            "extra": {"randomizedMac": oui.is_locally_administered(mac), "guessConfident": False},
+        })
+    log(f"{len(new_pairs)} weitere(s) Gerät(e) über die ARP-/Host-Tabelle des Gateways gefunden")
+    return len(new_pairs)
+
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _tokens(*parts: str) -> set[str]:
+    return {w for p in parts for w in _WORD_RE.findall(p.lower()) if len(w) >= 3}
+
+
+def _match_printer_supplies(supplies: list[dict], printers: list[dict]) -> dict[str, list[dict]]:
+    """Groups toner/ink readings by which printer in the inventory they most likely belong to.
+
+    Home Assistant's own printer name is the only link back to the inventory -- there is no shared
+    ID between "what HA calls it" and "what this app calls it" -- so this is a best-effort token
+    overlap between the HA sensor's friendly name and each printer's name/vendor/model, not an
+    exact match. A household with exactly one printer skips the guessing entirely and attaches
+    everything to it, since that is by far the common case and token matching has the most room to
+    fail on a printer named something HA's own device name shares no words with at all.
+    """
+    if not supplies or not printers:
+        return {}
+    if len(printers) == 1:
+        return {printers[0]["id"]: supplies}
+
+    printer_tokens = [(p["id"], _tokens(p.get("name", ""), p.get("vendor", ""), p.get("model", "")))
+                       for p in printers]
+    by_printer: dict[str, list[dict]] = {}
+    for supply in supplies:
+        supply_tokens = _tokens(supply["name"])
+        best_id, best_overlap = None, 0
+        for printer_id, tokens in printer_tokens:
+            overlap = len(supply_tokens & tokens)
+            if overlap > best_overlap:
+                best_id, best_overlap = printer_id, overlap
+        if best_id:
+            by_printer.setdefault(best_id, []).append(supply)
+    return by_printer
+
+
+def _apply_printer_supplies(printer_supplies: list[dict], log) -> int:
+    """Persists matched toner/ink readings onto each printer's own `extra.printerSupplies`, so
+    SystemDetailPage can render them at the device they actually belong to instead of only in the
+    generic facts block of whatever system holds the Home Assistant credential."""
+    printers = [s for s in db.list_systems() if s["kind"] == "printer"]
+    by_printer = _match_printer_supplies(printer_supplies, printers)
+    for printer_id, supplies in by_printer.items():
+        printer = db.get_system(printer_id)
+        if printer is None:
+            continue
+        db.update_system(printer_id, {"extra": {**(printer.get("extra") or {}), "printerSupplies": supplies}})
+    if by_printer:
+        log(f"Verbrauchsmaterial-Stand für {len(by_printer)} Drucker aus Home Assistant übernommen")
+    return len(by_printer)
+
+
+def _link_omada_topology() -> int:
+    """Resolves each Omada finding's `extra.omada.uplinkMac` (set by omada_probe.py, on APs,
+    switches and clients alike) to the inventory id of the device it points at, and records that
+    as `parentId`. Can only happen after the whole batch is upserted -- the target device's own
+    row might not have existed a moment earlier in the very same scan -- which is why this is a
+    separate pass rather than something omada_probe.py could set directly. topology.py's network
+    section then chains by `parentId` the same way the router chain already does, so an AP or
+    client shows up under the switch/AP it is actually plugged/associated into instead of a flat,
+    unordered row.
+    """
+    systems = db.list_systems()
+    by_mac = {s["mac"]: s["id"] for s in systems if s.get("mac")}
+    linked = 0
+    for system in systems:
+        uplink_mac = ((system.get("extra") or {}).get("omada") or {}).get("uplinkMac")
+        if not uplink_mac:
+            continue
+        target_id = by_mac.get(uplink_mac)
+        if not target_id or target_id == system["id"] or system.get("parentId") == target_id:
+            continue
+        db.update_system(system["id"], {"parentId": target_id})
+        linked += 1
+    return linked
 
 
 async def run_full_scan(scan_id: str) -> None:
@@ -160,7 +298,7 @@ async def run_full_scan(scan_id: str) -> None:
                 omada_result = await omada_probe.probe(account.get("url") or "", client_id, client_secret)
                 if omada_result["ok"]:
                     findings += omada_result["systems"]
-                    log(f"Omada ({account['label']}): {len(omada_result['systems'])} Geräte gefunden")
+                    log(f"Omada ({account['label']}): {len(omada_result['systems'])} Geräte/Clients gefunden")
                 else:
                     warnings.append(f"Omada Controller ({account['label']}): {omada_result['error']}")
 
@@ -230,6 +368,10 @@ async def run_full_scan(scan_id: str) -> None:
             if linked:
                 log(f"{linked} Container dem Host {host_ip} zugeordnet")
 
+        linked_omada = _link_omada_topology()
+        if linked_omada:
+            log(f"{linked_omada} Omada-Gerät(e)/Client(s) im Netzplan mit ihrem Uplink verknüpft")
+
         # Anything critical is worth watching continuously -- that is what "critical" means. Done
         # here rather than in the UI so it also covers devices a scan just promoted.
         newly_monitored = 0
@@ -243,8 +385,12 @@ async def run_full_scan(scan_id: str) -> None:
         probed = 0
         if settings.get("scanUseCredentials", True):
             progress("Geräte mit hinterlegtem Zugang abfragen", 93, None)
-            probed, probe_warnings = await _probe_with_credentials(log)
+            probed, probe_warnings, learned_arp, printer_supplies = await _probe_with_credentials(log)
             warnings += probe_warnings
+            if learned_arp:
+                await _learn_devices_from_arp(learned_arp, log)
+            if printer_supplies:
+                _apply_printer_supplies(printer_supplies, log)
         else:
             log("Auslesen per Zugangsdaten ist in den Einstellungen abgeschaltet")
 

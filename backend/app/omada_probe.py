@@ -1,6 +1,7 @@
 """Reads a TP-Link Omada SDN Controller's Open API to discover the access points, switches and
-gateways it manages -- a Wi-Fi/mDNS scan alone can only say "something answers on 192.168.1.5",
-never that it is the living-room access point this specific controller has adopted.
+gateways it manages, plus the clients connected through them -- a Wi-Fi/mDNS scan alone can only
+say "something answers on 192.168.1.5", never that it is the living-room access point this
+specific controller has adopted, or which switch port/AP a given client is actually on.
 
 Read-only: every call below is a GET, except the token exchange -- that POST is the client-
 credentials login step Omada's own Open API defines, not a configuration change, and no endpoint
@@ -36,6 +37,27 @@ async def _json(client: httpx.AsyncClient, method: str, url: str, **kwargs) -> d
     if not isinstance(result, dict):
         raise ValueError("Unerwartete Antwort (kein JSON-Objekt).")
     return result
+
+
+def _extract_uplink(device: dict) -> str:
+    """Best-effort normalized MAC of the switch/gateway an AP or switch device uplinks through,
+    from whichever field name the controller's Open API response happens to use.
+
+    Unverified against a live controller -- there is none in this environment -- so this is
+    deliberately defensive: several candidate keys (both a nested object and flat variants, since
+    Open API responses are not fully consistent between device types in TP-Link's own
+    documentation) are tried, and a device with none of them simply gets no uplink, falling back to
+    today's flat topology row rather than breaking the scan. Same caveat topology.py's own LLDP/CDP
+    parsers already carry for the same reason."""
+    uplink = device.get("uplink") or device.get("uplinkDeviceInfo") or {}
+    if isinstance(uplink, dict):
+        for key in ("mac", "deviceMac", "uplinkMac"):
+            if uplink.get(key):
+                return oui.normalize_mac(uplink[key])
+    for key in ("uplinkMac", "upLinkMac", "gatewayMac", "switchMac", "uplinkDeviceMac"):
+        if device.get(key):
+            return oui.normalize_mac(device[key])
+    return ""
 
 
 async def probe(base_url: str, client_id: str, client_secret: str) -> dict:
@@ -106,6 +128,7 @@ async def probe(base_url: str, client_id: str, client_secret: str) -> dict:
                     # "mac:..." discoveryKey -- without it, a device found by both sources would
                     # merge only by luck of matching case/delimiter and usually create a duplicate.
                     mac = oui.normalize_mac(device.get("mac", ""))
+                    uplink_mac = _extract_uplink(device)
                     systems.append({
                         "discoveryKey": f"mac:{mac}" if mac else f"omada:{site_id}:{device.get('name', '')}",
                         "kind": _KIND_BY_TYPE[device_type],
@@ -128,6 +151,55 @@ async def probe(base_url: str, client_id: str, client_secret: str) -> dict:
                                 "type": device_type,
                                 "firmwareVersion": device.get("firmwareVersion", ""),
                                 "serial": device.get("sn", ""),
+                                # Which switch/gateway this AP or switch uplinks through, if the
+                                # controller's response carried one -- pipeline.py resolves this
+                                # MAC to that device's own inventory id after the whole batch has
+                                # been upserted (it isn't known yet at this point), which is what
+                                # lets topology.py draw it as a child of that device instead of a
+                                # flat, unordered row. Empty when the field wasn't present; that
+                                # just means this device keeps today's flat placement.
+                                "uplinkMac": uplink_mac,
+                            }
+                        },
+                    })
+
+                clients_response = await _json(
+                    client, "GET", f"{base_url}/openapi/v1/{omada_id}/sites/{site_id}/clients",
+                    params={"pageSize": 500, "page": 1}, headers=headers,
+                )
+                if clients_response.get("errorCode"):
+                    continue
+                for entry in (clients_response.get("result") or {}).get("data") or []:
+                    mac = oui.normalize_mac(entry.get("mac", ""))
+                    if not mac:
+                        continue
+                    ap_mac = oui.normalize_mac(entry.get("apMac") or "")
+                    switch_mac = oui.normalize_mac(entry.get("switchMac") or "")
+                    wireless = bool(entry.get("wireless")) or bool(ap_mac)
+                    systems.append({
+                        "discoveryKey": f"mac:{mac}",
+                        # Deliberately no "kind"/"purpose" guess -- unlike an AP/switch/gateway, a
+                        # client could be anything (phone, laptop, TV, printer over Wi-Fi), and
+                        # db.upsert_discovered_system only overwrites an existing system's `kind`
+                        # when a finding's own value is truthy. Leaving it out means this entry can
+                        # only ever add information (which AP/switch/SSID it's on) to a device the
+                        # regular network scan already classified better, never downgrade one.
+                        "name": entry.get("name") or entry.get("hostName") or "",
+                        "ip": entry.get("ip", ""),
+                        "mac": mac,
+                        "location": site_name,
+                        "vendor": oui.lookup(mac),
+                        "status": "online" if entry.get("active", True) else "offline",
+                        "discovered": 1,
+                        "discoverySource": "omada",
+                        "extra": {
+                            "omada": {
+                                "siteId": site_id,
+                                "siteName": site_name,
+                                "type": "client",
+                                "ssid": entry.get("ssid", "") if wireless else "",
+                                "uplinkMac": ap_mac or switch_mac,
+                                "uplinkPort": entry.get("port"),
                             }
                         },
                     })

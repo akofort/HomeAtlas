@@ -6,7 +6,8 @@ promise in a docstring, because the credentials involved are usually root or rou
 things enforce it:
 
 1. **A hardcoded command allowlist.** `_SSH_COMMANDS` (and its platform variants,
-   `_SSH_COMMANDS_MIKROTIK`/`_SSH_COMMANDS_ARUBA`/`_SSH_COMMANDS_CISCO`) are module constants.
+   `_SSH_COMMANDS_MIKROTIK`/`_SSH_COMMANDS_ARUBA`/`_SSH_COMMANDS_CISCO`/`_SSH_COMMANDS_TPLINK`)
+   are module constants.
    There is no setting, no API parameter and no LLM tool that can add to them. Making it
    configurable would turn this into a remote-execution feature with a nice UI, which is
    precisely what it must not be.
@@ -61,6 +62,11 @@ _SSH_COMMANDS: tuple[tuple[str, str, str], ...] = (
     ("disks", "Speicherplatz",
      "df -h -x tmpfs -x devtmpfs -x overlay --output=target,size,used,pcent 2>/dev/null | head -8"),
     ("ip", "Netzwerkadressen", "ip -4 -o addr show scope global 2>/dev/null | awk '{print $2\" \"$4}' | head -6"),
+    # Read by pipeline.py's gateway-ARP step (see probe_auth.parse_arp_pairs) to find devices the
+    # scan's own ping/ARP sweep never saw -- most useful when this credential is attached to the
+    # router itself, whose neighbour table sees the whole LAN, not just what answered this host.
+    ("arp_table", "ARP-/Nachbartabelle",
+     "ip neigh show 2>/dev/null | grep lladdr | head -200 || arp -an 2>/dev/null | head -200"),
     ("docker", "Docker-Container",
      "docker ps --format '{{.Names}} ({{.Image}}) {{.Status}}' 2>/dev/null | head -25"),
     ("services", "Laufende Dienste",
@@ -99,6 +105,7 @@ _SSH_COMMANDS_MIKROTIK: tuple[tuple[str, str, str], ...] = (
     # this to place a multi-homed router next to every subnet it bridges, not just the one its
     # single stored `ip` field happens to fall into.
     ("ip_addresses", "IP-Adressen je Schnittstelle", "/ip address print without-paging"),
+    ("arp_table", "ARP-Tabelle", "/ip arp print detail without-paging"),
     # Never "/export show-sensitive" -- that writes out stored PPPoE/WiFi passwords in cleartext,
     # which would break the "secrets never exposed" invariant this whole module exists to uphold.
     ("config_export", "Vollständige Konfiguration", "/export compact"),
@@ -114,6 +121,7 @@ _SSH_COMMANDS_ARUBA: tuple[tuple[str, str, str], ...] = (
     ("interfaces", "Schnittstellen", "show interfaces brief"),
     # Same reasoning as Mikrotik's "ip_addresses" above -- which subnet(s) this device routes for.
     ("ip_addresses", "IP-Adressen je VLAN", "show ip"),
+    ("arp_table", "ARP-Tabelle", "show arp"),
     ("config_export", "Vollständige Konfiguration", "show running-config"),
 )
 
@@ -131,7 +139,20 @@ _SSH_COMMANDS_CISCO: tuple[tuple[str, str, str], ...] = (
     ("interfaces", "Schnittstellen", "show interfaces status | no-more"),
     # Same reasoning as Mikrotik's "ip_addresses" above -- which subnet(s) this device routes for.
     ("ip_addresses", "IP-Adressen je Schnittstelle", "show ip interface brief | no-more"),
+    ("arp_table", "ARP-Tabelle", "show ip arp | no-more"),
     ("config_export", "Vollständige Konfiguration", "show running-config | no-more"),
+)
+
+_SSH_COMMANDS_TPLINK: tuple[tuple[str, str, str], ...] = (
+    # TP-Link JetStream/Omada-managed switch CLI (T1600G/TL-SG-series): Cisco-like "show" syntax
+    # but its own command set, and -- unlike IOS's "| no-more" -- no per-command pager override,
+    # so output relies on probe_ssh's own truncation instead of a modifier here.
+    ("system", "System", "show system-info"),
+    ("vlan", "VLANs", "show vlan"),
+    ("neighbors", "Nachbargeräte (LLDP)", "show lldp neighbor-information"),
+    ("interfaces", "Schnittstellen", "show interface status"),
+    ("arp_table", "ARP-Tabelle", "show arp"),
+    ("config_export", "Vollständige Konfiguration", "show running-config"),
 )
 
 # Facts holding a full device config export -- picked up by `extract_config_backups` below and
@@ -157,10 +178,19 @@ def _detect_platform(system: dict) -> str:
     ]).lower()
     if "mikrotik" in haystack or "routeros" in haystack:
         return "mikrotik"
-    if "aruba" in haystack:
+    # ArubaOS-Switch is the renamed HP ProCurve CLI (see `_SSH_COMMANDS_ARUBA`'s own docstring) --
+    # older or relabelled hardware still reports itself as "HP"/"Hewlett Packard"/"ProCurve" in
+    # OUI/mDNS/banner data rather than "Aruba". Without this branch such a switch fell through to
+    # the generic Linux command set below, which means nothing to its CLI, and probing it silently
+    # returned no facts at all instead of an error pointing at why.
+    if "aruba" in haystack or "procurve" in haystack or "hewlett" in haystack or re.search(r"\bhp\b", haystack):
         return "aruba"
     if "cisco" in haystack:
         return "cisco"
+    # Same failure mode as HP above: a TP-Link JetStream/Omada-managed switch has its own CLI, not
+    # a POSIX shell, and fell through to the generic Linux set with no matching branch at all.
+    if "tp-link" in haystack or "tplink" in haystack or "jetstream" in haystack:
+        return "tplink"
     return ""
 
 
@@ -219,6 +249,7 @@ async def probe_ssh(host: str, account: dict, platform: str = "") -> dict:
 
     commands = {
         "mikrotik": _SSH_COMMANDS_MIKROTIK, "aruba": _SSH_COMMANDS_ARUBA, "cisco": _SSH_COMMANDS_CISCO,
+        "tplink": _SSH_COMMANDS_TPLINK,
     }.get(platform, _SSH_COMMANDS)
 
     facts: dict[str, dict] = {}
@@ -336,6 +367,34 @@ _HA_SERVICE_LABELS = {
     "send_message": "Nachricht senden",
 }
 
+# entity_id is the only signal that holds across printer integrations -- device_class and unit
+# vary (some report "%", some a raw HP/Brother supply code that isn't a percentage at all).
+_HA_SUPPLY_RE = re.compile(r"(toner|ink|cartridge|drum)", re.IGNORECASE)
+_HA_SUPPLY_LINE_RE = re.compile(r"^- (.+): ([0-9]+(?:[.,][0-9]+)?)\s*%$")
+
+
+def _ha_printer_supplies(states: list) -> list[dict]:
+    """Printer toner/ink/drum-level sensors HA already exposes (its own printer integrations, or
+    SNMP OIDs someone wired up by hand as sensors). Read-only, same as everything else here --
+    this only reads `sensor.*` state, never calls a service."""
+    supplies = []
+    for state in states:
+        if not isinstance(state, dict):
+            continue
+        entity_id = state.get("entity_id", "")
+        if not entity_id.startswith("sensor.") or not _HA_SUPPLY_RE.search(entity_id):
+            continue
+        value = state.get("state", "")
+        if value in ("unknown", "unavailable", ""):
+            continue
+        attrs = state.get("attributes") or {}
+        supplies.append({
+            "name": attrs.get("friendly_name") or entity_id,
+            "value": value,
+            "unit": attrs.get("unit_of_measurement") or "",
+        })
+    return supplies
+
 
 def _ha_trigger_summary(triggers: object) -> str:
     if not isinstance(triggers, list):
@@ -370,10 +429,11 @@ def _ha_action_summary(actions: object) -> str:
 
 
 async def probe_homeassistant(url: str, account: dict) -> dict:
-    """Reads a Home Assistant instance's own REST API with a Long-Lived Access Token: which
-    automations are currently active, with a short description of what each does, and (if the KNX
-    integration is set up) its connection details. Read-only -- only GET is ever called; nothing
-    here can flip a switch, run a service, or edit an automation.
+    """Reads a Home Assistant instance's own REST API with a Long-Lived Access Token: every
+    automation with its on/off status and a short description of what it does, plus printer
+    toner/ink levels (see `extract_printer_supplies`) and, if the KNX integration is set up, its
+    connection details. Read-only -- only GET is ever called; nothing here can flip a switch, run
+    a service, or edit an automation.
 
     A native `description` an automation was given in its own config is always the best answer to
     "what does this do" and is used verbatim when present -- only automations without one fall
@@ -415,16 +475,19 @@ async def probe_homeassistant(url: str, account: dict) -> dict:
                     knx_lines.append(f"Verbunden seit: {_knx('connected_since')}")
                 facts["knx"] = {"label": "KNX-Anbindung", "value": "\n".join(knx_lines)}
 
+            # Every automation, not just the enabled ones -- a disabled automation is exactly the
+            # kind of thing someone troubleshooting "warum tut X nicht mehr" needs to see, and
+            # dropping it here would hide the answer.
             automation_states = [
                 s for s in states
                 if isinstance(s, dict) and s.get("entity_id", "").startswith("automation.")
-                and s.get("state") == "on"
             ][:_HA_AUTOMATION_LIMIT]
 
             lines = []
             for state in automation_states:
                 attrs = state.get("attributes") or {}
                 name = attrs.get("friendly_name") or state["entity_id"]
+                status = "ein" if state.get("state") == "on" else "aus"
                 config_id = attrs.get("id")
                 description = ""
                 if config_id:
@@ -447,11 +510,20 @@ async def probe_homeassistant(url: str, account: dict) -> dict:
                                     ) if p)
                     except (httpx.HTTPError, ValueError):
                         pass  # one automation's config failing must not drop the rest
-                lines.append(f"- {name}: {description}" if description else f"- {name}")
+                lines.append(f"- {name} ({status}): {description}" if description else f"- {name} ({status})")
 
             if lines:
-                facts["automations"] = {"label": f"Aktive Automationen ({len(lines)})",
+                facts["automations"] = {"label": f"Automationen ({len(lines)})",
                                         "value": "\n".join(lines)[:20000]}
+
+            supplies = _ha_printer_supplies(states)
+            if supplies:
+                # Format is deliberately parseable back out by `extract_printer_supplies` below
+                # (a leading "- name: value%" per line) as well as human-readable in the generic
+                # facts view -- one representation, not two data channels to keep in sync.
+                supply_lines = [f"- {s['name']}: {s['value']}{s['unit']}" for s in supplies]
+                facts["printerSupplies"] = {"label": f"Drucker-Verbrauchsmaterial ({len(supplies)})",
+                                            "value": "\n".join(supply_lines)[:5000]}
     except (httpx.HTTPError, ValueError, KeyError) as exc:
         return {"ok": False, "error": f"Home Assistant nicht erreichbar: {exc}", "facts": {}}
 
@@ -476,6 +548,7 @@ _SNMP_OIDS: tuple[tuple[str, str, str, bool], ...] = (
     ("interfaces", "Schnittstellen", "1.3.6.1.2.1.2.2.1.2", True),  # IF-MIB ifDescr
     ("lldpNeighbors", "Nachbargeräte (LLDP)", "1.0.8802.1.1.2.1.4.1.1", True),  # LLDP-MIB remote table
     ("vlans", "VLANs (Q-BRIDGE-MIB)", "1.3.6.1.2.1.17.7.1.4.3.1", True),  # dot1qVlanStaticTable
+    ("arpTable", "ARP-Tabelle (IP-NET-TO-MEDIA-MIB)", "1.3.6.1.2.1.4.22.1.2", True),  # ipNetToMediaPhysAddress
 )
 
 
@@ -593,6 +666,55 @@ async def probe_fritzbox(host: str, account: dict | None) -> dict:
         except (httpx.HTTPError, ElementTree.ParseError, OSError, ValueError):
             pass
 
+        # The FRITZ!Box's own known-hosts table -- effectively its ARP/DHCP-lease table, and a
+        # more authoritative source of IP<->MAC pairs than this app's own ARP read
+        # (discovery.arp_table) since it also knows about devices asleep or on Wi-Fi that never
+        # answered this host's own ping/port probes. `X_AVM-DE_GetHostListPath` is one call
+        # instead of looping `GetGenericHostEntry` per index -- it hands back a URL to an XML
+        # dump of every host the router has ever leased or seen on the LAN side.
+        try:
+            host_envelope = (
+                '<?xml version="1.0" encoding="utf-8"?>'
+                '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+                's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
+                '<u:X_AVM-DE_GetHostListPath xmlns:u="urn:dslforum-org:service:Hosts:1" />'
+                "</s:Body></s:Envelope>"
+            )
+            async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT,
+                                         auth=httpx.DigestAuth(username, secret)) as client:
+                path_response = await client.post(
+                    f"{base}/upnp/control/hosts",
+                    content=host_envelope.encode(),
+                    headers={
+                        "Content-Type": 'text/xml; charset="utf-8"',
+                        "SoapAction": "urn:dslforum-org:service:Hosts:1#X_AVM-DE_GetHostListPath",
+                    },
+                )
+            path = _xml_text(ElementTree.fromstring(path_response.text), "NewX_AVM-DE_HostListPath") \
+                if path_response.status_code < 400 else ""
+            if path:
+                async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT,
+                                             auth=httpx.DigestAuth(username, secret)) as client:
+                    list_response = await client.get(f"{base}{path}")
+                if list_response.status_code < 400:
+                    lines = []
+                    for item in ElementTree.fromstring(list_response.text).iter():
+                        if _STRIP_NS.sub("", item.tag) != "Item":
+                            continue
+                        ip, mac = _xml_text(item, "IPAddress"), _xml_text(item, "MACAddress")
+                        if not ip or not mac:
+                            continue
+                        name = _xml_text(item, "HostName") or "unbenannt"
+                        active = "aktiv" if _xml_text(item, "Active") == "1" else "inaktiv"
+                        lines.append(f"{ip} {mac} {name} ({active})")
+                    if lines:
+                        facts["hostList"] = {
+                            "label": f"Bekannte Geräte laut FRITZ!Box ({len(lines)})",
+                            "value": "\n".join(lines)[:20000],
+                        }
+        except (httpx.HTTPError, ElementTree.ParseError, OSError, ValueError):
+            pass
+
     if not facts:
         return {"ok": False, "facts": {},
                 "error": ("Keine TR-064-Antwort. In der FRITZ!Box unter Heimnetz -> Netzwerk -> "
@@ -707,6 +829,101 @@ async def probe_system(system: dict, accounts: list[dict]) -> dict:
                 results[f"http:{account['label']}"] = result
 
     return {"ran": bool(results), "results": results, "purpose": _derive_purpose(results), "reason": ""}
+
+
+# ---------------------------------------------------------------------------------------------
+# ARP/host-list parsing -- turns whatever raw text `arp_table`/`arpTable`/`hostList` facts hold
+# (Linux `ip neigh`/`arp -an`, RouterOS `/ip arp print`, ArubaOS `show arp`, Cisco `show ip arp`,
+# an SNMP ipNetToMediaTable walk, or a FRITZ!Box host list) into IP -> MAC pairs.
+# ---------------------------------------------------------------------------------------------
+
+# Every one of the formats above prints exactly one MAC per record, just in a different notation
+# -- colon/dash-separated (Linux, RouterOS, generic), Cisco's dotted triples (aabb.ccdd.eeff),
+# ArubaOS/ProCurve's dashed hex-sextets (aabbcc-ddeeff), or an SNMP walk's space-separated octets.
+# Matching all four and normalizing afterwards is simpler and more robust than a parser per vendor,
+# because unlike topology.py's neighbour parsers (which also need a *name*), an ARP record only
+# ever needs "is there an IP and a MAC on this line", and that shape is the same everywhere.
+_ARP_MAC_PATTERNS: tuple[re.Pattern, ...] = (
+    re.compile(r"\b([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}\b"),
+    re.compile(r"\b[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\b"),
+    re.compile(r"\b[0-9A-Fa-f]{6}-[0-9A-Fa-f]{6}\b"),
+    re.compile(r"\b([0-9A-Fa-f]{2}\s){5}[0-9A-Fa-f]{2}\b"),
+)
+# A plain ARP dump has the IP as a standalone 4-octet run. An SNMP walk instead embeds it at the
+# *end* of a longer numeric run (the OID index is `<ifIndex>.<ip1>.<ip2>.<ip3>.<ip4>`), so matching
+# only 4 groups would grab "<ifIndex>.<ip1>.<ip2>.<ip3>" instead -- a real IP with its first octet
+# silently replaced by the SNMP table's row index. Matching the whole run and keeping only its last
+# four groups handles both shapes with one regex.
+_ARP_NUMERIC_RUN_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3,}\b")
+_ARP_FACT_KEYS = {"arp_table", "arpTable", "hostList"}
+
+
+def _extract_mac(text: str) -> str:
+    for pattern in _ARP_MAC_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            digits = re.sub(r"[^0-9A-Fa-f]", "", match.group(0))
+            if len(digits) == 12:
+                return ":".join(digits[i:i + 2] for i in range(0, 12, 2)).lower()
+    return ""
+
+
+def _extract_ip(text: str) -> str:
+    match = _ARP_NUMERIC_RUN_RE.search(text)
+    if not match:
+        return ""
+    octets = match.group(0).split(".")[-4:]
+    return ".".join(octets) if all(0 <= int(o) <= 255 for o in octets) else ""
+
+
+def parse_arp_pairs(text: str) -> dict[str, str]:
+    """IP -> normalized-lowercase MAC for every line that carries both. A header, separator or
+    incomplete-entry line simply has no match and is skipped, so this degrades gracefully on a
+    format it wasn't written against, same posture as topology.py's LLDP parsers."""
+    pairs: dict[str, str] = {}
+    for line in text.splitlines():
+        ip = _extract_ip(line)
+        if not ip or ip in ("0.0.0.0", "255.255.255.255"):
+            continue
+        mac = _extract_mac(line)
+        if mac:
+            pairs[ip] = mac
+    return pairs
+
+
+def extract_arp_entries(outcome: dict) -> dict[str, str]:
+    """IP -> MAC pairs from any ARP/host-list fact a probe outcome collected. Pure function, same
+    shape and same reason as `extract_config_backups` -- the caller (pipeline.py) decides what a
+    newly-learned device becomes; this module only ever reads."""
+    pairs: dict[str, str] = {}
+    for result in outcome.get("results", {}).values():
+        if not result.get("ok"):
+            continue
+        for key, fact in result.get("facts", {}).items():
+            if key in _ARP_FACT_KEYS:
+                pairs.update(parse_arp_pairs(fact["value"]))
+    return pairs
+
+
+def extract_printer_supplies(outcome: dict) -> list[dict]:
+    """(name, percent) pairs from any `printerSupplies` fact a probe outcome collected -- pure
+    function, same shape as `extract_arp_entries`. Only percentage readings are returned: a raw
+    HP/Brother supply code isn't something a progress bar can render, and the generic facts view
+    (see `probe_homeassistant`) already shows the reading as-is regardless. Matching a supply to
+    a specific printer in the inventory is pipeline.py's job, not this module's -- it never touches
+    the inventory."""
+    supplies: list[dict] = []
+    for result in outcome.get("results", {}).values():
+        if not result.get("ok"):
+            continue
+        fact = result.get("facts", {}).get("printerSupplies")
+        if not fact:
+            continue
+        for line in fact["value"].splitlines():
+            match = _HA_SUPPLY_LINE_RE.match(line)
+            if match:
+                supplies.append({"name": match.group(1), "percent": float(match.group(2).replace(",", "."))})
+    return supplies
 
 
 def extract_config_backups(system: dict, outcome: dict) -> list[tuple[str, str, str]]:

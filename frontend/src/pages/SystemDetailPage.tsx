@@ -217,6 +217,9 @@ export default function SystemDetailPage() {
 
   const docker = system.extra?.docker;
   const probeResults = Object.entries((system.extra?.probe ?? {}) as Record<string, ProbeResult>);
+  // Populated by pipeline.py after a scan with a Home Assistant credential -- see
+  // probe_auth.extract_printer_supplies / pipeline._apply_printer_supplies.
+  const printerSupplies = (system.extra?.printerSupplies ?? []) as { name: string; percent: number }[];
 
   return (
     <>
@@ -403,6 +406,29 @@ export default function SystemDetailPage() {
               </table>
             </div>
           </div>
+        </div>
+      )}
+
+      {system.kind === "printer" && printerSupplies.length > 0 && (
+        <div className="card">
+          <h2>Verbrauchsmaterial</h2>
+          <p className="muted" style={{ marginTop: -6 }}>
+            Über Home Assistant ausgelesen — Stand vom letzten Netzwerk-Scan.
+          </p>
+          {printerSupplies.map((supply) => (
+            <div key={supply.name} style={{ marginBottom: 12 }}>
+              <div className="row" style={{ justifyContent: "space-between", marginBottom: 4 }}>
+                <span>{supply.name}</span>
+                <span className="muted mono">{Math.round(supply.percent)}%</span>
+              </div>
+              <div className="progress">
+                <div style={{
+                  width: `${Math.max(0, Math.min(100, supply.percent))}%`,
+                  background: supply.percent <= 15 ? "var(--danger, #ef4444)" : undefined,
+                }} />
+              </div>
+            </div>
+          ))}
         </div>
       )}
 

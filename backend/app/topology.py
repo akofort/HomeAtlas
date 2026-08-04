@@ -370,17 +370,27 @@ def render(settings: dict | None = None) -> str:
             y += _LAYER_GAP
         previous = _midpoint(leaf_anchors)
 
-    # --- Verteilung ---------------------------------------------------------------------
+    # --- Verteilung -----------------------------------------------------------------------
+    # Chained by parentId, same as the router section above -- an Omada AP's parentId (set by
+    # pipeline.py's _link_omada_topology from the controller's own uplink info) places it under
+    # the switch it is actually plugged into instead of beside it in an unordered row. A device
+    # with no resolved uplink (no Omada credential, or the field wasn't present in the API
+    # response) still renders -- `_chain_layers` treats an unresolved parentId as root, same
+    # degrade-gracefully posture as the LLDP-based links in "Wichtige Geräte" below.
     if network:
         svg.append(_label(40, y - 12, "Verteilung (Switche, WLAN)"))
-        items = [{"id": n["id"], "title": n["name"], "subtitle": n["ip"], "status": n["status"]}
-                 for n in network[:5]]
-        row_svg, anchors = _row(items, y)
-        svg.append(_edges(previous, anchors))
-        svg.append(row_svg)
-        anchor_by_id.update(zip((n["id"] for n in network[:5]), anchors))
-        previous = _midpoint(anchors)
-        y += _LAYER_GAP
+        leaf_anchors: list[tuple[float, float]] = []
+        for depth, layer in enumerate(_chain_layers(network[:10])):
+            items = [{"id": n["id"], "parentId": n.get("parentId"), "title": n["name"],
+                     "subtitle": n["ip"], "status": n["status"]} for n in layer]
+            row_svg, anchors = _row(items, y)
+            svg.append(_edges(previous, anchors) if depth == 0
+                      else _edges_by_parent(anchor_by_id, layer, anchors, previous))
+            svg.append(row_svg)
+            anchor_by_id.update(zip((n["id"] for n in layer), anchors))
+            leaf_anchors = anchors
+            y += _LAYER_GAP
+        previous = _midpoint(leaf_anchors)
 
     # --- Wichtige Geräte: alles mit Bedeutung "kritisch" ---------------------------------
     # Everything else (including non-critical servers/NAS and all end devices) lives in the
