@@ -165,6 +165,11 @@ class Monitor:
             if db.record_monitor_state(system["id"], status, detail):
                 changes.append({"systemId": system["id"], "name": system["name"],
                                 "status": status, "detail": detail})
+                if status == "offline":
+                    # Only the confirmed transition (see _FAILURES_BEFORE_DOWN above), same as the
+                    # state change itself -- a single dropped Wi-Fi packet must not show up as a
+                    # logged error on the device any more than it shows up as a status flip.
+                    db.add_device_error_event(system["id"], "warning", f"Nicht mehr erreichbar: {detail}")
         self.last_run = time.time()
         return changes
 

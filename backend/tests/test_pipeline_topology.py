@@ -65,6 +65,30 @@ def test_link_omada_topology_resolves_uplink_mac_to_parent_id(temp_db):
     assert pipeline._link_omada_topology() == 0
 
 
+def test_assign_proxmox_parents_matches_guest_to_its_own_node(temp_db):
+    pve1 = temp_db.create_system({"kind": "server", "name": "pve1", "hostname": "pve1"})
+    pve2 = temp_db.create_system({"kind": "server", "name": "pve2", "hostname": "pve2"})
+    guests = [
+        {"name": "vm-on-1", "extra": {"proxmox": {"node": "pve1", "vmid": 100}}},
+        {"name": "vm-on-2", "extra": {"proxmox": {"node": "pve2", "vmid": 200}}},
+    ]
+
+    pipeline._assign_proxmox_parents(guests, fallback_host_id="__fallback__")
+
+    assert guests[0]["parentId"] == pve1["id"]
+    assert guests[1]["parentId"] == pve2["id"]
+
+
+def test_assign_proxmox_parents_falls_back_when_node_has_no_own_row(temp_db):
+    # Single-node setup: the only row is whatever the credential is attached to, and every guest's
+    # `node` is that same node -- there's nothing else in the inventory to match against.
+    guests = [{"name": "vm", "extra": {"proxmox": {"node": "pve", "vmid": 100}}}]
+
+    pipeline._assign_proxmox_parents(guests, fallback_host_id="host-1")
+
+    assert guests[0]["parentId"] == "host-1"
+
+
 def test_link_omada_topology_ignores_unresolvable_uplink(temp_db):
     orphan = temp_db.create_system({
         "kind": "network", "name": "Orphan AP", "mac": "bb:bb:bb:bb:bb:01",

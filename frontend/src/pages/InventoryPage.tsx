@@ -259,6 +259,12 @@ export default function InventoryPage() {
                       {s.importance === "critical" && (
                         <span className="badge warn" style={{ marginLeft: 8 }}>kritisch</span>
                       )}
+                      {!!s.errorCount && (
+                        <span className="badge danger" style={{ marginLeft: 8 }}
+                              title={`${s.errorCount} protokollierte(r) Fehler -- siehe Geräteseite`}>
+                          ⚠ {s.errorCount}
+                        </span>
+                      )}
                       {(s.tags ?? []).some((t) => t.toLowerCase().includes("poe")) && (
                         <span className="badge warn" style={{ marginLeft: 8 }}
                               title="Funktioniert ohne PoE-fähigen Switch oder Injector nicht">

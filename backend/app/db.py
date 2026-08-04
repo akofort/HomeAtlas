@@ -158,6 +158,12 @@ CREATE TABLE IF NOT EXISTS systems (
     -- Link to the manufacturer's manual/support page for this exact model. Separate from `url`,
     -- which is the device's own web interface -- when something is broken you often need both.
     docUrl TEXT NOT NULL DEFAULT '',
+    -- The household's *own* documentation for this specific instance (a wiki page, runbook,
+    -- compose-repo README, ...) -- distinct from docUrl's manufacturer manual, which is the same
+    -- for every unit of a model and says nothing about what this particular one is actually for.
+    -- Populated automatically from a `Doc:`/`URL:` line in a Proxmox guest's Notes field (see
+    -- proxmox_probe.parse_notes) but editable by hand for anything else.
+    docLink TEXT NOT NULL DEFAULT '',
     notes TEXT NOT NULL DEFAULT '',
     importance TEXT NOT NULL DEFAULT 'normal',
     parentId TEXT,
@@ -233,6 +239,22 @@ CREATE TABLE IF NOT EXISTS deviceConfigVersions (
     source TEXT NOT NULL DEFAULT '',
     createdAt TEXT NOT NULL
 );
+
+-- One row per scan-time failure a device was the subject of -- an SSH timeout, a Proxmox auth
+-- error, a monitored device going down, and so on (see pipeline.py/monitor.py's
+-- db.add_device_error_event calls). Kept as its own history table, not a field on `systems`,
+-- for the same reason deviceConfigVersions is: it is something that accumulates over many scans,
+-- not a single current value an upsert would just overwrite. Never contains a secret -- callers
+-- pass through whatever error message probe_auth/proxmox_probe/monitor.py already produced for a
+-- human to read, none of which include credentials (see those modules' own invariants).
+CREATE TABLE IF NOT EXISTS deviceErrorEvents (
+    id TEXT PRIMARY KEY,
+    systemId TEXT NOT NULL,
+    level TEXT NOT NULL DEFAULT 'error',
+    message TEXT NOT NULL,
+    createdAt TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_errorevents_system ON deviceErrorEvents(systemId, createdAt DESC);
 CREATE INDEX IF NOT EXISTS idx_configversions_system ON deviceConfigVersions(systemId, createdAt DESC);
 
 CREATE TABLE IF NOT EXISTS docPages (
@@ -301,6 +323,7 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("users", "totpEnabled", "INTEGER NOT NULL DEFAULT 0"),
     ("systems", "monitored", "INTEGER NOT NULL DEFAULT 0"),
     ("systems", "monitorPorts", "TEXT"),
+    ("systems", "docLink", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -526,7 +549,7 @@ def touch_api_token(token: str) -> dict | None:
 
 _SYSTEM_FIELDS = (
     "kind", "name", "hostname", "ip", "mac", "vendor", "model", "os", "location", "purpose",
-    "descriptionMd", "url", "docUrl", "notes", "importance", "parentId", "status", "discovered",
+    "descriptionMd", "url", "docUrl", "docLink", "notes", "importance", "parentId", "status", "discovered",
     "confirmed", "discoverySource", "discoveryKey", "monitored", "monitorPorts",
     "openPorts", "services", "tags", "extra",
 )
@@ -612,6 +635,74 @@ def find_system_by_key(discovery_key: str) -> dict | None:
         return _row(conn.execute("SELECT * FROM systems WHERE discoveryKey = ?", (discovery_key,)).fetchone())
 
 
+def find_system_by_mac(mac: str) -> dict | None:
+    """The strongest fallback identity there is: a MAC address is stable regardless of which
+    source found the device (network sweep, Omada, Proxmox, ...) and regardless of what
+    discoveryKey scheme that source happens to use. Needed because a device's *own* discoveryKey
+    can legitimately change between scans for reasons that have nothing to do with the device
+    changing -- see find_system_by_proxmox below for the concrete case this exists for."""
+    mac = (mac or "").strip().lower()
+    if not mac:
+        return None
+    with _conn() as conn:
+        return _row(conn.execute(
+            "SELECT * FROM systems WHERE mac = ? AND mac != '' LIMIT 1", (mac,)
+        ).fetchone())
+
+
+def find_system_by_proxmox(node: str, vmid: object) -> dict | None:
+    """A guest's (node, vmid) pair, read from `extra.proxmox` -- Python-side, like pipeline.py's
+    own `_assign_proxmox_parents`/`_link_omada_topology`, since `extra` is opaque JSON to SQLite.
+
+    This exists because proxmox_probe.probe's own discoveryKey is `mac:<mac>` when net0 parses a
+    MAC and `proxmox:<node>:<kind>:<vmid>` when it doesn't (see its docstring) -- the *same* guest
+    can flip between those two keys across scans (a NIC hot-added, a guest agent detail changes,
+    net0's format varies) with nothing about the guest itself having changed. Without this, that
+    flip reads as "new device" and duplicates the row instead of updating it.
+    """
+    if not node or vmid is None:
+        return None
+    for system in list_systems():
+        proxmox = (system.get("extra") or {}).get("proxmox") or {}
+        if proxmox.get("node") == node and proxmox.get("vmid") == vmid:
+            return system
+    return None
+
+
+def find_system_by_ip_and_hostname(ip: str, hostname: str) -> dict | None:
+    """Weak on their own (a DHCP lease can move an IP, a hostname can be reused), but together a
+    reasonable fallback identity for a device recorded under one discoveryKey scheme by a human
+    (a hand-created row with just an address and a hostname typed in) and found again under a
+    different one by a later scan -- a phone rotating its privacy MAC being the common case."""
+    ip, hostname = (ip or "").strip(), (hostname or "").strip()
+    if not ip or not hostname:
+        return None
+    with _conn() as conn:
+        return _row(conn.execute(
+            "SELECT * FROM systems WHERE ip = ? AND hostname = ? AND ip != '' AND hostname != '' LIMIT 1",
+            (ip, hostname),
+        ).fetchone())
+
+
+def find_system_for_merge(found: dict) -> dict | None:
+    """Beyond `found`'s own exact discoveryKey (and its legacy keys, tried by the caller first),
+    look for the same physical device under a different identity scheme entirely -- the case this
+    exists for is a device one source only ever saw by IP (no ARP-resolved MAC, e.g. off the local
+    L2 segment) that another source -- an API integration -- already knows by MAC, or a Proxmox
+    guest whose discoveryKey scheme flipped (see find_system_by_proxmox). Priority order matches
+    how trustworthy each identity is on its own: MAC first, then a Proxmox guest's own (node,
+    vmid), then IP+hostname together as the weakest-but-still-useful fallback.
+    """
+    existing = find_system_by_mac(found.get("mac", ""))
+    if existing is not None:
+        return existing
+    proxmox = (found.get("extra") or {}).get("proxmox") or {}
+    existing = find_system_by_proxmox(proxmox.get("node", ""), proxmox.get("vmid"))
+    if existing is not None:
+        return existing
+    return find_system_by_ip_and_hostname(found.get("ip", ""), found.get("hostname", ""))
+
+
 def link_containers_to_host(host_ip: str) -> int:
     """Docker containers are discovered with the scanning host's own IP (see docker_probe.py) but
     no link to the system row that represents that host. Called once per scan to fill that in, so
@@ -648,6 +739,21 @@ def upsert_discovered_system(found: dict) -> tuple[dict, bool]:
     this same device before its key scheme changed (see docker_probe.py's compose-based key). It
     is only ever a lookup fallback -- never written to the row -- so that an installation upgrading
     across the scheme change merges into its existing row instead of duplicating it.
+
+    `importance` gets one narrow exception to "never overwritten once confirmed": a finding that
+    says "critical" (currently only proxmox_probe.py, from a guest's own `critical` tag) promotes
+    an existing row straight to critical regardless of confirmed state, but never the reverse --
+    a rescan where the tag is gone (or was never there) leaves a human-set "critical" alone. Both
+    halves matter: promotion has to survive re-confirmation or tagging a VM critical in Proxmox
+    would only ever affect brand-new rows, and it has to be one-directional or the *absence* of a
+    tag this scan cycle would silently downgrade a device someone deliberately marked by hand.
+
+    Beyond the exact-key (and legacy-key) lookups below, `find_system_for_merge` tries the same
+    device under a different identity scheme entirely -- MAC, then Proxmox (node, vmid), then
+    IP+hostname, in that priority order -- so a device found this scan via one source (say, an ARP
+    sweep, with no resolved MAC) merges into the row an earlier scan already created via another
+    (say, Proxmox, keyed by MAC) instead of duplicating it. See its own docstring for why each
+    fallback exists.
     """
     existing = find_system_by_key(found.get("discoveryKey", ""))
     if existing is None:
@@ -655,6 +761,8 @@ def upsert_discovered_system(found: dict) -> tuple[dict, bool]:
             existing = find_system_by_key(legacy_key)
             if existing is not None:
                 break
+    if existing is None:
+        existing = find_system_for_merge(found)
     now = _now()
     if existing is None:
         created = create_system({**found, "discovered": 1, "firstSeen": now, "lastSeen": now})
@@ -669,9 +777,11 @@ def upsert_discovered_system(found: dict) -> tuple[dict, bool]:
         "lastSeen": now,
         "discoveryKey": found.get("discoveryKey") or existing["discoveryKey"],
     }
+    if found.get("importance") == "critical" and existing.get("importance") != "critical":
+        volatile["importance"] = "critical"
     if not existing["confirmed"]:
         for field in ("kind", "name", "hostname", "mac", "vendor", "model", "os", "location",
-                      "purpose", "descriptionMd", "url", "docUrl"):
+                      "purpose", "descriptionMd", "url", "docUrl", "docLink"):
             value = found.get(field)
             if value:
                 volatile[field] = value
@@ -680,7 +790,7 @@ def upsert_discovered_system(found: dict) -> tuple[dict, bool]:
         # manufacturer manual to a hand-created entry is strictly new information, not an
         # overwrite. `purpose` and `location` are included because a hand-created row usually has
         # only a name, and filling the blanks is the whole point of a rescan.
-        for field in ("hostname", "mac", "vendor", "model", "os", "docUrl", "purpose", "location"):
+        for field in ("hostname", "mac", "vendor", "model", "os", "docUrl", "docLink", "purpose", "location"):
             if found.get(field) and not existing.get(field):
                 volatile[field] = found[field]
     return update_system(existing["id"], volatile), False  # type: ignore[return-value]
@@ -944,6 +1054,56 @@ def list_device_config_versions(system_id: str) -> list[dict]:
 def get_device_config_version(version_id: str) -> dict | None:
     with _conn() as conn:
         return _row(conn.execute("SELECT * FROM deviceConfigVersions WHERE id = ?", (version_id,)).fetchone())
+
+
+# --------------------------------------------------------------------------------------------
+# Device error events -- see deviceErrorEvents' own schema comment for what these are.
+# --------------------------------------------------------------------------------------------
+
+# Per-device cap, same reasoning and same shape as deviceConfigVersions' "keep" trim: a device with
+# a persistently broken credential would otherwise grow one row every single scan forever. Not
+# user-configurable like the config-backup limit is -- these are diagnostic breadcrumbs, not
+# something anyone restores from, so there is no equivalent tradeoff to expose a setting for.
+_ERROR_EVENT_KEEP = 100
+
+
+def add_device_error_event(system_id: str, level: str, message: str) -> dict | None:
+    """Records one scan-time failure against the specific device it happened to, so it shows up
+    right where someone looking at *that* device would check first, rather than only in the
+    scan-wide log line that scrolls out of view after the next scan. A blank `system_id` is a
+    no-op, not an error -- some failures (e.g. a Proxmox host that never resolved to any inventory
+    row at all) have nowhere to attach to, and that is a normal, expected case, not a bug."""
+    if not system_id:
+        return None
+    with _conn() as conn:
+        event_id = _new_id()
+        conn.execute(
+            "INSERT INTO deviceErrorEvents(id, systemId, level, message, createdAt) VALUES(?,?,?,?,?)",
+            (event_id, system_id, level or "error", (message or "")[:2000], _now()),
+        )
+        conn.execute(
+            "DELETE FROM deviceErrorEvents WHERE systemId = ? AND id NOT IN "
+            "(SELECT id FROM deviceErrorEvents WHERE systemId = ? ORDER BY createdAt DESC, rowid DESC LIMIT ?)",
+            (system_id, system_id, _ERROR_EVENT_KEEP),
+        )
+        return _row(conn.execute("SELECT * FROM deviceErrorEvents WHERE id = ?", (event_id,)).fetchone())
+
+
+def list_device_error_events(system_id: str, limit: int = 50) -> list[dict]:
+    with _conn() as conn:
+        return _rows(conn.execute(
+            "SELECT * FROM deviceErrorEvents WHERE systemId = ? ORDER BY createdAt DESC, rowid DESC LIMIT ?",
+            (system_id, limit),
+        ))
+
+
+def count_error_events_by_system() -> dict[str, int]:
+    """Every device's error-event count in one query, so the systems list can show a warning
+    badge without an extra round trip per device -- same pattern `/api/systems` already uses for
+    `accountCount`."""
+    with _conn() as conn:
+        rows = conn.execute("SELECT systemId, COUNT(*) AS c FROM deviceErrorEvents GROUP BY systemId").fetchall()
+    return {row["systemId"]: row["c"] for row in rows}
 
 
 # --------------------------------------------------------------------------------------------

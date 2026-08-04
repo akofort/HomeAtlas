@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, type Account, type ConfigVersion, type ProbeResult, type RemoteContainer, type System } from "../lib/api";
+import {
+  api, type Account, type ConfigVersion, type DeviceErrorEvent, type ProbeResult,
+  type RemoteContainer, type System,
+} from "../lib/api";
 import { useAuth } from "../App";
 import Markdown from "../components/Markdown";
 import { KindIcon } from "../lib/icons";
@@ -35,6 +38,8 @@ export default function SystemDetailPage() {
   const [probeNotice, setProbeNotice] = useState<{ kind: "ok" | "error" | "info"; text: string } | null>(null);
   const [configVersions, setConfigVersions] = useState<ConfigVersion[] | null>(null);
   const [configPreview, setConfigPreview] = useState<ConfigVersion | null>(null);
+  const [errorEvents, setErrorEvents] = useState<DeviceErrorEvent[] | null>(null);
+  const [showErrorLog, setShowErrorLog] = useState(false);
   const [consoleAccountId, setConsoleAccountId] = useState<string | null>(null);
   const [keyGenBusy, setKeyGenBusy] = useState(false);
   const [keyGenNotice, setKeyGenNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
@@ -57,6 +62,9 @@ export default function SystemDetailPage() {
         if (r.system.kind === "router" || r.system.kind === "network") {
           api.listConfigVersions(id).then((cv) => setConfigVersions(cv.versions)).catch(() => setConfigVersions([]));
         }
+        // Fetched for every device, unlike config backups -- any device can accumulate a probe
+        // failure or a monitoring-down event, and the warning badge needs a real count to show.
+        api.listSystemErrors(id).then((r2) => setErrorEvents(r2.events)).catch(() => setErrorEvents([]));
       })
       .catch((e) => setError(e.message));
   }, [id]);
@@ -236,6 +244,12 @@ export default function SystemDetailPage() {
               {system.status === "online" ? "erreichbar" : system.status === "offline" ? "nicht erreichbar" : "Zustand unbekannt"}
             </span>
             {system.importance === "critical" && <span className="badge warn">kritisch fürs Haus</span>}
+            {!!errorEvents?.length && (
+              <button className="badge danger" style={{ cursor: "pointer", border: "none" }}
+                      onClick={() => setShowErrorLog((v) => !v)}>
+                ⚠ {errorEvents.length} Fehler protokolliert
+              </button>
+            )}
             {(system.tags ?? []).some((t) => t.toLowerCase().includes("poe")) && (
               <span className="badge warn" title="Funktioniert ohne PoE-fähigen Switch oder Injector nicht">
                 ⚡ benötigt PoE
@@ -253,6 +267,11 @@ export default function SystemDetailPage() {
             {system.docUrl && (
               <a className="badge" href={system.docUrl} target="_blank" rel="noreferrer">
                 Hersteller-Dokumentation ↗
+              </a>
+            )}
+            {system.docLink && (
+              <a className="badge" href={system.docLink} target="_blank" rel="noreferrer">
+                Eigene Dokumentation ↗
               </a>
             )}
           </div>
@@ -282,7 +301,7 @@ export default function SystemDetailPage() {
               ["name", "Name"], ["ip", "Adresse im Netzwerk"], ["hostname", "Hostname"],
               ["vendor", "Hersteller"], ["model", "Modell"], ["location", "Standort"],
               ["url", "Weboberfläche (URL)"], ["docUrl", "Hersteller-Dokumentation (URL)"],
-              ["purpose", "Zweck in einem Satz"],
+              ["docLink", "Eigene Dokumentation (URL)"], ["purpose", "Zweck in einem Satz"],
             ] as const).map(([field, label]) => (
               <div className="field" key={field}>
                 <label>{label}</label>
@@ -539,6 +558,42 @@ export default function SystemDetailPage() {
               )}
             </div>
           ))}
+        </div>
+      )}
+
+      {showErrorLog && !!errorEvents?.length && (
+        <div className="card">
+          <div className="row" style={{ justifyContent: "space-between", marginBottom: 4 }}>
+            <h2 style={{ margin: 0 }}>Fehlerprotokoll</h2>
+            <button className="secondary" onClick={() => setShowErrorLog(false)}>Einklappen</button>
+          </div>
+          <p className="muted" style={{ marginTop: -2 }}>
+            Was beim automatischen Auslesen oder bei der Dauerüberwachung an diesem Gerät
+            fehlgeschlagen ist — SSH-Zeitüberschreitungen, abgelehnte Zugangsdaten, Ausfälle. Zeigt
+            die letzten {errorEvents.length} Einträge.
+          </p>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Zeitpunkt</th><th>Stufe</th><th>Meldung</th></tr>
+              </thead>
+              <tbody>
+                {errorEvents.map((ev) => (
+                  <tr key={ev.id}>
+                    <td className="muted" style={{ whiteSpace: "nowrap" }}>
+                      {new Date(ev.createdAt).toLocaleString("de-DE")}
+                    </td>
+                    <td>
+                      <span className={`badge ${ev.level === "error" ? "danger" : ev.level === "warning" ? "warn" : ""}`}>
+                        {ev.level}
+                      </span>
+                    </td>
+                    <td>{ev.message}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
 

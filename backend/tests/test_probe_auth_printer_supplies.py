@@ -61,6 +61,8 @@ def test_probe_homeassistant_includes_disabled_automations_with_explicit_status(
     doesn't X run anymore" needs to see. Exercises the real function end-to-end over a mocked
     transport, not a reimplementation of its filtering logic."""
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/":
+            return httpx.Response(200, json={"message": "API running"})
         if request.url.path.endswith("/api/states"):
             return httpx.Response(200, json=[
                 {"entity_id": "automation.enabled_one", "state": "on",

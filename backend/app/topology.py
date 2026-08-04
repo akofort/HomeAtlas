@@ -395,12 +395,18 @@ def render(settings: dict | None = None) -> str:
     # --- Wichtige Geräte: alles mit Bedeutung "kritisch" ---------------------------------
     # Everything else (including non-critical servers/NAS and all end devices) lives in the
     # collapsible, kind-grouped lists PlanPage.tsx renders below the plan -- this file only ever
-    # draws what someone marked as mattering, plus the backbone that carries it.
-    critical = [s for s in systems if s.get("importance") == "critical" and s["kind"] not in ("container", "vm")]
+    # draws what someone marked as mattering, plus the backbone that carries it. A critical
+    # container/VM used to be excluded here and only ever showed up folded into its host's
+    # collapsed "N Container/VM" count -- exactly the kind of thing marking it critical was
+    # supposed to prevent -- so it now gets its own box here like any other critical device.
+    critical = [s for s in systems if s.get("importance") == "critical"]
+    critical_ids = {s["id"] for s in critical}
     host_ids = {s["id"] for s in systems if s["kind"] in ("server", "nas")}
     children_by_host: dict[str, list[dict]] = {}
     for kind in ("container", "vm"):
         for s in by_kind.get(kind, []):
+            if s["id"] in critical_ids:
+                continue  # drawn on its own below instead of folded into the host's summary count
             parent = s.get("parentId")
             if parent in host_ids:
                 children_by_host.setdefault(parent, []).append(s)
@@ -421,7 +427,13 @@ def render(settings: dict | None = None) -> str:
                     running = sum(1 for c in children if c["status"] == "online")
                     subtitle = f'{s["ip"]} · {len(children)} Container/VM, {running} aktiv ▸'
                     expand = True
-            resolved_parent = next((nid for nid in links.get(s["id"], ()) if nid in anchor_by_id), None)
+            # A container/VM's own parentId (set by pipeline.py from the Proxmox/Docker credential
+            # that found it) names its actual host directly -- a far more reliable anchor than
+            # LLDP, which containers/VMs never speak in the first place. Real neighbour data still
+            # wins for everything else that has it.
+            resolved_parent = s.get("parentId") if s.get("parentId") in anchor_by_id else None
+            if resolved_parent is None:
+                resolved_parent = next((nid for nid in links.get(s["id"], ()) if nid in anchor_by_id), None)
             items.append({"id": s["id"], "parentId": resolved_parent, "title": s["name"],
                          "subtitle": subtitle, "status": s["status"], "expand": expand})
         row_svg, anchors = _row(items, y)

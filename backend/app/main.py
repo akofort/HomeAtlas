@@ -508,7 +508,9 @@ async def list_systems(kind: str | None = None, _: dict = Depends(current_user))
     for account in db.list_accounts():
         if account["systemId"]:
             accounts_by_system[account["systemId"]] = accounts_by_system.get(account["systemId"], 0) + 1
+    error_counts = db.count_error_events_by_system()
     return {"systems": [{**s, "accountCount": accounts_by_system.get(s["id"], 0),
+                         "errorCount": error_counts.get(s["id"], 0),
                          "description": docs.describe_device(s)} for s in systems],
             "kindLabels": docs.KIND_LABELS}
 
@@ -1056,6 +1058,13 @@ async def get_config_version(system_id: str, version_id: str, _: dict = Depends(
     if version is None or version["systemId"] != system_id:
         raise HTTPException(status_code=404, detail="Version nicht gefunden.")
     return {"version": {**version, "content": crypto.decrypt(version["content"])}}
+
+
+@app.get("/api/systems/{system_id}/errors")
+async def list_system_errors(system_id: str, _: dict = Depends(current_user)) -> dict:
+    if db.get_system(system_id) is None:
+        raise HTTPException(status_code=404, detail="Gerät nicht gefunden.")
+    return {"events": db.list_device_error_events(system_id)}
 
 
 # ---------------------------------------------------------------------------------------------

@@ -6,8 +6,8 @@ promise in a docstring, because the credentials involved are usually root or rou
 things enforce it:
 
 1. **A hardcoded command allowlist.** `_SSH_COMMANDS` (and its platform variants,
-   `_SSH_COMMANDS_MIKROTIK`/`_SSH_COMMANDS_ARUBA`/`_SSH_COMMANDS_CISCO`/`_SSH_COMMANDS_TPLINK`)
-   are module constants.
+   `_SSH_COMMANDS_MIKROTIK`/`_SSH_COMMANDS_ARUBA`/`_SSH_COMMANDS_ARUBA_CX`/`_SSH_COMMANDS_CISCO`/
+   `_SSH_COMMANDS_TPLINK`) are module constants.
    There is no setting, no API parameter and no LLM tool that can add to them. Making it
    configurable would turn this into a remote-execution feature with a nice UI, which is
    precisely what it must not be.
@@ -111,18 +111,46 @@ _SSH_COMMANDS_MIKROTIK: tuple[tuple[str, str, str], ...] = (
     ("config_export", "Vollständige Konfiguration", "/export compact"),
 )
 
+# Classic ArubaOS-Switch (ProCurve-derived) CLI enables its own "-- MORE --" pager by default.
+# "no page" turns it off -- unlike TP-Link's "no clipaging" (see _TPLINK_DISABLE_PAGING below),
+# it needs no config-mode detour, but it is still a per-session setting, and each of probe_ssh's
+# commands opens its own fresh, non-interactive exec channel (see the Cisco comment above -- same
+# limitation, same reason). So it still has to be folded into the same command string as the thing
+# it's protecting rather than sent as its own earlier command, which would already be gone by the
+# time the next channel opens. Without this, "show running-config" on a switch with more than one
+# screen of config either hangs until _SSH_TIMEOUT kills the channel, losing the whole backup, or
+# comes back truncated at the first page.
+_ARUBA_DISABLE_PAGING = "no page\n"
+
 _SSH_COMMANDS_ARUBA: tuple[tuple[str, str, str], ...] = (
-    # Classic ArubaOS-Switch (ProCurve-derived) CLI. ArubaOS-CX, the newer REST-first line, uses a
-    # different command grammar and is not covered here -- SNMP (see probe_snmp) is the fallback.
-    ("system", "System", "show system-information"),
-    ("vlan", "VLANs", "show vlan"),
-    ("vlan_ports", "VLAN-Port-Zuordnung", "show vlan ports all detail"),
-    ("neighbors", "Nachbargeräte (LLDP)", "show lldp info remote-device"),
-    ("interfaces", "Schnittstellen", "show interfaces brief"),
+    ("system", "System", _ARUBA_DISABLE_PAGING + "show system-information"),
+    ("vlan", "VLANs", _ARUBA_DISABLE_PAGING + "show vlan"),
+    ("vlan_ports", "VLAN-Port-Zuordnung", _ARUBA_DISABLE_PAGING + "show vlan ports all detail"),
+    ("neighbors", "Nachbargeräte (LLDP)", _ARUBA_DISABLE_PAGING + "show lldp info remote-device"),
+    ("interfaces", "Schnittstellen", _ARUBA_DISABLE_PAGING + "show interfaces brief"),
     # Same reasoning as Mikrotik's "ip_addresses" above -- which subnet(s) this device routes for.
-    ("ip_addresses", "IP-Adressen je VLAN", "show ip"),
-    ("arp_table", "ARP-Tabelle", "show arp"),
-    ("config_export", "Vollständige Konfiguration", "show running-config"),
+    ("ip_addresses", "IP-Adressen je VLAN", _ARUBA_DISABLE_PAGING + "show ip"),
+    ("arp_table", "ARP-Tabelle", _ARUBA_DISABLE_PAGING + "show arp"),
+    ("config_export", "Vollständige Konfiguration", _ARUBA_DISABLE_PAGING + "show running-config"),
+)
+
+# ArubaOS-CX (the newer, REST-first line: 6300/6400/8320/8325/8400 and similar) is a different NOS
+# from classic ArubaOS-Switch above and speaks its own command grammar, not the ProCurve-derived
+# one -- "show system", not "show system-information"; "show lldp neighbor-info", not "show lldp
+# info remote-device"; and so on. Its pager-disable command differs too: "no paging" (this NOS's
+# own name for the same setting), same per-session/per-channel non-persistence as ArubaOS-Switch's
+# "no page" above, same fold-into-one-command fix for the same reason.
+_ARUBA_CX_DISABLE_PAGING = "no paging\n"
+
+_SSH_COMMANDS_ARUBA_CX: tuple[tuple[str, str, str], ...] = (
+    ("system", "System", _ARUBA_CX_DISABLE_PAGING + "show system"),
+    ("vlan", "VLANs", _ARUBA_CX_DISABLE_PAGING + "show vlan"),
+    ("neighbors", "Nachbargeräte (LLDP)", _ARUBA_CX_DISABLE_PAGING + "show lldp neighbor-info"),
+    ("interfaces", "Schnittstellen", _ARUBA_CX_DISABLE_PAGING + "show interface brief"),
+    # Same reasoning as Mikrotik's "ip_addresses" above -- which subnet(s) this device routes for.
+    ("ip_addresses", "IP-Adressen je VLAN", _ARUBA_CX_DISABLE_PAGING + "show interface vlan"),
+    ("arp_table", "ARP-Tabelle", _ARUBA_CX_DISABLE_PAGING + "show arp"),
+    ("config_export", "Vollständige Konfiguration", _ARUBA_CX_DISABLE_PAGING + "show running-config"),
 )
 
 _SSH_COMMANDS_CISCO: tuple[tuple[str, str, str], ...] = (
@@ -143,16 +171,28 @@ _SSH_COMMANDS_CISCO: tuple[tuple[str, str, str], ...] = (
     ("config_export", "Vollständige Konfiguration", "show running-config | no-more"),
 )
 
+# TP-Link JetStream/Omada-managed switch CLI (T1600G/TL-SG-series) enables its own "--More--"
+# pager by default and -- unlike IOS's "| no-more" -- has no per-command output-format flag to
+# suppress it. The only way to turn it off is the stateful, config-mode command "no clipaging",
+# and a stateful setting sent as its own earlier command would already be gone by the time the
+# next command opens its own fresh exec channel (see the Cisco comment above -- same non-
+# interactive, one-shot-exec-per-command model, same limitation). So it has to be folded into the
+# very same multi-line command string as the thing it's protecting, sent as one exec request:
+# TP-Link's CLI (like Cisco's) feeds a multi-line exec payload to its command parser one line at a
+# time, the same as a human typing at the prompt would, which is what makes "configure" / "no
+# clipaging" / "exit" take effect before "show ..." runs in that same channel. Without this,
+# any output longer than one screen (a switch with more than a handful of VLANs/ports/neighbors,
+# or any non-trivial running-config) either hangs until _SSH_TIMEOUT kills the channel -- losing
+# the whole fact, config backup included -- or comes back truncated at the first page.
+_TPLINK_DISABLE_PAGING = "configure\nno clipaging\nexit\n"
+
 _SSH_COMMANDS_TPLINK: tuple[tuple[str, str, str], ...] = (
-    # TP-Link JetStream/Omada-managed switch CLI (T1600G/TL-SG-series): Cisco-like "show" syntax
-    # but its own command set, and -- unlike IOS's "| no-more" -- no per-command pager override,
-    # so output relies on probe_ssh's own truncation instead of a modifier here.
-    ("system", "System", "show system-info"),
-    ("vlan", "VLANs", "show vlan"),
-    ("neighbors", "Nachbargeräte (LLDP)", "show lldp neighbor-information"),
-    ("interfaces", "Schnittstellen", "show interface status"),
-    ("arp_table", "ARP-Tabelle", "show arp"),
-    ("config_export", "Vollständige Konfiguration", "show running-config"),
+    ("system", "System", _TPLINK_DISABLE_PAGING + "show system-info"),
+    ("vlan", "VLANs", _TPLINK_DISABLE_PAGING + "show vlan"),
+    ("neighbors", "Nachbargeräte (LLDP)", _TPLINK_DISABLE_PAGING + "show lldp neighbor-information"),
+    ("interfaces", "Schnittstellen", _TPLINK_DISABLE_PAGING + "show interface status"),
+    ("arp_table", "ARP-Tabelle", _TPLINK_DISABLE_PAGING + "show arp"),
+    ("config_export", "Vollständige Konfiguration", _TPLINK_DISABLE_PAGING + "show running-config"),
 )
 
 # Facts holding a full device config export -- picked up by `extract_config_backups` below and
@@ -184,6 +224,13 @@ def _detect_platform(system: dict) -> str:
     # the generic Linux command set below, which means nothing to its CLI, and probing it silently
     # returned no facts at all instead of an error pointing at why.
     if "aruba" in haystack or "procurve" in haystack or "hewlett" in haystack or re.search(r"\bhp\b", haystack):
+        # ArubaOS-CX (the newer, REST-first line -- 6300/6400/8320/8325/8400 and similar) speaks a
+        # different command grammar from classic ArubaOS-Switch, so it needs its own branch rather
+        # than falling through to `_SSH_COMMANDS_ARUBA`'s ProCurve-derived syntax, which it doesn't
+        # understand. Checked before the generic "aruba" match below since a CX device's own
+        # strings ("Aruba CX 6300", sysDescr mentioning "ArubaOS-CX") contain both signals.
+        if re.search(r"\barubaos-cx\b|\baos-cx\b|\bcx\b", haystack):
+            return "arubacx"
         return "aruba"
     if "cisco" in haystack:
         return "cisco"
@@ -248,7 +295,8 @@ async def probe_ssh(host: str, account: dict, platform: str = "") -> dict:
         return {"ok": False, "error": f"Der hinterlegte SSH-Schlüssel ließ sich nicht lesen: {exc}", "facts": {}}
 
     commands = {
-        "mikrotik": _SSH_COMMANDS_MIKROTIK, "aruba": _SSH_COMMANDS_ARUBA, "cisco": _SSH_COMMANDS_CISCO,
+        "mikrotik": _SSH_COMMANDS_MIKROTIK, "aruba": _SSH_COMMANDS_ARUBA,
+        "arubacx": _SSH_COMMANDS_ARUBA_CX, "cisco": _SSH_COMMANDS_CISCO,
         "tplink": _SSH_COMMANDS_TPLINK,
     }.get(platform, _SSH_COMMANDS)
 
@@ -428,6 +476,35 @@ def _ha_action_summary(actions: object) -> str:
     return ", ".join(labels)
 
 
+async def _ha_self_check(client: httpx.AsyncClient, base_url: str) -> str:
+    """Confirms the endpoint actually is a Home Assistant instance answering this token, before
+    anything else is asked of it. HA's root `/api/` route -- unlike `/api/states` -- exists purely
+    as a health/identity check and always replies `{"message": "API running"}` once the token is
+    accepted, so checking it first turns "wrong URL, some other web server answered" or "token
+    rejected" into one specific, actionable message here instead of a confusing JSON-parse failure
+    two calls later while trying to read automation data that was never coming. Returns an error
+    string, or "" once the check passed.
+    """
+    try:
+        response = await client.get(f"{base_url}/api/")
+    except httpx.HTTPError as exc:
+        return f"Home Assistant unter {base_url} nicht erreichbar: {exc}"
+    if response.status_code in (401, 403):
+        return (f"Home Assistant hat das Zugriffstoken abgelehnt (HTTP {response.status_code}). "
+                "Ein neues Long-Lived Access Token erzeugen (Profil -> Sicherheit) und hier "
+                "hinterlegen.")
+    if response.status_code >= 400:
+        return f"Home Assistant antwortet auf {base_url}/api/ mit HTTP {response.status_code}."
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict) or payload.get("message") != "API running":
+        return (f"{base_url}/api/ hat nicht wie die Home-Assistant-API geantwortet -- Adresse "
+                "prüfen (Basis-URL ohne „/api“, z. B. http://homeassistant.local:8123).")
+    return ""
+
+
 async def probe_homeassistant(url: str, account: dict) -> dict:
     """Reads a Home Assistant instance's own REST API with a Long-Lived Access Token: every
     automation with its on/off status and a short description of what it does, plus printer
@@ -452,7 +529,16 @@ async def probe_homeassistant(url: str, account: dict) -> dict:
     headers = {"Authorization": f"Bearer {token}"}
     try:
         async with httpx.AsyncClient(timeout=_HA_TIMEOUT, verify=False, headers=headers) as client:
+            self_check_error = await _ha_self_check(client, base_url)
+            if self_check_error:
+                return {"ok": False, "error": self_check_error, "facts": {}}
+
             response = await client.get(f"{base_url}/api/states")
+            if response.status_code in (401, 403):
+                return {"ok": False, "facts": {}, "error": (
+                    f"Home Assistant hat das Zugriffstoken abgelehnt (HTTP {response.status_code}) "
+                    "beim Abruf der Zustände."
+                )}
             response.raise_for_status()
             states = response.json()
             if not isinstance(states, list):
@@ -525,7 +611,7 @@ async def probe_homeassistant(url: str, account: dict) -> dict:
                 facts["printerSupplies"] = {"label": f"Drucker-Verbrauchsmaterial ({len(supplies)})",
                                             "value": "\n".join(supply_lines)[:5000]}
     except (httpx.HTTPError, ValueError, KeyError) as exc:
-        return {"ok": False, "error": f"Home Assistant nicht erreichbar: {exc}", "facts": {}}
+        return {"ok": False, "error": f"Home Assistant unter {base_url} nicht erreichbar: {exc}", "facts": {}}
 
     if not facts:
         return {"ok": False, "error": "Verbindung stand, aber keine aktiven Automationen oder "
@@ -570,11 +656,18 @@ async def _snmp_run(*args: str) -> str:
     return stdout.decode("utf-8", errors="replace").strip()
 
 
-async def probe_snmp(host: str, account: dict) -> dict:
+async def probe_snmp(host: str, account: dict, kind: str = "") -> dict:
     """Walks a fixed OID set with the stored community string. Read-only by construction: an SNMP
     SET has no counterpart anywhere in this function. Output is kept as raw walk text rather than
     parsed into structured VLAN/neighbor tables -- formats vary enough between net-snmp versions
-    and vendor MIB implementations that a parser would be more fragile than useful here."""
+    and vendor MIB implementations that a parser would be more fragile than useful here.
+
+    `kind` additionally triggers a toner/ink read (see `_snmp_printer_supplies`) when the
+    credential is attached to a `printer`-kind system -- worth a special case, unlike the VLAN/
+    neighbor facts above, because it feeds `extract_printer_supplies`/pipeline.py's inventory
+    update rather than just the generic facts view, and needs one specific, structured shape
+    (`printerSupplies`, same "- name: value%" format `probe_homeassistant` already produces) to do
+    that."""
     community, _ = _decode_secret(account)
     if not community:
         return {"ok": False, "error": "Keine Community-Zeichenkette hinterlegt.", "facts": {}}
@@ -588,12 +681,156 @@ async def probe_snmp(host: str, account: dict) -> dict:
         if output and "Timeout" not in output and "No Such" not in output:
             facts[key] = {"label": label, "value": output[:20000]}
 
+    if kind == "printer":
+        supplies = await _snmp_printer_supplies(target, community)
+        if supplies:
+            supply_lines = [f"- {s['name']}: {s['percent']}%" for s in supplies]
+            facts["printerSupplies"] = {"label": f"Drucker-Verbrauchsmaterial ({len(supplies)})",
+                                        "value": "\n".join(supply_lines)[:5000]}
+
     if not facts:
         return {"ok": False, "facts": {}, "error": (
             f"Keine SNMP-Antwort von {target}. Community-Zeichenkette prüfen oder ob SNMP auf dem "
             "Gerät aktiviert ist."
         )}
     return {"ok": True, "error": "", "facts": facts}
+
+
+# ---------------------------------------------------------------------------------------------
+# Printer toner/ink levels via SNMP -- standard Printer-MIB first, a Brother private OID as
+# fallback for firmware that leaves the standard table unpopulated. Community string and port come
+# from the same "snmp"-category account as the rest of `probe_snmp` -- there is deliberately no
+# separate credential type or hardcoded "public" community for this, so it stays covered by the
+# same opt-in-per-credential rule as everything else in this module (see module docstring, point
+# 4); "public" is simply the value a household typically stores in that account, same as any other
+# SNMP-managed device here.
+# ---------------------------------------------------------------------------------------------
+
+_PRINTER_MIB_DESCR_OID = "1.3.6.1.2.1.43.11.1.1.6"  # prtMarkerSuppliesDescription
+_PRINTER_MIB_LEVEL_OID = "1.3.6.1.2.1.43.11.1.1.9"  # prtMarkerSuppliesLevel
+_PRINTER_MIB_MAX_OID = "1.3.6.1.2.1.43.11.1.1.8"    # prtMarkerSuppliesMaxCapacity
+
+# Brother's private enterprise MIB (1.3.6.1.4.1.2435), tried only when the standard Printer-MIB
+# above reports nothing usable. Some Brother firmware leaves prtMarkerSuppliesLevel/MaxCapacity at
+# -3/-2 ("not used"/"unknown", RFC 3805) for every supply even though the device tracks real
+# percentages internally, and exposes those instead through this single OctetString:
+# `brInfoMaintenance`, one packed record per consumable -- 1 id byte, a 2-byte "01 04" record
+# marker, then a 4-byte big-endian value in 0.01% steps (9700 = 97.00%), with runs of 0xFF padding
+# (both the inter-record gap and the table's own end-of-data marker look like this) between
+# records. Brother publishes no MIB for this table and the layout is reverse-engineered from field
+# reports, known to vary between models -- see `parse_brother_maintenance`'s docstring for how
+# that uncertainty is handled.
+_BROTHER_MAINTENANCE_OID = "1.3.6.1.4.1.2435.2.3.9.4.2.1.5.5.8.0"
+
+
+def _parse_printer_mib_walk(text: str, base_oid: str) -> dict[str, str]:
+    """Row-index -> raw value from one `snmpwalk -O n <base_oid>` output. The index is whatever
+    follows `base_oid` in each returned OID -- Printer-MIB's supplies table key (host-resource
+    device index + supply index) varies by vendor/model, so nothing here assumes a fixed shape for
+    it beyond "it's the table's own row key", the same posture `probe_snmp` already takes on
+    VLAN/neighbor output."""
+    prefix = base_oid.strip(".") + "."
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        oid_part, sep, rest = line.partition("=")
+        if not sep:
+            continue
+        oid = oid_part.strip().lstrip(".")
+        if not oid.startswith(prefix):
+            continue
+        index = oid[len(prefix):]
+        value = rest.split(":", 1)[-1].strip().strip('"') if ":" in rest else rest.strip()
+        if index:
+            values[index] = value
+    return values
+
+
+def parse_printer_mib_supplies(descr_text: str, level_text: str, max_text: str) -> list[dict]:
+    """(name, percent) pairs from standard Printer-MIB (RFC 3805) supplies-table walks, matched by
+    their shared row index across the three separate `snmpwalk` outputs -- one for
+    prtMarkerSuppliesDescription, one for prtMarkerSuppliesLevel, one for prtMarkerSuppliesMax
+    Capacity. Negative level/capacity values are RFC-defined sentinels (-1 unknown, -2
+    unrestricted/no fixed capacity, -3 not used), not real readings, and are skipped -- a printer
+    reporting only sentinels here is exactly the case `parse_brother_maintenance` exists for."""
+    descriptions = _parse_printer_mib_walk(descr_text, _PRINTER_MIB_DESCR_OID)
+    levels = _parse_printer_mib_walk(level_text, _PRINTER_MIB_LEVEL_OID)
+    capacities = _parse_printer_mib_walk(max_text, _PRINTER_MIB_MAX_OID)
+
+    supplies: list[dict] = []
+    for index, level_raw in levels.items():
+        capacity_raw = capacities.get(index)
+        if capacity_raw is None:
+            continue
+        try:
+            level, capacity = int(level_raw), int(capacity_raw)
+        except ValueError:
+            continue
+        if level < 0 or capacity <= 0:
+            continue
+        name = descriptions.get(index) or f"Verbrauchsmaterial {index}"
+        percent = max(0.0, min(100.0, round(level * 100 / capacity, 1)))
+        supplies.append({"name": name, "percent": percent})
+    return supplies
+
+
+def _brother_maintenance_bytes(hex_text: str) -> bytes:
+    """Raw bytes from an `snmpget -O x` Hex-STRING line (`Hex-STRING: 01 04 00 00 25 40 FF ...`) --
+    empty if the OID doesn't exist on this device or the reply isn't an octet string at all."""
+    match = re.search(r"Hex-STRING:\s*([0-9A-Fa-f ]+)", hex_text)
+    if not match:
+        return b""
+    try:
+        return bytes(int(b, 16) for b in match.group(1).split())
+    except ValueError:
+        return b""
+
+
+def parse_brother_maintenance(hex_text: str) -> list[dict]:
+    """Toner/drum percentages from Brother's private brInfoMaintenance blob (see
+    `_BROTHER_MAINTENANCE_OID`'s docstring for the reverse-engineered layout). Parses
+    record-by-record rather than all-or-nothing, since one malformed or unrecognised record must
+    not hide the rest -- but a record whose marker doesn't match or whose value falls outside a
+    sane 0-100% range is dropped rather than stored as a wrong-looking percentage, same "no data
+    beats wrong data" posture `_BINARY_BACKUP_LIMIT` already takes on truncated backups above.
+    Runs of 0xFF (inter-record padding and the table's own end marker look identical) are skipped
+    wherever they appear rather than matched as one fixed-width terminator, since which of the two
+    a given run is doesn't change how it should be handled -- both just mean "no record starts
+    here"."""
+    data = _brother_maintenance_bytes(hex_text)
+    supplies: list[dict] = []
+    pos = 0
+    while pos < len(data):
+        while pos < len(data) and data[pos] == 0xFF:
+            pos += 1
+        if pos + 7 > len(data):
+            break
+        record_id, marker, value = data[pos], data[pos + 1:pos + 3], data[pos + 3:pos + 7]
+        pos += 7
+        if marker != b"\x01\x04":
+            continue
+        percent = round(int.from_bytes(value, "big") / 100, 1)
+        if 0 <= percent <= 100:
+            supplies.append({"name": f"Verbrauchsmaterial {record_id}", "percent": percent})
+    return supplies
+
+
+async def _snmp_printer_supplies(target: str, community: str) -> list[dict]:
+    """Standard Printer-MIB first, Brother's private OID only as a fallback -- see
+    `parse_printer_mib_supplies`/`parse_brother_maintenance` for why each exists and how each is
+    parsed."""
+    descr = await _snmp_run("snmpwalk", "-v2c", "-c", community, "-t", "3", "-r", "1", "-O", "n",
+                            target, _PRINTER_MIB_DESCR_OID)
+    level = await _snmp_run("snmpwalk", "-v2c", "-c", community, "-t", "3", "-r", "1", "-O", "n",
+                            target, _PRINTER_MIB_LEVEL_OID)
+    maxcap = await _snmp_run("snmpwalk", "-v2c", "-c", community, "-t", "3", "-r", "1", "-O", "n",
+                             target, _PRINTER_MIB_MAX_OID)
+    supplies = parse_printer_mib_supplies(descr, level, maxcap)
+    if supplies:
+        return supplies
+
+    hex_text = await _snmp_run("snmpget", "-v2c", "-c", community, "-t", "3", "-r", "1", "-O", "x",
+                               target, _BROTHER_MAINTENANCE_OID)
+    return parse_brother_maintenance(hex_text)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -811,7 +1048,7 @@ async def probe_system(system: dict, accounts: list[dict]) -> dict:
                 elif "ssh" not in results:
                     results[f"ssh:{account['label']}"] = result
         if category == "snmp":
-            result = await probe_snmp(host, account)
+            result = await probe_snmp(host, account, system.get("kind", ""))
             if result["ok"]:
                 results[f"snmp:{account['label']}"] = result
             elif "snmp" not in results:

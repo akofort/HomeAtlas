@@ -86,12 +86,22 @@ async def _probe_with_credentials(log) -> tuple[int, list[str], dict[str, str], 
             outcome = await probe_auth.probe_system(system, accounts)
         except Exception as exc:  # noqa: BLE001 -- one unreachable device must not end the scan
             warnings.append(f"Abfrage von {system['name']} fehlgeschlagen: {exc}")
+            db.add_device_error_event(system["id"], "error", f"Abfrage fehlgeschlagen: {exc}")
             continue
 
+        # Collected regardless of whether *some* credential on this system succeeded -- a system
+        # with both a working SSH account and a Home Assistant account whose token just expired
+        # used to have that second failure silently swallowed here (only visible at all once every
+        # credential on the row failed), which is exactly backwards for something an admin needs
+        # to notice and fix. Logged both to the scan-wide `warnings` (gone after the next scan) and
+        # against the device itself (see db.add_device_error_event) -- someone troubleshooting one
+        # specific switch/host should not have to dig through the last scan's log to find out an
+        # SSH timeout is why its config backup stopped updating.
+        for label, result in (outcome.get("results") or {}).items():
+            if not result.get("ok") and result.get("error"):
+                warnings.append(f"{system['name']} ({label}): {result['error']}")
+                db.add_device_error_event(system["id"], "error", f"{label}: {result['error']}")
         if not outcome["ran"]:
-            for label, result in (outcome.get("results") or {}).items():
-                if not result.get("ok") and result.get("error"):
-                    warnings.append(f"{system['name']} ({label}): {result['error']}")
             continue
 
         patch: dict = {"extra": {**(system.get("extra") or {}), "probe": outcome["results"]}}
@@ -221,6 +231,27 @@ def _apply_printer_supplies(printer_supplies: list[dict], log) -> int:
     return len(by_printer)
 
 
+def _assign_proxmox_parents(guests: list[dict], fallback_host_id: str | None) -> None:
+    """Points each Proxmox guest's `parentId` at its own node's system row, so a guest ends up
+    nested under the node it actually runs on rather than always under whichever single host the
+    credential happens to be attached to -- the credential is attached to *one* HomeAtlas system
+    row, but a cluster can run guests across several nodes at several addresses.
+
+    Matched by hostname/name against the guest's own `extra.proxmox.node` (set by
+    proxmox_probe.probe) -- the same "known name, no shared id" situation `_match_printer_supplies`
+    above already deals with, just for hosts instead of printers. Falls back to the credential's
+    own host when no separate row for that node exists yet, which is also the correct answer for
+    the common single-node setup (there, every guest's node *is* that one host).
+    """
+    node_hosts = {
+        (s.get("hostname") or s.get("name") or "").strip().lower(): s["id"]
+        for s in db.list_systems() if s["kind"] in ("server", "nas")
+    }
+    for guest in guests:
+        node = ((guest.get("extra") or {}).get("proxmox") or {}).get("node", "")
+        guest["parentId"] = node_hosts.get(node.strip().lower()) or fallback_host_id
+
+
 def _link_omada_topology() -> int:
     """Resolves each Omada finding's `extra.omada.uplinkMac` (set by omada_probe.py, on APs,
     switches and clients alike) to the inventory id of the device it points at, and records that
@@ -301,6 +332,8 @@ async def run_full_scan(scan_id: str) -> None:
                     log(f"Omada ({account['label']}): {len(omada_result['systems'])} Geräte/Clients gefunden")
                 else:
                     warnings.append(f"Omada Controller ({account['label']}): {omada_result['error']}")
+                    if account.get("systemId"):
+                        db.add_device_error_event(account["systemId"], "error", omada_result["error"])
 
         if settings.get("scanEnableProxmox", True):
             proxmox_accounts = [a for a in db.list_accounts()
@@ -312,15 +345,13 @@ async def run_full_scan(scan_id: str) -> None:
                 token_secret = crypto.decrypt(account.get("secretEnc") or "")
                 proxmox_result = await proxmox_probe.probe(account.get("url") or "", token_id, token_secret)
                 if proxmox_result["ok"]:
-                    # The credential is attached to the Proxmox host's own system row -- so that's
-                    # exactly the right parent for every VM/LXC it just reported, even in a cluster
-                    # with several nodes at several addresses (see proxmox_probe.probe's docstring).
-                    for guest in proxmox_result["systems"]:
-                        guest["parentId"] = account.get("systemId") or None
+                    _assign_proxmox_parents(proxmox_result["systems"], account.get("systemId"))
                     findings += proxmox_result["systems"]
                     log(f"Proxmox ({account['label']}): {len(proxmox_result['systems'])} Gäste gefunden")
                 else:
                     warnings.append(f"Proxmox-Host ({account['label']}): {proxmox_result['error']}")
+                    if account.get("systemId"):
+                        db.add_device_error_event(account["systemId"], "error", proxmox_result["error"])
 
         if settings.get("scanUseLlm", True):
             progress("Geräte einordnen (KI)", 89, "KI-Einordnung unbekannter Geräte")

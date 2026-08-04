@@ -145,6 +145,7 @@ export interface System {
   descriptionMd: string;
   url: string;
   docUrl: string;
+  docLink: string;
   notes: string;
   importance: "critical" | "normal" | "low";
   parentId: string | null;
@@ -162,8 +163,19 @@ export interface System {
   lastSeen: string;
   updatedAt: string;
   accountCount?: number;
+  /** Number of logged scan-time failures for this device (SSH timeout, Proxmox auth error, a
+   * monitored device going down, ...) -- see GET /api/systems/{id}/errors for the full list. */
+  errorCount?: number;
   /** Server-derived "what is this for" sentence; falls back to the kind when nothing is stored. */
   description?: string;
+}
+
+export interface DeviceErrorEvent {
+  id: string;
+  systemId: string;
+  level: "error" | "warning" | "info";
+  message: string;
+  createdAt: string;
 }
 
 export interface Account {
@@ -381,6 +393,8 @@ export const api = {
     get<{ versions: ConfigVersion[] }>(`/systems/${systemId}/config-versions`),
   getConfigVersion: (systemId: string, id: string) =>
     get<{ version: ConfigVersion }>(`/systems/${systemId}/config-versions/${id}`),
+  listSystemErrors: (systemId: string) =>
+    get<{ events: DeviceErrorEvent[] }>(`/systems/${systemId}/errors`),
 
   listMcpTokens: () => get<{ tokens: ApiToken[] }>("/settings/mcp-tokens"),
   createMcpToken: (label: string) => post<{ token: ApiToken }>("/settings/mcp-tokens", { label }),
