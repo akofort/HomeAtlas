@@ -1,12 +1,14 @@
-"""Write-capable SSH administration -- the counterpart `probe_auth.py` explicitly is not.
+"""Write-capable remote administration -- the counterpart `probe_auth.py` explicitly is not.
 
 Everything here changes something on a remote device (installs a key, opens an interactive shell,
-starts/stops a container over SSH) or is meant only to feed such an action. `probe_auth.py`'s
-entire reason to exist is to be provably read-only; mixing write paths into it would make that
-claim false. So this module stands apart, and never imports from `probe_auth.py` (nor is it
-imported by it) even though the SSH connection setup below is near-identical -- the duplication is
-deliberate, not an oversight: `probe_auth.py`'s import graph must never touch a module that can
-write to a device.
+starts/stops a container or Proxmox guest over SSH, reboots a host) or is meant only to feed such
+an action. `probe_auth.py`'s entire reason to exist is to be provably read-only; mixing write paths
+into it would make that claim false. So this module stands apart, and never imports from
+`probe_auth.py` (nor is it imported by it) even though the SSH connection setup below is
+near-identical -- the duplication is deliberate, not an oversight: `probe_auth.py`'s import graph
+must never touch a module that can write to a device. `reboot_fritzbox` is the one function here
+that writes over HTTP (a TR-064 SOAP action) rather than SSH -- same duplication-over-import
+reasoning applies to its overlap with `probe_auth.probe_fritzbox`'s read-only GetInfo calls.
 
 Reachable only from `main.py`'s admin-gated REST/WebSocket routes. Never imported by `tools.py`
 (the LLM's tool-calling surface) -- a human clicking a button in the browser is the only caller
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import shlex
 
+import httpx
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
@@ -33,6 +36,10 @@ _SSH_DIR_PATH = ".ssh"
 # Same allowlist discipline as probe_auth._SSH_COMMANDS, just for a write action: this is the
 # only place the three literals below are ever chosen from, never free text.
 _DOCKER_ACTIONS = ("start", "stop", "restart")
+
+# Duplicate of probe_auth._TR064_PORT -- see module docstring for why this file never imports
+# probe_auth.
+_TR064_PORT = 49000
 
 
 def generate_keypair(comment: str = "") -> tuple[str, str]:
@@ -202,12 +209,39 @@ async def list_remote_containers(host: str, account: dict, port: int = 0) -> dic
     return {"ok": True, "error": "", "containers": containers}
 
 
+async def remote_container_logs(host: str, account: dict, container_id: str, port: int = 0, tail: int = 200) -> dict:
+    """The last `tail` lines of a remote container's Docker logs, fetched once over SSH rather
+    than followed live -- an ordinary `connection.run()` (request/response) is enough for that and
+    avoids building a second streaming/relay path next to the local `docker_admin.stream_logs`
+    one, which talks to the Docker socket directly and has no SSH equivalent here."""
+    import asyncssh
+
+    try:
+        connect_args = _connect_args(host, account, port)
+    except (ValueError, KeyError) as exc:
+        return {"ok": False, "error": f"Der hinterlegte Zugang ließ sich nicht lesen: {exc}", "text": ""}
+
+    command = f"docker logs --tail {int(tail)} {shlex.quote(container_id)} 2>&1"
+    try:
+        async with asyncssh.connect(**connect_args) as connection:
+            result = await connection.run(command, check=False)
+    except Exception as exc:  # noqa: BLE001 -- connection errors are an expected, reportable outcome
+        return {"ok": False, "error": f"Verbindung zu {host} fehlgeschlagen: {exc}", "text": ""}
+
+    if result.exit_status != 0:
+        return {"ok": False, "error": _docker_error(result.stdout or "", connect_args["username"]), "text": ""}
+    return {"ok": True, "error": "", "text": result.stdout or "(keine Ausgabe)"}
+
+
 def _parse_pct_list(text: str) -> list[dict]:
     """LXC containers from `pct list`'s own table (`VMID  Status  [Lock]  Name` -- the Lock column
     only appears when a guest currently has one). Column count therefore varies, so this reads the
     first token as VMID, the second as Status, and the *last* as Name rather than assuming a fixed
     width -- LXC hostnames don't contain spaces, so "last token" is always the name regardless of
-    whether Lock was present."""
+    whether Lock was present. `node` is left empty -- `pct list` never names the local node, unlike
+    the REST listing in proxmox_probe.list_guests -- so the frontend's node-dependent actions
+    (web console) stay disabled for SSH-sourced entries; start/stop/restart and `pct exec`-based
+    logs don't need a node name, only the vmid."""
     containers = []
     for line in text.splitlines()[1:]:  # [0] is the header row
         parts = line.split()
@@ -215,14 +249,17 @@ def _parse_pct_list(text: str) -> list[dict]:
             continue
         vmid, status, name = parts[0], parts[1], parts[-1]
         containers.append({
-            "id": f"lxc/{vmid}", "name": name, "image": "LXC-Container",
+            # ":" not "/" -- see proxmox_probe.list_guests' matching comment.
+            "id": f"lxc:{vmid}", "name": name, "image": "LXC-Container",
             "state": "running" if status == "running" else "stopped", "status": status,
+            "ip": "", "node": "", "vmid": vmid, "kind": "container",
         })
     return containers
 
 
 def _parse_qm_list(text: str) -> list[dict]:
-    """VMs from `qm list`'s own fixed-column table: VMID, Name, Status, Mem(MB), Bootdisk(GB), PID."""
+    """VMs from `qm list`'s own fixed-column table: VMID, Name, Status, Mem(MB), Bootdisk(GB), PID.
+    `node` is left empty -- see `_parse_pct_list`'s docstring for why."""
     containers = []
     for line in text.splitlines()[1:]:  # [0] is the header row
         parts = line.split()
@@ -230,8 +267,10 @@ def _parse_qm_list(text: str) -> list[dict]:
             continue
         vmid, name, status = parts[0], parts[1], parts[2]
         containers.append({
-            "id": f"qemu/{vmid}", "name": name, "image": "VM (QEMU/KVM)",
+            # ":" not "/" -- see proxmox_probe.list_guests' matching comment.
+            "id": f"qemu:{vmid}", "name": name, "image": "VM (QEMU/KVM)",
             "state": "running" if status == "running" else "stopped", "status": status,
+            "ip": "", "node": "", "vmid": vmid, "kind": "vm",
         })
     return containers
 
@@ -268,6 +307,67 @@ async def list_remote_proxmox_guests(host: str, account: dict, port: int = 0) ->
         + (_parse_qm_list(vm_result.stdout or "") if vm_result.exit_status == 0 else [])
     )
     return {"ok": True, "error": "", "containers": containers}
+
+
+# Same mapping as proxmox_admin._ACTIONS -- duplicated rather than imported, same reasoning as the
+# rest of this module (see its docstring): proxmox_admin is itself a write-capable module and this
+# file already stands apart from every read-only module it has a counterpart to.
+_PROXMOX_GUEST_ACTIONS = {"start": "start", "stop": "shutdown", "restart": "reboot"}
+
+
+async def run_remote_proxmox_guest_command(host: str, account: dict, kind: str, vmid: str,
+                                           action: str, port: int = 0) -> dict:
+    """SSH fallback for starting/stopping/restarting one VM or LXC guest -- used when
+    proxmox_admin.guest_action's REST call fails, or no Proxmox API-token account is stored at
+    all, only an SSH login to the Proxmox host itself. Uses the native `pct`/`qm` subcommands,
+    never `docker` -- same reasoning as `list_remote_proxmox_guests`."""
+    import asyncssh
+
+    proxmox_action = _PROXMOX_GUEST_ACTIONS.get(action)
+    if proxmox_action is None:
+        return {"ok": False, "error": f"Unbekannte Aktion '{action}'."}
+    try:
+        connect_args = _connect_args(host, account, port)
+    except (ValueError, KeyError) as exc:
+        return {"ok": False, "error": f"Der hinterlegte Zugang ließ sich nicht lesen: {exc}"}
+
+    tool = "pct" if kind == "container" else "qm"
+    command = f"{tool} {proxmox_action} {shlex.quote(str(vmid))}"
+    try:
+        async with asyncssh.connect(**connect_args) as connection:
+            result = await connection.run(command, check=False)
+    except Exception as exc:  # noqa: BLE001 -- connection errors are an expected, reportable outcome
+        return {"ok": False, "error": f"Verbindung zu {host} fehlgeschlagen: {exc}"}
+
+    if result.exit_status != 0:
+        return {"ok": False, "error": (result.stderr or f"{command} fehlgeschlagen.").strip()}
+    return {"ok": True, "error": ""}
+
+
+async def run_remote_lxc_journalctl(host: str, account: dict, vmid: str, port: int = 0, lines: int = 200) -> dict:
+    """Real system-log lines for one LXC container, via `pct exec <vmid> -- journalctl`. VM-only
+    hosts have no equivalent here -- a VM has its own separate kernel, so the Proxmox host cannot
+    read its journal without a guest agent, unlike an LXC container, which shares the host kernel
+    and can be entered directly. See proxmox_probe.guest_task_log for the REST-only alternative
+    that works for both VMs and LXC (Proxmox's own task history, not application/system output)."""
+    import asyncssh
+
+    try:
+        connect_args = _connect_args(host, account, port)
+    except (ValueError, KeyError) as exc:
+        return {"ok": False, "error": f"Der hinterlegte Zugang ließ sich nicht lesen: {exc}", "text": ""}
+
+    command = f"pct exec {shlex.quote(str(vmid))} -- journalctl -n {int(lines)} --no-pager"
+    try:
+        async with asyncssh.connect(**connect_args) as connection:
+            result = await connection.run(command, check=False)
+    except Exception as exc:  # noqa: BLE001 -- connection errors are an expected, reportable outcome
+        return {"ok": False, "error": f"Verbindung zu {host} fehlgeschlagen: {exc}", "text": ""}
+
+    if result.exit_status != 0:
+        return {"ok": False, "error": (result.stderr or "journalctl fehlgeschlagen -- läuft der Container?").strip(),
+                "text": ""}
+    return {"ok": True, "error": "", "text": result.stdout or "(keine Ausgabe)"}
 
 
 async def run_remote_docker_command(host: str, account: dict, action: str, container_id: str, port: int = 0) -> dict:
@@ -314,3 +414,66 @@ async def open_remote_docker_exec(host: str, account: dict, container_id: str, c
         connection.close()
         raise
     return connection, process
+
+
+async def reboot_host(host: str, account: dict, port: int = 0) -> dict:
+    """Generic Linux reboot over SSH -- for any device kind that isn't a router/FRITZ!Box (see
+    `reboot_fritzbox` for that path) and isn't itself modeled as a Docker container or Proxmox
+    guest (those have their own, more specific restart actions above). Tries passwordless sudo
+    first (the common case for a non-root admin login), falling back to a bare `reboot` (works
+    when the account already IS root, the common case for a home-lab NAS/Pi login). `sudo -n`
+    fails immediately rather than waiting on a password prompt it can never receive over a
+    non-interactive SSH command, so this never hangs until the connection's own timeout."""
+    import asyncssh
+
+    try:
+        connect_args = _connect_args(host, account, port)
+    except (ValueError, KeyError) as exc:
+        return {"ok": False, "error": f"Der hinterlegte Zugang ließ sich nicht lesen: {exc}"}
+
+    command = "sudo -n reboot 2>/dev/null || reboot"
+    try:
+        async with asyncssh.connect(**connect_args) as connection:
+            result = await connection.run(command, check=False)
+    except Exception as exc:  # noqa: BLE001 -- connection errors are an expected, reportable outcome
+        return {"ok": False, "error": f"Verbindung zu {host} fehlgeschlagen: {exc}"}
+
+    if result.exit_status != 0:
+        return {"ok": False, "error": (result.stderr or "reboot fehlgeschlagen.").strip()}
+    return {"ok": True, "error": ""}
+
+
+async def reboot_fritzbox(host: str, account: dict, port: int = 0) -> dict:
+    """Reboots an AVM FRITZ!Box (or another TR-064-capable router) via the DeviceConfig:1#Reboot
+    SOAP action -- the one write call this module makes over HTTP rather than SSH, since a router
+    in a home network is essentially never reachable over SSH. Same credential shape and Digest
+    auth as probe_auth.probe_fritzbox's read-only GetInfo call, duplicated rather than imported
+    for the same reason as the SSH connection setup above: this module never imports probe_auth.
+    `port` is accepted for signature symmetry with every other function here but ignored -- TR-064
+    is always on 49000, never the account's own `port` field (that's the login's SSH/HTTP port,
+    a different, unrelated setting)."""
+    secret, _ = _decode_secret(account)
+    username = (account.get("username") or "").strip()
+    envelope = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+        's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
+        '<u:Reboot xmlns:u="urn:dslforum-org:service:DeviceConfig:1" />'
+        "</s:Body></s:Envelope>"
+    )
+    base = f"http://{host}:{_TR064_PORT}"
+    try:
+        async with httpx.AsyncClient(timeout=_SSH_TIMEOUT, auth=httpx.DigestAuth(username, secret)) as client:
+            response = await client.post(
+                f"{base}/upnp/control/deviceconfig",
+                content=envelope.encode(),
+                headers={
+                    "Content-Type": 'text/xml; charset="utf-8"',
+                    "SoapAction": "urn:dslforum-org:service:DeviceConfig:1#Reboot",
+                },
+            )
+        if response.status_code >= 400:
+            return {"ok": False, "error": f"TR-064-Neustart fehlgeschlagen (HTTP {response.status_code})."}
+        return {"ok": True, "error": ""}
+    except httpx.HTTPError as exc:
+        return {"ok": False, "error": f"Verbindung zu {host} fehlgeschlagen: {exc}"}

@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 
 from . import (auth, crypto, db, diagnostics, docker_admin, docker_probe, docs, llm_providers,
                mcp_server, model_catalog, monitor as monitor_module, oui, pipeline, probe_auth,
-               proxmox_probe, remote_admin, security, topology, tools)
+               proxmox_admin, proxmox_probe, remote_admin, security, topology, tools)
 
 logger = logging.getLogger("homeatlas")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -937,10 +937,32 @@ def _proxmox_account(system_id: str) -> dict | None:
     """The "proxmox"-category account attached to this system, if any -- the same signal
     proxmox_probe.py/pipeline.py already treat as "this system row IS the Proxmox host" (see
     AccountsPage.tsx's own hint to attach that credential to the host itself). Used to route
-    `list_remote_containers` and its action/console counterparts to the pct/qm/REST path instead
-    of Docker -- a Proxmox host has no Docker CLI at all, see remote_admin.list_remote_proxmox_
-    guests' docstring for the bug this avoids."""
+    `list_remote_containers` and its action/console/logs counterparts to the pct/qm/REST path
+    instead of Docker -- a Proxmox host has no Docker CLI at all, see remote_admin.list_remote_
+    proxmox_guests' docstring for the bug this avoids."""
     return next((a for a in db.list_accounts(system_id) if a.get("category") == "proxmox"), None)
+
+
+def _parse_proxmox_guest_id(container_id: str) -> tuple[str, str, str] | None:
+    """(node, kind, vmid) from a container_id in either the REST-sourced "{node}:{qemu|lxc}:
+    {vmid}" shape (proxmox_probe.list_guests) or the SSH-sourced "{qemu|lxc}:{vmid}" shape
+    (remote_admin._parse_pct_list/_parse_qm_list, which never learns the node's own name). ":" not
+    "/" -- container_id is a single FastAPI path segment (`{container_id}` below), and a literal
+    slash inside it would split into extra segments and break routing. `kind` here matches
+    proxmox_probe's/proxmox_admin's own vocabulary ("vm"/"container"), not the raw API path
+    segment. `node` is "" when unknown -- callers that need it (REST actions, the task log) must
+    check for that themselves and fall back or fail accordingly."""
+    parts = container_id.split(":")
+    if len(parts) == 3:
+        node, path, vmid = parts
+    elif len(parts) == 2:
+        node, path, vmid = "", parts[0], parts[1]
+    else:
+        return None
+    kind = {"qemu": "vm", "lxc": "container"}.get(path)
+    if kind is None or not vmid.isdigit():
+        return None
+    return node, kind, vmid
 
 
 @app.get("/api/systems/{system_id}/remote-containers")
@@ -957,13 +979,15 @@ async def list_remote_containers(system_id: str, accountId: str = "", _: dict = 
             result = await remote_admin.list_remote_proxmox_guests(host, account)
         if not result["ok"]:
             raise HTTPException(status_code=400, detail=result["error"])
-        return {"containers": result["containers"]}
+        # proxmoxUrl lets the frontend build a link straight into Proxmox's own noVNC web console
+        # (?console=kvm|lxc&node=&vmid=) -- HomeAtlas never proxies that console itself.
+        return {"containers": result["containers"], "proxmoxUrl": proxmox_account.get("url") or ""}
 
     _system, account, host = _remote_host_and_account(system_id, accountId)
     result = await remote_admin.list_remote_containers(host, account)
     if not result["ok"]:
         raise HTTPException(status_code=400, detail=result["error"])
-    return {"containers": result["containers"]}
+    return {"containers": result["containers"], "proxmoxUrl": ""}
 
 
 @app.post("/api/systems/{system_id}/remote-containers/{container_id}/{action}")
@@ -971,16 +995,125 @@ async def remote_container_action(system_id: str, container_id: str, action: str
                                   request: Request, user: dict = Depends(require_admin)) -> dict:
     if action not in ("start", "stop", "restart"):
         raise HTTPException(status_code=404, detail="Unbekannte Aktion.")
-    if _proxmox_account(system_id) is not None:
-        raise HTTPException(status_code=400, detail=(
-            "Docker-Aktionen sind auf einem Proxmox-Host nicht möglich -- VMs/LXC-Container werden "
-            "über Proxmox selbst gesteuert (Weboberfläche oder pct/qm)."
-        ))
-    system, account, host = _remote_host_and_account(system_id, accountId)
+    system = db.get_system(system_id)
+    if system is None:
+        raise HTTPException(status_code=404, detail="Gerät nicht gefunden.")
+
+    proxmox_account = _proxmox_account(system_id)
+    if proxmox_account is not None:
+        parsed = _parse_proxmox_guest_id(container_id)
+        if parsed is None:
+            raise HTTPException(status_code=400, detail="Ungültige Container-/VM-ID.")
+        node, kind, vmid = parsed
+        result = None
+        if node:
+            token_id = proxmox_account.get("username") or ""
+            token_secret = crypto.decrypt(proxmox_account.get("secretEnc") or "")
+            result = await proxmox_admin.guest_action(
+                proxmox_account.get("url") or "", token_id, token_secret, node, kind, vmid, action)
+        if (result is None or not result["ok"]) and accountId:
+            # REST unreachable/misconfigured (or no node known -- an SSH-sourced listing) -- fall
+            # back to the native pct/qm CLI over SSH, same posture as the listing route above.
+            _system, account, host = _remote_host_and_account(system_id, accountId)
+            result = await remote_admin.run_remote_proxmox_guest_command(host, account, kind, vmid, action)
+        if result is None:
+            raise HTTPException(status_code=400, detail=(
+                "Proxmox-API nicht erreichbar und kein SSH-Zugang für den Ausweich-Befehl ausgewählt."))
+        ip, agent = _client(request)
+        db.log_access(f"container.proxmox.{action}", user=user, ip=ip, user_agent=agent, ok=result["ok"],
+                      detail=f"{system['name']}: {container_id}")
+        if not result["ok"]:
+            raise HTTPException(status_code=400, detail=result["error"])
+        return {"ok": True}
+
+    _system, account, host = _remote_host_and_account(system_id, accountId)
     result = await remote_admin.run_remote_docker_command(host, account, action, container_id)
     ip, agent = _client(request)
     db.log_access(f"container.remote.{action}", user=user, ip=ip, user_agent=agent, ok=result["ok"],
                   detail=f"{system['name']}: {container_id[:12]}")
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return {"ok": True}
+
+
+@app.get("/api/systems/{system_id}/remote-containers/{container_id}/logs")
+async def remote_container_logs(system_id: str, container_id: str, accountId: str = "", mode: str = "",
+                                _: dict = Depends(require_admin)) -> dict:
+    """Text-based logs for one remote Docker container or Proxmox guest -- a one-shot fetch (last
+    N lines / a task history), not a live tail, so this is a plain GET returning JSON rather than
+    a websocket relay like the console routes above.
+
+    For a Proxmox guest, `mode` picks the source: "journal" runs `journalctl` inside an LXC
+    container over SSH (real system-log lines, LXC-only -- see remote_admin.run_remote_lxc_
+    journalctl); anything else (the default) reads Proxmox's own REST task history for the guest
+    (proxmox_probe.guest_task_log), which needs `node` to be known and therefore only works for
+    guests the REST listing itself returned, not ones only discovered via the SSH pct/qm fallback."""
+    proxmox_account = _proxmox_account(system_id)
+    if proxmox_account is not None:
+        parsed = _parse_proxmox_guest_id(container_id)
+        if parsed is None:
+            raise HTTPException(status_code=400, detail="Ungültige Container-/VM-ID.")
+        node, kind, vmid = parsed
+        if mode == "journal":
+            if kind != "container":
+                raise HTTPException(status_code=400, detail="journalctl ist nur für LXC-Container verfügbar.")
+            if not accountId:
+                raise HTTPException(status_code=400, detail="Für journalctl wird ein SSH-Zugang benötigt.")
+            _system, account, host = _remote_host_and_account(system_id, accountId)
+            result = await remote_admin.run_remote_lxc_journalctl(host, account, vmid)
+        else:
+            if not node:
+                raise HTTPException(status_code=400, detail=(
+                    "Das Aufgabenprotokoll ist nur über die Proxmox-API verfügbar -- dieser Gast wurde "
+                    "nur über den SSH-Ausweichweg gefunden, der den Node-Namen nicht kennt."
+                ))
+            token_id = proxmox_account.get("username") or ""
+            token_secret = crypto.decrypt(proxmox_account.get("secretEnc") or "")
+            result = await proxmox_probe.guest_task_log(
+                proxmox_account.get("url") or "", token_id, token_secret, node, vmid)
+        if not result["ok"]:
+            raise HTTPException(status_code=400, detail=result["error"])
+        return {"text": result["text"]}
+
+    _system, account, host = _remote_host_and_account(system_id, accountId)
+    result = await remote_admin.remote_container_logs(host, account, container_id)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return {"text": result["text"]}
+
+
+@app.post("/api/systems/{system_id}/reboot")
+async def reboot_system(system_id: str, accountId: str, request: Request,
+                        user: dict = Depends(require_admin)) -> dict:
+    """Reboots the device itself (not a Docker container or Proxmox guest -- those have their own,
+    more specific restart actions above). Two paths, chosen by what the device is: a FRITZ!Box or
+    other TR-064 router reboots over its own management HTTP port with the "login" credential
+    already used for its read-only GetInfo probe (see probe_auth.probe_fritzbox); anything else
+    needs an SSH-eligible credential and gets a generic Linux `reboot`. Routers essentially never
+    run SSH and Linux hosts essentially never speak TR-064, so this is a real either/or, not an
+    arbitrary priority order."""
+    system, account = db.get_system(system_id), db.get_account(accountId)
+    if system is None or account is None or account.get("systemId") != system_id:
+        raise HTTPException(status_code=404, detail="Gerät oder Zugang nicht gefunden.")
+    host = (system.get("ip") or system.get("hostname") or "").strip()
+    if not host:
+        raise HTTPException(status_code=400, detail="Für dieses Gerät ist keine Adresse hinterlegt.")
+
+    is_fritzbox = "fritz" in " ".join(
+        [system.get("vendor", ""), system.get("model", ""), system.get("name", "")]
+    ).lower()
+    if is_fritzbox or system.get("kind") == "router":
+        if account.get("category") not in ("login", "router"):
+            raise HTTPException(status_code=400, detail=(
+                "Für einen Router-Neustart wird der TR-064-Zugang (Kategorie „Login“) benötigt."))
+        result = await remote_admin.reboot_fritzbox(host, account)
+    else:
+        if not _ssh_eligible(account):
+            raise HTTPException(status_code=400, detail="Für einen Neustart wird ein SSH-Zugang benötigt.")
+        result = await remote_admin.reboot_host(host, account)
+
+    ip, agent = _client(request)
+    db.log_access("system.reboot", user=user, ip=ip, user_agent=agent, ok=result["ok"], detail=system["name"])
     if not result["ok"]:
         raise HTTPException(status_code=400, detail=result["error"])
     return {"ok": True}
@@ -1349,7 +1482,7 @@ async def dashboard(_: dict = Depends(current_user)) -> dict:
         "criticalSystems": [
             {**s, "monitorPortsEffective": monitor_module.effective_ports(s)[0]}
             for s in systems if s["importance"] == "critical"
-        ][:8],
+        ][:10],
         "monitorIntervalSeconds": settings.get("monitorIntervalSeconds", 10),
         "monitorEnabled": settings.get("monitorEnabled", True),
         "recentlyChanged": sorted(systems, key=lambda s: s["updatedAt"], reverse=True)[:8],

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from datetime import datetime, timezone
 
 import httpx
 
@@ -202,12 +203,13 @@ _KIND_LABEL = {"vm": "VM (QEMU/KVM)", "container": "LXC-Container"}
 
 
 async def list_guests(base_url: str, token_id: str, token_secret: str) -> dict:
-    """Returns {"ok", "error", "containers": [...]}. A lean node/VM/LXC listing for the "VMs &
-    LXC-Container laden" button on a Proxmox host's own device page in the UI -- unlike `probe()`
-    above, this never touches the inventory and skips the per-guest `/config` round trip (MAC/IP/
-    notes/tags), since the button only needs name/kind/status, not everything a full scan collects.
+    """Returns {"ok", "error", "containers": [...]}. A VM/LXC listing for the "VMs &
+    LXC-Container laden" card on a Proxmox host's own device page in the UI -- fetches each
+    guest's `/config` in parallel (same call `probe()` makes, via `_guest_details`) so the card can
+    show an IP address and so start/stop/restart/console/logs have the `node`/`vmid`/`kind` they
+    need; unlike `probe()` this never touches the inventory.
 
-    `containers` entries share their shape (id/name/image/state/status) with remote_admin.
+    `containers` entries share their base shape (id/name/image/state/status) with remote_admin.
     list_remote_containers' Docker listing so the frontend can render both with one table -- but
     Docker is never involved on the Proxmox path: this is the primary source main.py's
     `list_remote_containers` route uses for a system with a "proxmox"-category account attached,
@@ -243,17 +245,26 @@ async def list_guests(base_url: str, token_id: str, token_secret: str) -> dict:
                         # them" -- see the `errors` check below.
                         errors.append(f"{node}/{path}: {exc}")
                         continue
-                    for guest in guests:
-                        vmid = guest.get("vmid")
-                        if vmid is None:
-                            continue
+                    valid_guests = [g for g in guests if g.get("vmid") is not None]
+                    details = await asyncio.gather(*(
+                        _guest_details(client, base_url, node, kind, int(g["vmid"])) for g in valid_guests
+                    ))
+                    for guest, detail in zip(valid_guests, details):
+                        vmid = guest["vmid"]
                         status = guest.get("status") or "unbekannt"
                         containers.append({
-                            "id": f"{node}/{path}/{vmid}",
+                            # ":" not "/" -- a literal slash inside a single FastAPI path segment
+                            # (`{container_id}` in main.py's remote-containers routes) would split
+                            # into extra path segments and break routing entirely.
+                            "id": f"{node}:{path}:{vmid}",
                             "name": guest.get("name") or f"{'VM' if kind == 'vm' else 'LXC'} {vmid}",
                             "image": f"{_KIND_LABEL[kind]} · Node {node}",
                             "state": "running" if status == "running" else "stopped",
                             "status": status,
+                            "ip": detail["ip"],
+                            "node": node,
+                            "vmid": str(vmid),
+                            "kind": kind,
                         })
             if not containers and errors:
                 return {"ok": False, "containers": [], "error": (
@@ -264,3 +275,45 @@ async def list_guests(base_url: str, token_id: str, token_secret: str) -> dict:
             return {"ok": True, "error": "", "containers": containers}
     except (httpx.HTTPError, ValueError, KeyError) as exc:
         return {"ok": False, "error": f"Proxmox-Host nicht erreichbar: {exc}", "containers": []}
+
+
+async def guest_task_log(base_url: str, token_id: str, token_secret: str, node: str, vmid: str) -> dict:
+    """The Proxmox task history for one guest (start/stop/restart/backup/... and their outcome) --
+    not application/system output, which the REST API has no access to at all (a VM's console
+    output needs a VNC/serial session, not a GET request; see remote_admin.run_remote_lxc_
+    journalctl for the LXC-only alternative that does read real system logs). Reads `/nodes/{node}
+    /tasks` filtered to this guest, newest first, then fetches each task's own log lines. Capped at
+    the 20 most recent tasks -- this is a history view, not a live tail."""
+    base_url = (base_url or "").rstrip("/")
+    if not base_url:
+        return {"ok": False, "error": "Keine Adresse für den Proxmox-Host hinterlegt.", "text": ""}
+    if not token_id or not token_secret:
+        return {"ok": False, "error": "API-Token-ID oder -Secret fehlt.", "text": ""}
+
+    headers = {"Authorization": f"PVEAPIToken={token_id}={token_secret}"}
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, headers=headers) as client:
+            tasks = (await _get(client, base_url, f"/nodes/{node}/tasks?vmid={vmid}&limit=20")).get("data") or []
+            tasks.sort(key=lambda t: t.get("starttime") or 0, reverse=True)
+            blocks = []
+            for task in tasks:
+                upid = task.get("upid")
+                if not upid:
+                    continue
+                try:
+                    log_lines = (await _get(client, base_url, f"/nodes/{node}/tasks/{upid}/log")).get("data") or []
+                except (httpx.HTTPError, ValueError):
+                    log_lines = []
+                when = task.get("starttime")
+                header = f"=== {task.get('type', 'Aufgabe')} ({task.get('status', 'unbekannt')})"
+                if when:
+                    header += f" -- {datetime.fromtimestamp(when, tz=timezone.utc).astimezone().strftime('%Y-%m-%d %H:%M:%S')}"
+                header += " ==="
+                body = "\n".join(line.get("t", "") for line in log_lines) or "(keine Ausgabe)"
+                blocks.append(f"{header}\n{body}")
+            text = "\n\n".join(blocks)
+        if not text:
+            return {"ok": True, "error": "", "text": "Kein Aufgabenprotokoll für diesen Gast vorhanden."}
+        return {"ok": True, "error": "", "text": text[-20000:]}
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        return {"ok": False, "error": f"Proxmox-Host nicht erreichbar: {exc}", "text": ""}

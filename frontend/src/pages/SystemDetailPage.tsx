@@ -49,6 +49,8 @@ export default function SystemDetailPage() {
   const [logLines, setLogLines] = useState("");
   const [showDockerConsole, setShowDockerConsole] = useState(false);
   const logsAbortRef = useRef<AbortController | null>(null);
+  const [rebootBusy, setRebootBusy] = useState(false);
+  const [rebootNotice, setRebootNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
 
   useEffect(() => {
     api
@@ -205,6 +207,20 @@ export default function SystemDetailPage() {
     setShowLogs(false);
   }
 
+  async function rebootDevice(accountId: string) {
+    if (!window.confirm(`„${system?.name}" wirklich neu starten? Das Gerät ist währenddessen kurz nicht erreichbar.`)) return;
+    setRebootBusy(true);
+    setRebootNotice(null);
+    try {
+      await api.rebootSystem(id, accountId);
+      setRebootNotice({ kind: "ok", text: "Neustart ausgelöst." });
+    } catch (e) {
+      setRebootNotice({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setRebootBusy(false);
+    }
+  }
+
   async function generateKeyForThisDevice() {
     setKeyGenBusy(true);
     setKeyGenNotice(null);
@@ -237,6 +253,13 @@ export default function SystemDetailPage() {
   // the backend's _remote_host_and_account/_proxmox_account only ever look at that field, so a
   // group-assigned account (viaAssignment) can be shown in the Zugänge table but can't drive them.
   const directAccounts = accounts.filter((a) => !a.viaAssignment);
+  // Same is_fritzbox heuristic as the backend's own POST /systems/{id}/reboot -- a router almost
+  // never runs SSH, and a Linux host almost never speaks TR-064, so exactly one of these two
+  // credential shapes applies to a given device, never both.
+  const looksLikeFritzbox = [system.vendor, system.model, system.name].join(" ").toLowerCase().includes("fritz");
+  const rebootAccount = looksLikeFritzbox || system.kind === "router"
+    ? directAccounts.find((a) => a.category === "login" || a.category === "router")
+    : directAccounts.find(sshEligible);
 
   return (
     <>
@@ -292,6 +315,11 @@ export default function SystemDetailPage() {
                 {probing ? "Frage ab…" : "Gerät auslesen"}
               </button>
             )}
+            {rebootAccount && (
+              <button className="secondary" disabled={rebootBusy} onClick={() => void rebootDevice(rebootAccount.id)}>
+                {rebootBusy ? "Starte neu…" : "Gerät neu starten"}
+              </button>
+            )}
             <button className="secondary" onClick={() => { setDraft(system); setEditing(true); }}>Bearbeiten</button>
             <button className="danger" onClick={() => void remove()}>Löschen</button>
           </div>
@@ -299,6 +327,8 @@ export default function SystemDetailPage() {
       </div>
 
       {probeNotice && <div className={`notice ${probeNotice.kind}`}>{probeNotice.text}</div>}
+
+      {rebootNotice && <div className={`notice ${rebootNotice.kind}`}>{rebootNotice.text}</div>}
 
       {saved && <div className="notice ok">Gespeichert. Diese Angaben bleiben bei künftigen Scans erhalten.</div>}
 
@@ -801,6 +831,18 @@ export default function SystemDetailPage() {
   );
 }
 
+/** Native Proxmox noVNC console URL for one guest -- opened in a new tab rather than proxied
+ *  through HomeAtlas, same reasoning as the "Weboberfläche öffnen" link elsewhere: Proxmox already
+ *  has its own authenticated console, building a second one here would just be a worse copy.
+ *  Requires `node` (only known for guests the REST listing itself returned, not ones only found
+ *  via the SSH pct/qm fallback -- see RemoteContainer's own doc comment in api.ts). */
+function proxmoxConsoleUrl(baseUrl: string, node: string, kind: RemoteContainer["kind"], vmid: string, name: string): string {
+  const params = new URLSearchParams({
+    console: kind === "vm" ? "kvm" : "lxc", novnc: "1", vmid, vmname: name, node, resize: "off", cmd: "",
+  });
+  return `${baseUrl}/?${params.toString()}`;
+}
+
 /** Docker containers (or, on a Proxmox host, its VMs/LXC containers) on a host reached over
  *  SSH/API -- for a host system (server/NAS/Proxmox-node/etc.) that isn't itself modeled as a
  *  container, unlike the local "Container-Details" card above. Needs an explicit "Laden" click
@@ -810,17 +852,23 @@ export default function SystemDetailPage() {
  *  A Proxmox host never runs a `docker` command -- it has no Docker CLI at all ("bash: line 1:
  *  docker: command not found" is the bug this branch exists to fix). `isProxmoxHost` (a
  *  "proxmox"-category account is attached to this system, same signal AccountsPage.tsx tells
- *  people to set up) switches the whole card to the read-only VM/LXC view, backed by
- *  proxmox_probe.list_guests (REST, no SSH account needed at all) with `pct list`/`qm list` over
- *  SSH as main.py's own fallback -- see its `list_remote_containers` route. Start/stop/console
- *  controls are Docker-specific and hidden here; VMs/LXC are managed through Proxmox itself. */
+ *  people to set up) switches the whole card to the VM/LXC view, backed by proxmox_probe.
+ *  list_guests (REST, no SSH account needed at all) with `pct list`/`qm list` over SSH as main.py's
+ *  own fallback -- see its `list_remote_containers` route. Start/stop/restart use the same REST
+ *  API first, falling back to `pct`/`qm` over SSH via the selected `sshAccounts` entry when REST
+ *  fails; the web console and the Proxmox task-log view need `node`, so they're only offered for
+ *  guests the REST listing itself returned. */
 function RemoteContainersCard(
   { systemId, sshAccounts, isProxmoxHost }: { systemId: string; sshAccounts: Account[]; isProxmoxHost: boolean },
 ) {
   const [accountId, setAccountId] = useState(sshAccounts[0]?.id ?? "");
   const [containers, setContainers] = useState<RemoteContainer[] | null>(null);
+  const [proxmoxUrl, setProxmoxUrl] = useState("");
   const [busyId, setBusyId] = useState("");
   const [consoleContainerId, setConsoleContainerId] = useState<string | null>(null);
+  const [logsFor, setLogsFor] = useState<{ id: string; mode: "" | "journal" } | null>(null);
+  const [logsText, setLogsText] = useState("");
+  const [logsLoading, setLogsLoading] = useState(false);
   const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -830,6 +878,7 @@ function RemoteContainersCard(
     try {
       const r = await api.listRemoteContainers(systemId, accountId);
       setContainers(r.containers);
+      setProxmoxUrl(r.proxmoxUrl);
     } catch (e) {
       setNotice({ kind: "error", text: e instanceof Error ? e.message : String(e) });
       setContainers(null);
@@ -840,7 +889,7 @@ function RemoteContainersCard(
 
   async function runAction(containerId: string, action: "start" | "stop" | "restart") {
     if (action !== "start" && !window.confirm(
-      `Container wirklich ${action === "stop" ? "stoppen" : "neu starten"}?`,
+      `${isProxmoxHost ? "Gast" : "Container"} wirklich ${action === "stop" ? "stoppen" : "neu starten"}?`,
     )) return;
     setBusyId(containerId + action);
     setNotice(null);
@@ -854,15 +903,36 @@ function RemoteContainersCard(
     }
   }
 
+  async function toggleLogs(c: RemoteContainer, mode: "" | "journal" = "") {
+    if (logsFor?.id === c.id && logsFor.mode === mode) {
+      setLogsFor(null);
+      return;
+    }
+    setLogsFor({ id: c.id, mode });
+    setLogsText("");
+    setLogsLoading(true);
+    setNotice(null);
+    try {
+      const r = await api.remoteContainerLogs(systemId, c.id, accountId, mode);
+      setLogsText(r.text);
+    } catch (e) {
+      setNotice({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+      setLogsFor(null);
+    } finally {
+      setLogsLoading(false);
+    }
+  }
+
   return (
     <div className="card">
       <h2>{isProxmoxHost ? "VMs & LXC-Container auf diesem Proxmox-Host" : "Container auf diesem Host"}</h2>
       <p className="muted" style={{ marginTop: -6 }}>
         {isProxmoxHost ? (
           <>
-            Über die Proxmox-API abgefragt (mit „pct list“/„qm list“ per SSH als Ausweichmöglichkeit,
-            falls der API-Zugang fehlschlägt) — nur lesend. Gesteuert werden VMs/LXC-Container über
-            Proxmox selbst, nicht über HomeAtlas.
+            Über die Proxmox-API abgefragt und gesteuert (mit „pct“/„qm“ per SSH als
+            Ausweichmöglichkeit, falls der API-Zugang fehlschlägt oder nicht hinterlegt ist).
+            Web-Konsole und Aufgabenprotokoll stehen nur für Gäste zur Verfügung, die über die API
+            gefunden wurden.
           </>
         ) : (
           <>
@@ -873,7 +943,7 @@ function RemoteContainersCard(
         )}
       </p>
       <div className="row" style={{ marginBottom: 12 }}>
-        {!isProxmoxHost && sshAccounts.length > 1 && (
+        {sshAccounts.length > 1 && (
           <select style={{ width: "auto" }} value={accountId} onChange={(e) => setAccountId(e.target.value)}>
             {sshAccounts.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
           </select>
@@ -894,35 +964,78 @@ function RemoteContainersCard(
         ) : (
           <div className="table-wrap">
             <table>
-              <thead><tr><th>Name</th><th>{isProxmoxHost ? "Art" : "Image"}</th><th>Zustand</th>{!isProxmoxHost && <th />}</tr></thead>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>{isProxmoxHost ? "Art" : "Image"}</th>
+                  {isProxmoxHost && <th>IP-Adresse</th>}
+                  <th>Zustand</th>
+                  <th />
+                </tr>
+              </thead>
               <tbody>
                 {containers.map((c) => (
                   <tr key={c.id}>
                     <td>{c.name}</td>
                     <td className="mono">{c.image}</td>
+                    {isProxmoxHost && <td className="mono">{c.ip || "—"}</td>}
                     <td>
                       <span className={`badge ${c.state === "running" ? "ok" : ""}`}>{c.status}</span>
                     </td>
-                    {!isProxmoxHost && (
-                      <td style={{ whiteSpace: "nowrap", width: 1 }}>
-                        <button className="secondary small" disabled={busyId !== ""}
-                                onClick={() => void runAction(c.id, "start")}>Starten</button>{" "}
-                        <button className="secondary small" disabled={busyId !== ""}
-                                onClick={() => void runAction(c.id, "stop")}>Stoppen</button>{" "}
-                        <button className="secondary small" disabled={busyId !== ""}
-                                onClick={() => void runAction(c.id, "restart")}>Neu starten</button>{" "}
-                        <button className="secondary small"
-                                onClick={() => setConsoleContainerId(consoleContainerId === c.id ? null : c.id)}>
-                          {consoleContainerId === c.id ? "Konsole schließen" : "Konsole"}
-                        </button>
-                      </td>
-                    )}
+                    <td style={{ whiteSpace: "nowrap", width: 1 }}>
+                      <button className="secondary small" disabled={busyId !== ""}
+                              onClick={() => void runAction(c.id, "start")}>Starten</button>{" "}
+                      <button className="secondary small" disabled={busyId !== ""}
+                              onClick={() => void runAction(c.id, "stop")}>Stoppen</button>{" "}
+                      <button className="secondary small" disabled={busyId !== ""}
+                              onClick={() => void runAction(c.id, "restart")}>Neu starten</button>{" "}
+                      {isProxmoxHost ? (
+                        <>
+                          {c.node && proxmoxUrl && (
+                            <button className="secondary small" onClick={() => window.open(
+                              proxmoxConsoleUrl(proxmoxUrl, c.node!, c.kind, c.vmid ?? "", c.name), "_blank", "noopener",
+                            )}>
+                              Web-Konsole ↗
+                            </button>
+                          )}{" "}
+                          {c.node && (
+                            <button className="secondary small" onClick={() => void toggleLogs(c, "")}>
+                              {logsFor?.id === c.id && logsFor.mode === "" ? "Protokoll schließen" : "Aufgabenprotokoll"}
+                            </button>
+                          )}{" "}
+                          {c.kind === "container" && accountId && (
+                            <button className="secondary small" onClick={() => void toggleLogs(c, "journal")}>
+                              {logsFor?.id === c.id && logsFor.mode === "journal" ? "Logs schließen" : "System-Logs"}
+                            </button>
+                          )}
+                        </>
+                      ) : (
+                        <>
+                          <button className="secondary small" onClick={() => void toggleLogs(c)}>
+                            {logsFor?.id === c.id ? "Logs schließen" : "Logs"}
+                          </button>{" "}
+                          <button className="secondary small"
+                                  onClick={() => setConsoleContainerId(consoleContainerId === c.id ? null : c.id)}>
+                            {consoleContainerId === c.id ? "Konsole schließen" : "Konsole"}
+                          </button>
+                        </>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
         )
+      )}
+
+      {logsFor && (
+        <pre className="mono" style={{
+          marginTop: 12, maxHeight: 320, overflow: "auto", background: "#0b1120",
+          color: "#d7dee8", padding: 12, borderRadius: 10, whiteSpace: "pre-wrap",
+        }}>
+          {logsLoading ? "Lade…" : logsText}
+        </pre>
       )}
 
       {!isProxmoxHost && consoleContainerId && (

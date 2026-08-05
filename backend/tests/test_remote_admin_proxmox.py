@@ -17,8 +17,10 @@ def test_parse_pct_list_reads_vmid_status_and_name():
     )
     containers = remote_admin._parse_pct_list(text)
     assert containers == [
-        {"id": "lxc/100", "name": "nextcloud", "image": "LXC-Container", "state": "running", "status": "running"},
-        {"id": "lxc/101", "name": "pihole", "image": "LXC-Container", "state": "stopped", "status": "stopped"},
+        {"id": "lxc:100", "name": "nextcloud", "image": "LXC-Container", "state": "running", "status": "running",
+         "ip": "", "node": "", "vmid": "100", "kind": "container"},
+        {"id": "lxc:101", "name": "pihole", "image": "LXC-Container", "state": "stopped", "status": "stopped",
+         "ip": "", "node": "", "vmid": "101", "kind": "container"},
     ]
 
 
@@ -29,7 +31,8 @@ def test_parse_pct_list_handles_a_locked_row_with_extra_column():
     )
     containers = remote_admin._parse_pct_list(text)
     assert containers == [
-        {"id": "lxc/100", "name": "nextcloud", "image": "LXC-Container", "state": "running", "status": "running"},
+        {"id": "lxc:100", "name": "nextcloud", "image": "LXC-Container", "state": "running", "status": "running",
+         "ip": "", "node": "", "vmid": "100", "kind": "container"},
     ]
 
 
@@ -46,8 +49,10 @@ def test_parse_qm_list_reads_vmid_name_and_status():
     )
     containers = remote_admin._parse_qm_list(text)
     assert containers == [
-        {"id": "qemu/100", "name": "nextcloud-vm", "image": "VM (QEMU/KVM)", "state": "running", "status": "running"},
-        {"id": "qemu/101", "name": "test-vm", "image": "VM (QEMU/KVM)", "state": "stopped", "status": "stopped"},
+        {"id": "qemu:100", "name": "nextcloud-vm", "image": "VM (QEMU/KVM)", "state": "running", "status": "running",
+         "ip": "", "node": "", "vmid": "100", "kind": "vm"},
+        {"id": "qemu:101", "name": "test-vm", "image": "VM (QEMU/KVM)", "state": "stopped", "status": "stopped",
+         "ip": "", "node": "", "vmid": "101", "kind": "vm"},
     ]
 
 
@@ -132,3 +137,91 @@ def test_list_remote_proxmox_guests_survives_qm_missing_when_pct_works(monkeypat
 
     assert result["ok"]
     assert [c["name"] for c in result["containers"]] == ["pihole"]
+
+
+def test_run_remote_proxmox_guest_command_uses_pct_for_containers_and_never_docker(monkeypatch):
+    connection = _FakeConnection({"pct reboot 101": _FakeRunResult("")})
+    monkeypatch.setattr(asyncssh, "connect", lambda **kwargs: _FakeConnectContextManager(connection))
+    monkeypatch.setattr(remote_admin, "_decode_secret", lambda account: ("hunter2", ""))
+
+    result = asyncio.run(remote_admin.run_remote_proxmox_guest_command("10.0.0.20", _account(), "container", "101", "restart"))
+
+    assert result["ok"]
+    assert connection.commands == ["pct reboot 101"]
+
+
+def test_run_remote_proxmox_guest_command_uses_qm_for_vms_and_maps_stop_to_shutdown(monkeypatch):
+    connection = _FakeConnection({"qm shutdown 202": _FakeRunResult("")})
+    monkeypatch.setattr(asyncssh, "connect", lambda **kwargs: _FakeConnectContextManager(connection))
+    monkeypatch.setattr(remote_admin, "_decode_secret", lambda account: ("hunter2", ""))
+
+    result = asyncio.run(remote_admin.run_remote_proxmox_guest_command("10.0.0.20", _account(), "vm", "202", "stop"))
+
+    assert result["ok"]
+    assert connection.commands == ["qm shutdown 202"]
+
+
+def test_run_remote_proxmox_guest_command_rejects_unknown_action(monkeypatch):
+    result = asyncio.run(remote_admin.run_remote_proxmox_guest_command("10.0.0.20", _account(), "vm", "202", "delete"))
+    assert not result["ok"]
+    assert "Unbekannte Aktion" in result["error"]
+
+
+def test_run_remote_proxmox_guest_command_reports_failure(monkeypatch):
+    connection = _FakeConnection({"pct start 101": _FakeRunResult("", 1, "unable to start")})
+    monkeypatch.setattr(asyncssh, "connect", lambda **kwargs: _FakeConnectContextManager(connection))
+    monkeypatch.setattr(remote_admin, "_decode_secret", lambda account: ("hunter2", ""))
+
+    result = asyncio.run(remote_admin.run_remote_proxmox_guest_command("10.0.0.20", _account(), "container", "101", "start"))
+
+    assert not result["ok"]
+    assert "unable to start" in result["error"]
+
+
+def test_run_remote_lxc_journalctl_uses_pct_exec_never_docker(monkeypatch):
+    connection = _FakeConnection({
+        "pct exec 101 -- journalctl -n 200 --no-pager": _FakeRunResult("Jan 01 12:00:00 host systemd[1]: Started."),
+    })
+    monkeypatch.setattr(asyncssh, "connect", lambda **kwargs: _FakeConnectContextManager(connection))
+    monkeypatch.setattr(remote_admin, "_decode_secret", lambda account: ("hunter2", ""))
+
+    result = asyncio.run(remote_admin.run_remote_lxc_journalctl("10.0.0.20", _account(), "101"))
+
+    assert result["ok"]
+    assert "Started." in result["text"]
+    assert connection.commands == ["pct exec 101 -- journalctl -n 200 --no-pager"]
+    assert not any("docker" in c for c in connection.commands)
+
+
+def test_run_remote_lxc_journalctl_reports_failure(monkeypatch):
+    connection = _FakeConnection({})  # falls through to the "not found" default -> exit 127
+    monkeypatch.setattr(asyncssh, "connect", lambda **kwargs: _FakeConnectContextManager(connection))
+    monkeypatch.setattr(remote_admin, "_decode_secret", lambda account: ("hunter2", ""))
+
+    result = asyncio.run(remote_admin.run_remote_lxc_journalctl("10.0.0.20", _account(), "999"))
+
+    assert not result["ok"]
+
+
+def test_reboot_host_tries_passwordless_sudo_then_plain_reboot(monkeypatch):
+    connection = _FakeConnection({"sudo -n reboot 2>/dev/null || reboot": _FakeRunResult("")})
+    monkeypatch.setattr(asyncssh, "connect", lambda **kwargs: _FakeConnectContextManager(connection))
+    monkeypatch.setattr(remote_admin, "_decode_secret", lambda account: ("hunter2", ""))
+
+    result = asyncio.run(remote_admin.reboot_host("10.0.0.30", _account()))
+
+    assert result["ok"]
+    assert connection.commands == ["sudo -n reboot 2>/dev/null || reboot"]
+
+
+def test_reboot_host_reports_failure(monkeypatch):
+    connection = _FakeConnection({
+        "sudo -n reboot 2>/dev/null || reboot": _FakeRunResult("", 1, "Permission denied"),
+    })
+    monkeypatch.setattr(asyncssh, "connect", lambda **kwargs: _FakeConnectContextManager(connection))
+    monkeypatch.setattr(remote_admin, "_decode_secret", lambda account: ("hunter2", ""))
+
+    result = asyncio.run(remote_admin.reboot_host("10.0.0.30", _account()))
+
+    assert not result["ok"]
+    assert "Permission denied" in result["error"]

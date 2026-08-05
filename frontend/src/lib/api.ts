@@ -240,6 +240,14 @@ export interface RemoteContainer {
   image: string;
   state: string;
   status: string;
+  /** Proxmox guests only (empty string for Docker containers). IP is only populated when the
+   *  guest was found via the Proxmox REST API, not the pct/qm SSH fallback (see backend
+   *  remote_admin._parse_pct_list/_parse_qm_list). `node` is likewise only known via REST --
+   *  it gates the web-console link and the REST-only task-log view. */
+  ip?: string;
+  node?: string;
+  vmid?: string;
+  kind?: "vm" | "container";
 }
 
 export interface ApiToken {
@@ -458,11 +466,23 @@ export const api = {
   dockerConsoleWsUrl: (systemId: string) => wsUrl(`/api/ws/systems/${systemId}/docker-console`),
 
   listRemoteContainers: (systemId: string, accountId: string) =>
-    get<{ containers: RemoteContainer[] }>(`/systems/${systemId}/remote-containers?accountId=${accountId}`),
+    get<{ containers: RemoteContainer[]; proxmoxUrl: string }>(
+      `/systems/${systemId}/remote-containers?accountId=${accountId}`,
+    ),
   remoteContainerAction: (systemId: string, containerId: string, action: "start" | "stop" | "restart", accountId: string) =>
-    post<{ ok: boolean }>(`/systems/${systemId}/remote-containers/${containerId}/${action}?accountId=${accountId}`),
+    post<{ ok: boolean }>(
+      `/systems/${systemId}/remote-containers/${encodeURIComponent(containerId)}/${action}?accountId=${accountId}`,
+    ),
+  remoteContainerLogs: (systemId: string, containerId: string, accountId: string, mode: "" | "journal" = "") =>
+    get<{ text: string }>(
+      `/systems/${systemId}/remote-containers/${encodeURIComponent(containerId)}/logs`
+      + `?accountId=${accountId}${mode ? `&mode=${mode}` : ""}`,
+    ),
   remoteDockerConsoleWsUrl: (systemId: string, accountId: string, containerId: string) =>
     wsUrl(`/api/ws/systems/${systemId}/remote-docker-console?accountId=${accountId}&containerId=${containerId}`),
+
+  rebootSystem: (systemId: string, accountId: string) =>
+    post<{ ok: boolean }>(`/systems/${systemId}/reboot?accountId=${accountId}`),
 
   listDocs: () => get<{ pages: Omit<DocPage, "bodyMd">[] }>("/docs"),
   getDoc: (slug: string) => get<{ page: DocPage }>(`/docs/${slug}`),
