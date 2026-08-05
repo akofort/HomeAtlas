@@ -44,7 +44,7 @@ scp -rq "${SSH_OPTS[@]}" \
 
 echo "==> Lade Frontend hoch"
 scp -rq "${SSH_OPTS[@]}" \
-  "$LOCAL_DIR/frontend/src" "$LOCAL_DIR/frontend/index.html" \
+  "$LOCAL_DIR/frontend/src" "$LOCAL_DIR/frontend/public" "$LOCAL_DIR/frontend/index.html" \
   "$LOCAL_DIR/frontend/package.json" "$LOCAL_DIR/frontend/package-lock.json" \
   "$LOCAL_DIR/frontend/vite.config.ts" "$LOCAL_DIR/frontend/tsconfig.json" \
   "$LOCAL_DIR/frontend/nginx.conf.template" "$LOCAL_DIR/frontend/Dockerfile" \
