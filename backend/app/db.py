@@ -692,8 +692,11 @@ def merge_systems(keep_id: str, remove_id: str) -> dict | None:
     fill_fields = ("ip", "hostname", "mac", "vendor", "model", "os", "location", "purpose",
                    "descriptionMd", "url", "docUrl", "docLink", "notes")
     patch = {f: remove[f] for f in fill_fields if remove.get(f) and not keep.get(f)}
-    if remove.get("importance") == "critical" and keep.get("importance") != "critical":
-        patch["importance"] = "critical"
+    # Same "never overwritten once confirmed" rule as upsert_discovered_system -- importance is a
+    # human classification, not a discovered fact, so it only carries over from the merged-away row
+    # while `keep` hasn't been confirmed yet.
+    if not keep.get("confirmed") and remove.get("importance") and remove.get("importance") != keep.get("importance"):
+        patch["importance"] = remove["importance"]
     if remove.get("confirmed") and not keep.get("confirmed"):
         patch["confirmed"] = 1
     if remove.get("monitored") and not keep.get("monitored"):
@@ -828,13 +831,10 @@ def upsert_discovered_system(found: dict) -> tuple[dict, bool]:
     is only ever a lookup fallback -- never written to the row -- so that an installation upgrading
     across the scheme change merges into its existing row instead of duplicating it.
 
-    `importance` gets one narrow exception to "never overwritten once confirmed": a finding that
-    says "critical" (currently only proxmox_probe.py, from a guest's own `critical` tag) promotes
-    an existing row straight to critical regardless of confirmed state, but never the reverse --
-    a rescan where the tag is gone (or was never there) leaves a human-set "critical" alone. Both
-    halves matter: promotion has to survive re-confirmation or tagging a VM critical in Proxmox
-    would only ever affect brand-new rows, and it has to be one-directional or the *absence* of a
-    tag this scan cycle would silently downgrade a device someone deliberately marked by hand.
+    `importance` follows the same rule as every other human-editable field below -- once a row is
+    `confirmed`, discovery/classification/Proxmox tags may no longer touch it, in either direction.
+    The classification is the user's call to make and keep; the app only ever proposes a default
+    for new or not-yet-confirmed rows.
 
     Beyond the exact-key (and legacy-key) lookups below, `find_system_for_merge` tries the same
     device under a different identity scheme entirely -- MAC, then Proxmox (node, vmid), then
@@ -865,11 +865,9 @@ def upsert_discovered_system(found: dict) -> tuple[dict, bool]:
         "lastSeen": now,
         "discoveryKey": found.get("discoveryKey") or existing["discoveryKey"],
     }
-    if found.get("importance") == "critical" and existing.get("importance") != "critical":
-        volatile["importance"] = "critical"
     if not existing["confirmed"]:
         for field in ("kind", "name", "hostname", "mac", "vendor", "model", "os", "location",
-                      "purpose", "descriptionMd", "url", "docUrl", "docLink"):
+                      "purpose", "descriptionMd", "url", "docUrl", "docLink", "importance"):
             value = found.get(field)
             if value:
                 volatile[field] = value

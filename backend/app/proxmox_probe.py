@@ -13,8 +13,9 @@ login -- and its `url` the Proxmox host's own base address. See AccountsPage.tsx
 
 Each guest's own Notes field (`description` in the API) is read too, via `parse_notes`: a
 `Doc:`/`URL:` line becomes `docLink`, and whatever text is left becomes `purpose`/`descriptionMd`.
-A `critical` Proxmox tag (`is_critical_tag`) promotes the guest to HomeAtlas's own `importance`
-field -- see db.upsert_discovered_system for why that promotion is one-directional.
+A `critical` Proxmox tag (`is_critical_tag`) sets the guest's initial `importance` in HomeAtlas the
+same way discovery's own gateway check does -- a default for new/unconfirmed rows only, never a
+later override of a classification the user has already set (see db.upsert_discovered_system).
 """
 from __future__ import annotations
 
