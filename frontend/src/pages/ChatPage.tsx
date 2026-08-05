@@ -9,6 +9,33 @@ const SUGGESTIONS = [
   "Erkläre mir, was mein Router eigentlich macht.",
 ];
 
+// The Web Speech API has no shared/standard TypeScript lib entry (Chrome/Edge still only expose
+// it under the webkit-prefixed name) -- this is the minimal shape this component actually uses,
+// not a full typing of the API.
+interface SpeechRecognitionLike extends EventTarget {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  start: () => void;
+  stop: () => void;
+  onresult: ((event: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void) | null;
+  onerror: (() => void) | null;
+  onend: (() => void) | null;
+}
+type SpeechRecognitionCtor = new () => SpeechRecognitionLike;
+const SpeechRecognitionImpl: SpeechRecognitionCtor | undefined =
+  (window as unknown as { SpeechRecognition?: SpeechRecognitionCtor; webkitSpeechRecognition?: SpeechRecognitionCtor })
+    .SpeechRecognition ??
+  (window as unknown as { SpeechRecognition?: SpeechRecognitionCtor; webkitSpeechRecognition?: SpeechRecognitionCtor })
+    .webkitSpeechRecognition;
+
+function formatMessageMeta(m: ChatMessage): string {
+  const when = new Date(m.createdAt).toLocaleString("de-DE", { dateStyle: "short", timeStyle: "medium" });
+  if (m.durationMs == null) return when;
+  const seconds = m.durationMs / 1000;
+  return `${when} · Antwort in ${seconds >= 10 ? seconds.toFixed(0) : seconds.toFixed(1)} s`;
+}
+
 export default function ChatPage() {
   const [chats, setChats] = useState<Chat[]>([]);
   const [chatId, setChatId] = useState<string>("");
@@ -17,7 +44,13 @@ export default function ChatPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [toolsUsed, setToolsUsed] = useState<string[]>([]);
+  const [recording, setRecording] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+
+  // Stop an in-flight recording rather than leaving the microphone open when the user navigates
+  // away mid-dictation.
+  useEffect(() => () => recognitionRef.current?.stop(), []);
 
   useEffect(() => {
     api.listChats().then((r) => {
@@ -56,7 +89,7 @@ export default function ChatPage() {
     // Optimistic echo so the question appears instantly; the id is replaced when the turn returns.
     const optimistic: ChatMessage = {
       id: `local-${Date.now()}`, chatId: chatId, role: "user",
-      content: trimmed, createdAt: new Date().toISOString(),
+      content: trimmed, createdAt: new Date().toISOString(), durationMs: null,
     };
     setMessages((current) => [...current, optimistic]);
     try {
@@ -72,6 +105,28 @@ export default function ChatPage() {
     } finally {
       setBusy(false);
     }
+  }
+
+  function toggleVoiceInput() {
+    if (!SpeechRecognitionImpl) return;
+    if (recording) {
+      recognitionRef.current?.stop();
+      return;
+    }
+    const recognition = new SpeechRecognitionImpl();
+    recognition.lang = "de-DE";
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.onresult = (event) => {
+      let transcript = "";
+      for (let i = 0; i < event.results.length; i++) transcript += event.results[i][0].transcript;
+      setInput(transcript);
+    };
+    recognition.onerror = () => setRecording(false);
+    recognition.onend = () => setRecording(false);
+    recognitionRef.current = recognition;
+    recognition.start();
+    setRecording(true);
   }
 
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -128,6 +183,7 @@ export default function ChatPage() {
           {messages.map((m) => (
             <div key={m.id} className={`bubble ${m.role}`}>
               {m.role === "assistant" ? <Markdown>{m.content}</Markdown> : m.content}
+              <div className="bubble-meta">{formatMessageMeta(m)}</div>
             </div>
           ))}
 
@@ -152,6 +208,17 @@ export default function ChatPage() {
             onKeyDown={onKeyDown}
             disabled={busy}
           />
+          {SpeechRecognitionImpl && (
+            <button
+              type="button"
+              className={`secondary ${recording ? "recording" : ""}`}
+              onClick={toggleVoiceInput}
+              disabled={busy}
+              title={recording ? "Aufnahme stoppen" : "Spracheingabe starten"}
+            >
+              {recording ? "⏹" : "🎤"}
+            </button>
+          )}
           <button onClick={() => void send(input)} disabled={busy || !input.trim()}>Senden</button>
         </div>
       </div>

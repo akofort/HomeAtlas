@@ -130,6 +130,7 @@ async def probe(base_url: str, token_id: str, token_secret: str) -> dict:
             nodes = (await _get(client, base_url, "/nodes")).get("data") or []
 
             systems = []
+            errors = []
             for node_entry in nodes:
                 node = node_entry.get("node", "")
                 if not node:
@@ -137,8 +138,12 @@ async def probe(base_url: str, token_id: str, token_secret: str) -> dict:
                 for kind, path in (("vm", "qemu"), ("container", "lxc")):
                     try:
                         guests = (await _get(client, base_url, f"/nodes/{node}/{path}")).get("data") or []
-                    except (httpx.HTTPError, ValueError):
-                        continue  # one node/guest-type failing must not drop the rest
+                    except (httpx.HTTPError, ValueError) as exc:
+                        # See list_guests()'s matching comment: swallowing every failure here would
+                        # make a token without its own permission grant look identical to a host
+                        # with genuinely zero guests.
+                        errors.append(f"{node}/{path}: {exc}")
+                        continue
                     valid_guests = [g for g in guests if g.get("vmid") is not None]
                     details = await asyncio.gather(*(
                         _guest_details(client, base_url, node, kind, int(g["vmid"])) for g in valid_guests
@@ -181,6 +186,12 @@ async def probe(base_url: str, token_id: str, token_secret: str) -> dict:
                             # the tag later never silently un-marks a device a human relied on.
                             system["importance"] = "critical"
                         systems.append(system)
+            if not systems and errors:
+                return {"ok": False, "systems": [], "error": (
+                    "Gäste-Liste konnte nicht gelesen werden (Berechtigung des API-Tokens prüfen -- "
+                    "bei aktivierter Privilege Separation braucht der Token eine eigene Berechtigung, "
+                    "z. B. PVEAuditor auf „/“): " + "; ".join(errors)
+                )}
             return {"ok": True, "error": "", "systems": systems}
     except (httpx.HTTPError, ValueError, KeyError) as exc:
         return {"ok": False, "error": f"Proxmox-Host nicht erreichbar: {exc}", "systems": []}
@@ -214,6 +225,7 @@ async def list_guests(base_url: str, token_id: str, token_secret: str) -> dict:
             nodes = (await _get(client, base_url, "/nodes")).get("data") or []
 
             containers = []
+            errors = []
             for node_entry in nodes:
                 node = node_entry.get("node", "")
                 if not node:
@@ -221,8 +233,15 @@ async def list_guests(base_url: str, token_id: str, token_secret: str) -> dict:
                 for kind, path in (("vm", "qemu"), ("container", "lxc")):
                     try:
                         guests = (await _get(client, base_url, f"/nodes/{node}/{path}")).get("data") or []
-                    except (httpx.HTTPError, ValueError):
-                        continue  # one node/guest-type failing must not drop the rest
+                    except (httpx.HTTPError, ValueError) as exc:
+                        # One node/guest-type failing must not drop the rest -- but if every one of
+                        # them fails (typically an API token that has no permission of its own: with
+                        # Proxmox's "Privilege Separation" a token needs its own ACL entry, separate
+                        # from the user it belongs to), an empty `containers` list would look exactly
+                        # like "this host genuinely has zero guests" instead of "token can't see
+                        # them" -- see the `errors` check below.
+                        errors.append(f"{node}/{path}: {exc}")
+                        continue
                     for guest in guests:
                         vmid = guest.get("vmid")
                         if vmid is None:
@@ -235,6 +254,12 @@ async def list_guests(base_url: str, token_id: str, token_secret: str) -> dict:
                             "state": "running" if status == "running" else "stopped",
                             "status": status,
                         })
+            if not containers and errors:
+                return {"ok": False, "containers": [], "error": (
+                    "Gäste-Liste konnte nicht gelesen werden (Berechtigung des API-Tokens prüfen -- "
+                    "bei aktivierter Privilege Separation braucht der Token eine eigene Berechtigung, "
+                    "z. B. PVEAuditor auf „/“): " + "; ".join(errors)
+                )}
             return {"ok": True, "error": "", "containers": containers}
     except (httpx.HTTPError, ValueError, KeyError) as exc:
         return {"ok": False, "error": f"Proxmox-Host nicht erreichbar: {exc}", "containers": []}

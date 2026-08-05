@@ -16,6 +16,7 @@ needs "der Router antwortet, aber das Internet dahinter nicht" rather than a pac
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shutil
 import socket
@@ -280,3 +281,61 @@ async def internet_check() -> dict:
             "explanation": verdict,
             "details": {"dns": dns_result if isinstance(dns_result, dict) else str(dns_result),
                         "ping": ping_result if isinstance(ping_result, dict) else str(ping_result)}}
+
+
+# Cloudflare's own public speed-test backend (the same one speed.cloudflare.com's page in a
+# browser talks to) -- free, no account/API key, and already the kind of well-known internet
+# infrastructure this module leans on elsewhere (1.1.1.1 for ping, gstatic for the captive-portal
+# check above), so this needs neither a new dependency nor picking some third party's server as a
+# default. Undocumented as a formal API, but stable and widely relied on by other open-source
+# speed-test tools for exactly this reason.
+_SPEEDTEST_DOWNLOAD_URL = "https://speed.cloudflare.com/__down"
+_SPEEDTEST_UPLOAD_URL = "https://speed.cloudflare.com/__up"
+_SPEEDTEST_DOWNLOAD_BYTES = 25_000_000  # 25 MB -- past TCP slow-start, so the number means something
+_SPEEDTEST_UPLOAD_BYTES = 10_000_000  # 10 MB -- uploads are usually the slower direction at home
+
+
+async def speedtest() -> dict:
+    """Measures actual internet throughput against Cloudflare's public speed-test endpoint.
+
+    Deliberately NOT wired into tools.py: every other check in this module is near-instant and a
+    few bytes, "bounded" the way the module docstring promises, so the chat assistant can run any
+    of them freely. A real speed test moves tens of megabytes and takes several seconds by design
+    -- the opposite of bounded -- so it only ever runs from an explicit button click, never
+    something an LLM decides to trigger on its own (possibly repeatedly) mid-conversation.
+
+    Latency is measured as its own near-zero-byte request rather than derived from the download
+    timing, since a multi-second bulk transfer's start-to-finish time says nothing useful about
+    round-trip time.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=8.0)) as client:
+            ping_started = time.monotonic()
+            await client.get(f"{_SPEEDTEST_DOWNLOAD_URL}?bytes=0")
+            ping_ms = (time.monotonic() - ping_started) * 1000
+
+            download_started = time.monotonic()
+            response = await client.get(f"{_SPEEDTEST_DOWNLOAD_URL}?bytes={_SPEEDTEST_DOWNLOAD_BYTES}")
+            downloaded = len(response.content)
+            download_elapsed = time.monotonic() - download_started
+            download_mbps = (downloaded * 8 / 1_000_000) / download_elapsed if download_elapsed > 0 else 0.0
+
+            payload = os.urandom(_SPEEDTEST_UPLOAD_BYTES)
+            upload_started = time.monotonic()
+            await client.post(_SPEEDTEST_UPLOAD_URL, content=payload)
+            upload_elapsed = time.monotonic() - upload_started
+            upload_mbps = (len(payload) * 8 / 1_000_000) / upload_elapsed if upload_elapsed > 0 else 0.0
+    except httpx.HTTPError as exc:
+        return {"ok": False, "error": f"Speedtest fehlgeschlagen -- ist eine Internetverbindung vorhanden? ({exc})",
+                "downloadMbps": None, "uploadMbps": None, "pingMs": None, "explanation": ""}
+
+    return {
+        "ok": True, "error": "",
+        "downloadMbps": round(download_mbps, 1),
+        "uploadMbps": round(upload_mbps, 1),
+        "pingMs": round(ping_ms),
+        "explanation": (
+            f"Download {download_mbps:.0f} Mbit/s, Upload {upload_mbps:.0f} Mbit/s, "
+            f"Latenz {ping_ms:.0f} ms (gemessen gegen speed.cloudflare.com)."
+        ),
+    }

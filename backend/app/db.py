@@ -343,6 +343,7 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("systems", "monitored", "INTEGER NOT NULL DEFAULT 0"),
     ("systems", "monitorPorts", "TEXT"),
     ("systems", "docLink", "TEXT NOT NULL DEFAULT ''"),
+    ("chatMessages", "durationMs", "INTEGER"),
 )
 
 
@@ -659,6 +660,62 @@ def delete_system(system_id: str) -> None:
         conn.execute("DELETE FROM systems WHERE id = ?", (system_id,))
 
 
+def merge_systems(keep_id: str, remove_id: str) -> dict | None:
+    """Folds `remove_id` into `keep_id` as one physical device on record under two inventory rows
+    -- the case this exists for is a multi-homed router discovered once per subnet interface (no
+    shared MAC across interfaces for `upsert_discovered_system`'s own merge heuristics to catch,
+    since each interface only speaks on its own subnet) plus, commonly, a further hand-created row
+    for the same box. There is no automatic detection for this -- unlike upsert's MAC/Proxmox/
+    IP+hostname fallbacks, "two rows are actually the same multi-homed device" has no reliable
+    signal to key off of, so a human picks the pair and which one survives.
+
+    `keep_id` wins every field conflict; blank fields on it are filled from `remove_id` (same
+    "new information, not an overwrite" rule as upsert_discovered_system's confirmed-row branch),
+    and `remove_id`'s `confirmed`/`monitored` state is carried over if `keep_id` doesn't already
+    have it, so a human-confirmed or monitored duplicate never silently loses that status to the
+    row it's merged into. Every other table that points at `remove_id` by systemId is repointed to
+    `keep_id` rather than dropped, so its accounts, config/error history and monitor events survive
+    the merge instead of vanishing with the deleted row -- same manual-cleanup convention as
+    delete_system above, since this codebase declares no FK constraints anywhere.
+    """
+    if keep_id == remove_id:
+        return get_system(keep_id)
+    keep, remove = get_system(keep_id), get_system(remove_id)
+    if keep is None or remove is None:
+        return None
+
+    # "ip" is included despite a multi-homed router having more than one real address -- an empty
+    # `ip` on the surviving row would break everything keyed off it (monitoring, the SSH console,
+    # the device list's address column), so the row still needs *a* reachable address even though
+    # topology.py's Layer-3 view separately reads every interface address from its own probe data,
+    # not this field.
+    fill_fields = ("ip", "hostname", "mac", "vendor", "model", "os", "location", "purpose",
+                   "descriptionMd", "url", "docUrl", "docLink", "notes")
+    patch = {f: remove[f] for f in fill_fields if remove.get(f) and not keep.get(f)}
+    if remove.get("importance") == "critical" and keep.get("importance") != "critical":
+        patch["importance"] = "critical"
+    if remove.get("confirmed") and not keep.get("confirmed"):
+        patch["confirmed"] = 1
+    if remove.get("monitored") and not keep.get("monitored"):
+        patch["monitored"] = 1
+        patch["monitorPorts"] = remove.get("monitorPorts")
+    if patch:
+        update_system(keep_id, patch)
+
+    with _conn() as conn:
+        conn.execute("UPDATE systems SET parentId = ? WHERE parentId = ?", (keep_id, remove_id))
+        conn.execute("UPDATE accounts SET systemId = ? WHERE systemId = ?", (keep_id, remove_id))
+        conn.execute(
+            "UPDATE accountAssignments SET targetValue = ? WHERE targetType = 'system' AND targetValue = ?",
+            (keep_id, remove_id),
+        )
+        conn.execute("UPDATE monitorEvents SET systemId = ? WHERE systemId = ?", (keep_id, remove_id))
+        conn.execute("UPDATE deviceConfigVersions SET systemId = ? WHERE systemId = ?", (keep_id, remove_id))
+        conn.execute("UPDATE deviceErrorEvents SET systemId = ? WHERE systemId = ?", (keep_id, remove_id))
+        conn.execute("DELETE FROM systems WHERE id = ?", (remove_id,))
+    return get_system(keep_id)
+
+
 def find_system_by_key(discovery_key: str) -> dict | None:
     if not discovery_key:
         return None
@@ -898,14 +955,38 @@ def update_account(account_id: str, patch: dict) -> dict | None:
     return get_account(account_id)
 
 
+def _assigned_account_ids(conn, system: dict) -> set[str]:
+    """Ids of accounts reaching `system` through an `accountAssignments` rule -- assigned straight
+    to this system's id, to its `kind` (e.g. every "router"), or to a subnet its IP falls inside.
+    Shared by `list_probe_accounts` (which additionally requires `allowProbe`) and
+    `list_assigned_accounts` (which doesn't, since that one is for display, not for deciding what
+    a scan may actually run)."""
+    system_id = system["id"]
+    assigned_ids = {
+        row["accountId"] for row in conn.execute(
+            "SELECT accountId FROM accountAssignments WHERE "
+            "(targetType = 'system' AND targetValue = ?) OR "
+            "(targetType = 'kind' AND targetValue = ?)",
+            (system_id, system.get("kind") or ""),
+        )
+    }
+    ip = (system.get("ip") or "").strip()
+    if ip:
+        for row in conn.execute(
+            "SELECT accountId, targetValue FROM accountAssignments WHERE targetType = 'subnet'"
+        ):
+            if _ip_in_subnet(ip, row["targetValue"]):
+                assigned_ids.add(row["accountId"])
+    return assigned_ids
+
+
 def list_probe_accounts(system_id: str) -> list[dict]:
     """Credentials a human explicitly cleared for authenticated read-only probing of this device --
     either attached directly (`accounts.systemId`) or reaching it through a group/multi-device
-    credential profile (see `list_account_assignments`'s own docstring): assigned straight to this
-    system's id, to its `kind` (e.g. every "router"), or to a subnet its IP falls inside. This is
-    the one place that resolution happens, so every caller (pipeline.py's credentialed-probe step,
-    the on-demand SNMP/HTTP probes, anything added later) automatically picks up a group-assigned
-    credential without having to know the assignment mechanism exists."""
+    credential profile (see `list_account_assignments`'s own docstring). This is the one place that
+    resolution happens, so every caller (pipeline.py's credentialed-probe step, the on-demand
+    SNMP/HTTP probes, anything added later) automatically picks up a group-assigned credential
+    without having to know the assignment mechanism exists."""
     system = get_system(system_id)
     if system is None:
         return []
@@ -913,21 +994,7 @@ def list_probe_accounts(system_id: str) -> list[dict]:
         direct = _rows(conn.execute(
             "SELECT * FROM accounts WHERE systemId = ? AND allowProbe = 1", (system_id,),
         ))
-        assigned_ids = {
-            row["accountId"] for row in conn.execute(
-                "SELECT accountId FROM accountAssignments WHERE "
-                "(targetType = 'system' AND targetValue = ?) OR "
-                "(targetType = 'kind' AND targetValue = ?)",
-                (system_id, system.get("kind") or ""),
-            )
-        }
-        ip = (system.get("ip") or "").strip()
-        if ip:
-            for row in conn.execute(
-                "SELECT accountId, targetValue FROM accountAssignments WHERE targetType = 'subnet'"
-            ):
-                if _ip_in_subnet(ip, row["targetValue"]):
-                    assigned_ids.add(row["accountId"])
+        assigned_ids = _assigned_account_ids(conn, system)
         assigned: list[dict] = []
         if assigned_ids:
             placeholders = ",".join("?" * len(assigned_ids))
@@ -942,6 +1009,27 @@ def list_probe_accounts(system_id: str) -> list[dict]:
     for a in assigned:
         by_id.setdefault(a["id"], a)
     return sorted(by_id.values(), key=lambda a: (a["category"], a["label"].lower()))
+
+
+def list_assigned_accounts(system_id: str) -> list[dict]:
+    """Accounts that reach this device only through an `accountAssignments` rule (kind/subnet/extra
+    system), not through `accounts.systemId` directly. For *display* on the device's own page --
+    "which credentials apply here and why" -- so, unlike `list_probe_accounts`, not filtered to
+    `allowProbe`: a documented-but-not-probed account assigned to a whole device kind should still
+    be visible on each device it covers."""
+    system = get_system(system_id)
+    if system is None:
+        return []
+    with _conn() as conn:
+        assigned_ids = _assigned_account_ids(conn, system)
+        if not assigned_ids:
+            return []
+        placeholders = ",".join("?" * len(assigned_ids))
+        rows = _rows(conn.execute(
+            f"SELECT * FROM accounts WHERE id IN ({placeholders}) AND (systemId IS NULL OR systemId != ?)",
+            (*assigned_ids, system_id),
+        ))
+    return sorted(rows, key=lambda a: (a["category"], a["label"].lower()))
 
 
 def _ip_in_subnet(ip: str, cidr: str) -> bool:
@@ -1432,15 +1520,15 @@ def delete_chat(chat_id: str) -> None:
 
 def add_chat_message(chat_id: str, role: str, content: str = "", tool_calls: list | None = None,
                      tool_call_id: str | None = None, name: str | None = None,
-                     provider_raw: dict | None = None) -> dict:
+                     provider_raw: dict | None = None, duration_ms: int | None = None) -> dict:
     message_id = _new_id()
     now = _now()
     with _conn() as conn:
         conn.execute(
-            "INSERT INTO chatMessages(id, chatId, role, content, toolCalls, providerRaw, toolCallId, name, createdAt) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO chatMessages(id, chatId, role, content, toolCalls, providerRaw, toolCallId, name, "
+            "createdAt, durationMs) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (message_id, chat_id, role, content, _dump(tool_calls), _dump(provider_raw or None),
-             tool_call_id, name, now),
+             tool_call_id, name, now, duration_ms),
         )
         conn.execute("UPDATE chats SET updatedAt = ? WHERE id = ?", (now, chat_id))
     with _conn() as conn:

@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useState } from "react";
-import { NavLink, Navigate, Route, Routes } from "react-router-dom";
+import { NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { ApiError, api, type User } from "./lib/api";
 import LoginPage from "./pages/LoginPage";
 import MfaEnrollPage from "./pages/MfaEnrollPage";
@@ -49,6 +49,7 @@ export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const [setupCompleted, setSetupCompleted] = useState(true);
+  const location = useLocation();
 
   const refresh = useCallback(async () => {
     try {
@@ -134,7 +135,7 @@ export default function App() {
           </div>
         </nav>
 
-        <main className="content">
+        <main className={`content${location.pathname === "/assistent" ? " content-chat" : ""}`}>
           <Routes>
             <Route path="/" element={<DashboardPage />} />
             <Route path="/geraete" element={<InventoryPage />} />

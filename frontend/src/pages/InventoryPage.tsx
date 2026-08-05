@@ -133,6 +133,28 @@ export default function InventoryPage() {
     setBulkBusy(false);
   }
 
+  async function mergeSelected(keepId: string, removeId: string) {
+    const keep = systems.find((s) => s.id === keepId);
+    const remove = systems.find((s) => s.id === removeId);
+    if (!window.confirm(
+      `„${remove?.name}" wird gelöscht, seine Zugänge und Historie werden zu „${keep?.name}" ` +
+      "übernommen (leere Felder von dort werden ebenfalls übernommen). Fortfahren?",
+    )) return;
+    setBulkBusy(true);
+    try {
+      const { system } = await api.mergeSystems(keepId, removeId);
+      setSystems((current) => current.filter((s) => s.id !== removeId).map((s) => (s.id === keepId ? system : s)));
+      setSelected(new Set());
+      setError("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
+  const selectedList = useMemo(() => systems.filter((s) => selected.has(s.id)), [systems, selected]);
+
   const parentSystem = useMemo(
     () => (parentId ? systems.find((s) => s.id === parentId) : undefined),
     [systems, parentId],
@@ -201,8 +223,23 @@ export default function InventoryPage() {
         </div>
 
         {isAdmin && selected.size > 0 && (
-          <div className="row notice info" style={{ marginBottom: 14, alignItems: "center" }}>
+          <div className="row notice info" style={{ marginBottom: 14, alignItems: "center", flexWrap: "wrap" }}>
             <strong>{selected.size}</strong> ausgewählt
+            {selected.size === 2 && (
+              <span className="row" style={{ gap: 6, alignItems: "center" }}>
+                <span className="muted">— dasselbe Gerät doppelt? Zusammenführen, behalte:</span>
+                {selectedList.map((s) => {
+                  const other = selectedList.find((o) => o.id !== s.id);
+                  if (!other) return null;
+                  return (
+                    <button key={s.id} className="secondary" disabled={bulkBusy}
+                            onClick={() => void mergeSelected(s.id, other.id)}>
+                      „{s.name}"
+                    </button>
+                  );
+                })}
+              </span>
+            )}
             <button className="danger" style={{ marginLeft: "auto" }} disabled={bulkBusy}
                     onClick={() => void deleteSelected()}>
               {bulkBusy ? "Lösche…" : "Ausgewählte löschen"}

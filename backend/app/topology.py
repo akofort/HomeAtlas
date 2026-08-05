@@ -24,6 +24,9 @@ _W = 1000
 _BOX_H = 52
 _GAP_X = 16
 _LAYER_GAP = 78
+# At _W's own width, a row this size still keeps each box legible (_row shrinks box width to fit
+# the count, down to its own readability floor) -- see the "Wichtige Geräte" row below.
+_MAX_CRITICAL_BOXES = 10
 
 _COLORS = {
     "bg": "#0b1120",
@@ -228,12 +231,14 @@ def _box(x: float, y: float, w: float, h: float, title: str, subtitle: str = "",
     body = "".join(parts)
     if not system_id:
         return body
-    # Expandable boxes (a host with containers/VMs nested in it) are wrapped so the frontend can
-    # find them by a click and navigate to the filtered device list -- the plan stays a single
-    # static SVG (see module docstring) and does not itself re-layout on click.
-    attrs = f'data-system-id="{_esc(system_id)}"'
+    # Every named box links straight to its device page -- an expandable one (a host with
+    # containers/VMs nested in it) is additionally marked `data-expand` so the frontend opens the
+    # filtered device list instead, since that box represents several systems, not just itself.
+    # The plan stays a single static SVG either way (see module docstring) and never re-lays-out
+    # on click; the frontend does the navigating.
+    attrs = f'data-system-id="{_esc(system_id)}" style="cursor:pointer"'
     if expandable:
-        attrs += ' data-expand="1" style="cursor:pointer"'
+        attrs += ' data-expand="1"'
     return f'<g {attrs}>{body}</g>'
 
 
@@ -418,7 +423,7 @@ def render(settings: dict | None = None) -> str:
         # plain trunk connection below, so a parsing miss loses a specific line, never the device.
         links = _resolve_system_links(systems)
         items = []
-        for s in critical[:8]:
+        for s in critical[:_MAX_CRITICAL_BOXES]:
             subtitle = s["ip"]
             expand = False
             if s["id"] in host_ids:
@@ -439,7 +444,7 @@ def render(settings: dict | None = None) -> str:
         row_svg, anchors = _row(items, y)
         svg.append(_edges_by_parent(anchor_by_id, items, anchors, previous))
         svg.append(row_svg)
-        anchor_by_id.update(zip((s["id"] for s in critical[:8]), anchors))
+        anchor_by_id.update(zip((s["id"] for s in critical[:_MAX_CRITICAL_BOXES]), anchors))
         y += _LAYER_GAP
 
     if len(systems) == 0:
@@ -483,6 +488,7 @@ def _subnet_sort_key(subnet: str) -> tuple:
 # right next to the address they belong to, and this keeps them out of `_router_subnets` below.
 _MASK_OCTETS = {"0", "128", "192", "224", "240", "248", "252", "254", "255"}
 _IP_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+_CIDR_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})/(\d{1,2})\b")
 
 
 def _looks_like_mask(ip: str) -> bool:
@@ -529,6 +535,110 @@ def _router_subnets(system: dict) -> set[str]:
     return subnets
 
 
+def _mikrotik_vlan_ids_by_interface(text: str) -> dict[str, str]:
+    """interface name -> VLAN ID, from RouterOS `/interface vlan print detail`
+    (` 0  R name="vlan10" mtu=1500 arp=enabled vlan-id=10 interface=bridge1 ...`), one record per
+    line/wrapped block, same split heuristic as `_parse_mikrotik_neighbors` above."""
+    result: dict[str, str] = {}
+    for block in re.split(r"\n(?=\s*\d+\s+\S)", text):
+        name_match = re.search(r'name="([^"]+)"', block)
+        vlan_match = re.search(r"vlan-id=(\d+)", block)
+        if name_match and vlan_match:
+            result[name_match.group(1)] = vlan_match.group(1)
+    return result
+
+
+def _mikrotik_subnet_interfaces(text: str) -> dict[str, str]:
+    """subnet (/24, via `_subnet_of`) -> interface name, from RouterOS `/ip address print`
+    (` 1   10.1.1.1/24        10.1.1.0/24     vlan10`). The interface name is reliably the line's
+    last whitespace-separated token regardless of which flag/index columns precede the address, so
+    this takes that rather than assuming a fixed column count."""
+    result: dict[str, str] = {}
+    for line in text.splitlines():
+        match = _CIDR_RE.search(line)
+        tokens = line.split()
+        if not match or not tokens:
+            continue
+        result[_subnet_of(match.group(1))] = tokens[-1]
+    return result
+
+
+def _router_vlan_ids(system: dict) -> dict[str, str]:
+    """subnet -> VLAN ID label, by joining RouterOS's `vlan` fact (interface -> VLAN ID) with its
+    `ip_addresses` fact (subnet -> interface) on the interface name. Mikrotik-only for now -- the
+    one platform whose two facts this module can reliably join this way; Aruba/Cisco's own `vlan`
+    fact formats aren't parsed here, so a subnet behind one of those simply gets no VLAN label,
+    same degrade-gracefully posture as everything else in this file."""
+    probe = (system.get("extra") or {}).get("probe") or {}
+    result: dict[str, str] = {}
+    for src, res in probe.items():
+        if not src.startswith("ssh:"):
+            continue
+        facts = (res or {}).get("facts") or {}
+        if "vlan" not in facts or "ip_addresses" not in facts:
+            continue
+        vlan_by_interface = _mikrotik_vlan_ids_by_interface(facts["vlan"]["value"])
+        if not vlan_by_interface:
+            continue
+        for subnet, interface in _mikrotik_subnet_interfaces(facts["ip_addresses"]["value"]).items():
+            if interface in vlan_by_interface:
+                result[subnet] = vlan_by_interface[interface]
+    return result
+
+
+# Subnets with fewer active IPs than this are left off the plan entirely -- a household with a
+# /24 per VLAN otherwise ends up with several rows showing little more than "1 Gerät", which is
+# clutter, not information. The devices themselves are still fully visible elsewhere (the device
+# list, the physical plan) -- this only trims what the Layer-3 overview draws.
+_MIN_SUBNET_DEVICES = 3
+
+
+def _infer_router_hierarchy(routers: list[dict], raw_subnets: dict[str, set[str]]) -> dict[str, str | None]:
+    """Which router is the effective *parent* of which (its upstream, closer to Internet), so a
+    secondary router plugged into the household's primary one (a Mikrotik behind a FritzBox) is
+    drawn as a chain -- Internet -> FritzBox -> Mikrotik -> its own networks -- instead of as two
+    unrelated boxes both hanging directly off Internet.
+
+    Nothing in this codebase ever sets a router's own `parentId` today (that field is only ever
+    filled in for Proxmox guests and Omada-linked switches/APs), so without this every router
+    would render as its own root. Inferred instead from subnet containment, which needs no extra
+    configuration: a downstream router's own interface set always includes its upstream's subnet
+    too (its WAN/uplink side is an ordinary client address on the upstream router's LAN) plus
+    subnets of its own the upstream router never sees -- so its raw subnet set is always a strict
+    superset of its immediate upstream's. For each router, the smallest other router whose raw set
+    is a strict subset of its own is picked as the immediate parent (the closest upstream hop, not
+    a more distant ancestor further up the same chain). A human-set `parentId` that already points
+    at another router in this list wins over the inference, same "confirmed data wins" rule as
+    everywhere else in this app.
+
+    A router with no SSH probe data at all falls back (see `_router_subnets`) to the single subnet
+    implied by its own stored `ip` -- still enough for this containment check to work as long as at
+    least the *upstream* router's address is known, which discovery always has.
+    """
+    router_ids = {r["id"] for r in routers}
+    parent_by_id: dict[str, str | None] = {}
+    for r in routers:
+        manual_parent = r.get("parentId")
+        if manual_parent in router_ids:
+            parent_by_id[r["id"]] = manual_parent
+            continue
+        own = raw_subnets.get(r["id"]) or set()
+        candidates = [o for o in routers if o["id"] != r["id"] and (raw_subnets.get(o["id"]) or set()) < own]
+        parent_by_id[r["id"]] = min(candidates, key=lambda o: len(raw_subnets[o["id"]]))["id"] if candidates else None
+    return parent_by_id
+
+
+def _looks_like_gateway_ip(ip: str) -> bool:
+    """Whether an IP's last octet is .1 or .254 -- the two conventional gateway-address endings
+    (FritzBox and most home routers default to .1, some ISP/enterprise gear to .254). A `kind ==
+    "router"` system without one of these is, in practice, something misclassified rather than a
+    real gateway (a mesh satellite, an AP that reports itself oddly, a stale duplicate) -- the
+    Layer-3 view's router chain is built entirely from what `_infer_router_hierarchy` can deduce
+    about real gateways, so one of those would otherwise show up as a spurious, unconnected box."""
+    parts = (ip or "").strip().split(".")
+    return len(parts) == 4 and parts[3] in ("1", "254")
+
+
 def render_layer3(settings: dict | None = None) -> str:
     """Alternative view of the same inventory, grouped by IP subnet (/24) instead of by how
     devices are physically wired -- useful once a household has more than one subnet or VLAN (a
@@ -537,22 +647,82 @@ def render_layer3(settings: dict | None = None) -> str:
 
     End-device subnet membership is derived purely from each system's own stored IP (this app has
     no per-device VLAN tag to group by instead). Routers are placed more accurately: a router
-    probed over SSH gets listed under *every* subnet its own interface table shows an address in
+    probed over SSH is checked against *every* subnet its own interface table shows an address in
     (see `_router_subnets`), not just the one its single stored `ip` field happens to fall into --
-    that is what actually distinguishes a Layer-3 view from the physical one, since a router
-    bridging several VLANs is exactly the thing a single-IP model can't otherwise show.
+    and routers are chained by inferred upstream/downstream relationship (`_infer_router_hierarchy`)
+    rather than all lumped together as roots, so a household with FritzBox -> Mikrotik -> its own
+    LANs actually renders as that chain instead of two disconnected boxes.
+
+    Only a `kind == "router"` system whose own stored IP ends in .1 or .254 (see
+    `_looks_like_gateway_ip`) is considered for this view at all -- anything else with that `kind`
+    is left out of the plan entirely, on this view only, rather than drawn as a router or folded
+    into an "other devices" count (the physical plan is unaffected).
+
+    A subnet a router shares with its own upstream is that upstream's LAN, not something the
+    downstream router "serves" -- excluded from the downstream router's own networks (see
+    `own_subnets` below) so it is attributed once, to whichever router actually owns it, and drawn
+    as that router's own child row rather than claimed twice or attached to the wrong one.
     """
     settings = settings or db.get_settings()
     all_systems = db.list_systems()
-    routers = [s for s in all_systems if s["kind"] == "router"]
+    routers = sorted(
+        (s for s in all_systems if s["kind"] == "router" and _looks_like_gateway_ip(s.get("ip"))),
+        key=lambda r: r["name"].lower(),
+    )
     others = [s for s in all_systems if s["kind"] != "router" and s.get("ip")]
 
-    by_subnet: dict[str, dict] = {}
+    raw_subnets = {r["id"]: _router_subnets(r) for r in routers}
+    router_vlans = {r["id"]: _router_vlan_ids(r) for r in routers}
+    parent_by_id = _infer_router_hierarchy(routers, raw_subnets)
+
+    own_subnets = {
+        r["id"]: raw_subnets[r["id"]] - raw_subnets.get(parent_by_id.get(r["id"]), set())
+        for r in routers
+    }
+
+    others_by_subnet: dict[str, list[dict]] = {}
     for s in others:
-        by_subnet.setdefault(_subnet_of(s["ip"]), {"routers": [], "others": []})["others"].append(s)
+        others_by_subnet.setdefault(_subnet_of(s["ip"]), []).append(s)
+
+    # First router (in the already name-sorted list) to claim a subnet as its own wins -- a tie is
+    # only possible between two routers whose subnet sets are identical, which is not something
+    # `_infer_router_hierarchy` can tell apart anyway.
+    subnet_owner: dict[str, str] = {}
     for r in routers:
-        for subnet in _router_subnets(r):
-            by_subnet.setdefault(subnet, {"routers": [], "others": []})["routers"].append(r)
+        for subnet in own_subnets[r["id"]]:
+            subnet_owner.setdefault(subnet, r["id"])
+
+    subnet_nodes: dict[str, dict] = {}
+    for subnet in set(others_by_subnet) | set(subnet_owner):
+        owner_id = subnet_owner.get(subnet)
+        members = others_by_subnet.get(subnet, [])
+        # The owning router itself holds an active address in this subnet too -- counted here even
+        # though it is drawn as its own box elsewhere in the chain, not repeated in this one.
+        total = len(members) + (1 if owner_id else 0)
+        if total < _MIN_SUBNET_DEVICES:
+            continue
+        vlan_id = router_vlans.get(owner_id, {}).get(subnet) if owner_id else None
+        subtitle_parts = [f"{total} Gerät{'e' if total != 1 else ''}"]
+        if vlan_id:
+            subtitle_parts.append(f"VLAN {vlan_id}")
+        if members:
+            online = sum(1 for m in members if m["status"] == "online")
+            subtitle_parts.append(f"{online} erreichbar" if online else "keins erreichbar")
+        subnet_nodes[subnet] = {
+            "id": f"subnet:{subnet}", "parentId": owner_id, "title": subnet,
+            "subtitle": " · ".join(subtitle_parts), "fill": _COLORS["boxAlt"],
+        }
+
+    # Routers and kept subnets share one chain: a subnet node's `parentId` is the router that owns
+    # it, a router's is its inferred (or human-set) upstream -- `_chain_layers`/`_edges_by_parent`
+    # (the same generic layering the physical plan's Router/Verteilung sections use) don't care
+    # which is which, so a mixed row of "further router" and "own network" siblings falls out of
+    # the exact same code path with no special-casing needed here.
+    chain_items = [
+        {"id": r["id"], "parentId": parent_by_id.get(r["id"]), "title": r["name"],
+         "subtitle": r["ip"], "status": r["status"]}
+        for r in routers
+    ] + list(subnet_nodes.values())
 
     svg: list[str] = []
     y = 40
@@ -566,32 +736,22 @@ def render_layer3(settings: dict | None = None) -> str:
     previous = internet_anchor[0]
     y += _LAYER_GAP
 
-    for subnet in sorted(by_subnet, key=_subnet_sort_key):
-        group = by_subnet[subnet]
-        subnet_routers = group["routers"][:3]
-        subnet_others = group["others"]
-        total = len(subnet_others) + len({r["id"] for r in group["routers"]})
-
-        svg.append(_label(40, y - 12, f"{subnet} — {total} Gerät{'e' if total != 1 else ''}"))
-        items = [{"id": r["id"], "title": r["name"],
-                 "subtitle": (f"{r['ip']} · mehrere Netze" if len(_router_subnets(r)) > 1 else r["ip"]),
-                 "status": r["status"]} for r in subnet_routers]
-        if subnet_others:
-            online = sum(1 for m in subnet_others if m["status"] == "online")
-            items.append({
-                "title": f"{len(subnet_others)} weitere Geräte",
-                "subtitle": f"{online} erreichbar" if online else "keins erreichbar",
-                "fill": _COLORS["boxAlt"],
-            })
-        row_svg, anchors = _row(items, y)
-        svg.append(_edges(previous, anchors))
+    anchor_by_id: dict[str, tuple[float, float]] = {}
+    for depth, layer in enumerate(_chain_layers(chain_items)):
+        row_svg, anchors = _row(layer, y, box_w_max=220)
+        svg.append(_edges(previous, anchors) if depth == 0
+                  else _edges_by_parent(anchor_by_id, layer, anchors, previous))
         svg.append(row_svg)
+        anchor_by_id.update(zip((i["id"] for i in layer), anchors))
         y += _LAYER_GAP
 
-    if not by_subnet:
+    if not chain_items:
+        message = ("Noch keine Geräte mit bekannter Adresse erfasst." if not others_by_subnet else
+                   f"Nur Netze mit weniger als {_MIN_SUBNET_DEVICES} Geräten gefunden — zur "
+                   "Übersichtlichkeit ausgeblendet.")
         svg.append(
             f'<text x="{_W / 2:.0f}" y="{y:.0f}" text-anchor="middle" fill="{_COLORS["muted"]}" '
-            f'font-size="14">Noch keine Geräte mit bekannter Adresse erfasst.</text>'
+            f'font-size="14">{_esc(message)}</text>'
         )
         y += 40
 

@@ -13,6 +13,7 @@ Two rules shape what is exposed here:
 from __future__ import annotations
 
 import json
+import time
 
 from . import crypto, db, diagnostics, docker_probe, llm_providers, prompts
 from datetime import datetime, timezone
@@ -356,6 +357,10 @@ async def run_chat_turn(chat_id: str, user_text: str, settings: dict) -> dict:
     system_prompt = build_system_prompt(settings)
     used_tools: list[str] = []
     prompt_tokens = completion_tokens = 0
+    # Wall-clock for the whole turn (every tool round-trip included), shown small under the answer
+    # in the UI -- a household member waiting on "why is this slow" cares how long the turn as a
+    # whole took, not just the final model call.
+    started = time.monotonic()
 
     for _ in range(_MAX_ITERATIONS):
         result = await llm_providers.chat(
@@ -366,7 +371,8 @@ async def run_chat_turn(chat_id: str, user_text: str, settings: dict) -> dict:
         completion_tokens += result.completion_tokens or 0
 
         if not result.tool_calls:
-            message = db.add_chat_message(chat_id, "assistant", result.text)
+            duration_ms = round((time.monotonic() - started) * 1000)
+            message = db.add_chat_message(chat_id, "assistant", result.text, duration_ms=duration_ms)
             return {"message": message, "model": result.model, "toolsUsed": used_tools,
                     "usage": {"promptTokens": prompt_tokens, "completionTokens": completion_tokens}}
 
@@ -379,11 +385,12 @@ async def run_chat_turn(chat_id: str, user_text: str, settings: dict) -> dict:
 
     # Out of iterations: say so in the transcript rather than silently returning the last tool
     # output, which would look like the assistant ignored the question.
+    duration_ms = round((time.monotonic() - started) * 1000)
     message = db.add_chat_message(chat_id, "assistant", (
         "Ich habe mehrere Prüfungen hintereinander durchgeführt und komme so nicht weiter, ohne den "
         "Rahmen zu sprengen. Magst du die Frage etwas eingrenzen -- zum Beispiel auf ein bestimmtes "
         "Gerät oder einen bestimmten Dienst?"
-    ))
+    ), duration_ms=duration_ms)
     return {"message": message, "model": "", "toolsUsed": used_tools,
             "usage": {"promptTokens": prompt_tokens, "completionTokens": completion_tokens}}
 

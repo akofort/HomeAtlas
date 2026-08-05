@@ -520,7 +520,8 @@ async def get_system(system_id: str, _: dict = Depends(current_user)) -> dict:
     system = db.get_system(system_id)
     if system is None:
         raise HTTPException(status_code=404, detail="Gerät nicht gefunden.")
-    accounts = [_public_account(a) for a in db.list_accounts(system_id)]
+    accounts = [{**_public_account(a), "viaAssignment": False} for a in db.list_accounts(system_id)]
+    accounts += [{**_public_account(a), "viaAssignment": True} for a in db.list_assigned_accounts(system_id)]
     return {"system": system, "accounts": accounts,
             # Derived rather than stored, so it stays correct as the device's data fills in.
             "description": docs.describe_device(system),
@@ -550,6 +551,24 @@ async def update_system(system_id: str, patch: dict = Body(...), _: dict = Depen
 async def delete_system(system_id: str, _: dict = Depends(require_admin)) -> dict:
     db.delete_system(system_id)
     return {"ok": True}
+
+
+@app.post("/api/systems/{system_id}/merge")
+async def merge_system(system_id: str, body: dict = Body(...), _: dict = Depends(require_admin)) -> dict:
+    """Folds another system row into this one -- see db.merge_systems' own docstring for why this
+    has to be a human's call (a multi-homed router discovered once per subnet interface, plus
+    often a hand-created row for the same box, with no shared MAC across rows to merge on
+    automatically)."""
+    remove_id = (body.get("removeId") or "").strip()
+    if not remove_id:
+        raise HTTPException(status_code=400, detail="removeId fehlt.")
+    if remove_id == system_id:
+        raise HTTPException(status_code=400, detail="Ein Gerät kann nicht mit sich selbst zusammengeführt werden.")
+    merged = db.merge_systems(system_id, remove_id)
+    if merged is None:
+        raise HTTPException(status_code=404, detail="Gerät nicht gefunden.")
+    db.ensure_monitoring_for_critical()
+    return {"system": merged}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1301,6 +1320,11 @@ async def dns_diagnostic(body: dict = Body(default={}), _: dict = Depends(curren
     settings = db.get_settings()
     names = body.get("names") or settings.get("dnsTestNames") or []
     return {"result": await diagnostics.dns_check(names)}
+
+
+@app.post("/api/diagnostics/speedtest")
+async def speedtest_diagnostic(_: dict = Depends(current_user)) -> dict:
+    return {"result": await diagnostics.speedtest()}
 
 
 @app.get("/api/dashboard")

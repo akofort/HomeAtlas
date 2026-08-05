@@ -118,6 +118,15 @@ export interface DnsResult {
   serversExplanation: string;
 }
 
+export interface SpeedtestResult {
+  ok: boolean;
+  error: string;
+  downloadMbps: number | null;
+  uploadMbps: number | null;
+  pingMs: number | null;
+  explanation: string;
+}
+
 export interface PasswordPolicy {
   minLength: number;
   passphraseLength: number;
@@ -195,6 +204,10 @@ export interface Account {
    *  `systemId` points at. Only populated by GET /accounts (the accounts list); absent from
    *  responses scoped to one system's own accounts, which don't need it. */
   assignmentCount?: number;
+  /** True when this account reaches the device only through an AccountAssignment rule
+   *  (kind/subnet/extra system), not through its own `systemId`. Only populated by
+   *  GET /systems/{id} (the device page's own account list); absent everywhere else. */
+  viaAssignment?: boolean;
 }
 
 /** One group/multi-device target a credential profile additionally applies to, beyond its own
@@ -299,6 +312,10 @@ export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   createdAt: string;
+  /** How long the whole turn (every tool round-trip included) took to produce this message.
+   *  Only ever set on the final assistant answer of a turn -- null for user messages and for the
+   *  optimistic local echo, which never round-trips through the backend. */
+  durationMs: number | null;
 }
 
 export interface Chat {
@@ -385,6 +402,7 @@ export const api = {
   monitor: () => get<MonitorState>("/monitor"),
   monitorRunNow: () => post<{ changes: { systemId: string; name: string; status: string }[] }>("/monitor/run"),
   dnsCheck: (names?: string[]) => post<{ result: DnsResult }>("/diagnostics/dns", names ? { names } : {}),
+  speedtest: () => post<{ result: SpeedtestResult }>("/diagnostics/speedtest", {}),
 
   getSettings: () => get<SettingsResponse>("/settings"),
   updateSettings: (patchBody: Record<string, any>) =>
@@ -404,6 +422,8 @@ export const api = {
   createSystem: (body: Partial<System>) => post<{ system: System }>("/systems", body),
   updateSystem: (id: string, body: Partial<System>) => patch<{ system: System }>(`/systems/${id}`, body),
   deleteSystem: (id: string) => del<{ ok: boolean }>(`/systems/${id}`),
+  mergeSystems: (keepId: string, removeId: string) =>
+    post<{ system: System }>(`/systems/${keepId}/merge`, { removeId }),
   probeSystem: (id: string) => post<{ outcome: ProbeOutcome; system: System }>(`/systems/${id}/probe`),
   listConfigVersions: (systemId: string) =>
     get<{ versions: ConfigVersion[] }>(`/systems/${systemId}/config-versions`),

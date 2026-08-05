@@ -233,6 +233,10 @@ export default function SystemDetailPage() {
   const adguard = system.extra?.adguard as {
     protectionEnabled?: boolean; queries?: number; blocked?: number; blockedPercent?: number;
   } | undefined;
+  // SSH console/remote-container actions require an account directly attached via systemId --
+  // the backend's _remote_host_and_account/_proxmox_account only ever look at that field, so a
+  // group-assigned account (viaAssignment) can be shown in the Zugänge table but can't drive them.
+  const directAccounts = accounts.filter((a) => !a.viaAssignment);
 
   return (
     <>
@@ -733,7 +737,18 @@ export default function SystemDetailPage() {
                 <tbody>
                   {accounts.map((a) => (
                     <tr key={a.id}>
-                      <td>{a.label}</td>
+                      <td>
+                        {a.label}
+                        {a.viaAssignment && (
+                          <span
+                            className="badge"
+                            style={{ marginLeft: 6 }}
+                            title="Nicht direkt diesem Gerät zugeordnet, sondern über eine Regel (Gerätekategorie/Subnetz/weiteres Gerät) auf der Zugänge-Seite"
+                          >
+                            über Zuordnung
+                          </span>
+                        )}
+                      </td>
                       <td className="mono">{a.username || "—"}</td>
                       <td>
                         {!a.hasSecret ? (
@@ -745,7 +760,11 @@ export default function SystemDetailPage() {
                         )}
                       </td>
                       <td style={{ width: 1, whiteSpace: "nowrap" }}>
-                        {sshEligible(a) && (
+                        {/* SSH console/remote actions only work for accounts directly attached via
+                         *  systemId -- the backend's _remote_host_and_account requires an exact
+                         *  match, so a group-assigned account (viaAssignment) can't use them here;
+                         *  it's still visible in the table above, just without these buttons. */}
+                        {sshEligible(a) && !a.viaAssignment && (
                           <button className="secondary small" onClick={() => setConsoleAccountId(a.id)}>
                             Konsole öffnen
                           </button>
@@ -768,11 +787,14 @@ export default function SystemDetailPage() {
         </div>
       )}
 
-      {isAdmin && (accounts.some(sshEligible) || accounts.some((a) => a.category === "proxmox")) && (
+      {/* Same direct-attachment requirement as the console button above -- the backend's
+       *  _proxmox_account/_remote_host_and_account only ever look at accounts.systemId, so a
+       *  group-assigned account can't drive this card either. */}
+      {isAdmin && (directAccounts.some(sshEligible) || directAccounts.some((a) => a.category === "proxmox")) && (
         <RemoteContainersCard
           systemId={id}
-          sshAccounts={accounts.filter(sshEligible)}
-          isProxmoxHost={accounts.some((a) => a.category === "proxmox")}
+          sshAccounts={directAccounts.filter(sshEligible)}
+          isProxmoxHost={directAccounts.some((a) => a.category === "proxmox")}
         />
       )}
     </>

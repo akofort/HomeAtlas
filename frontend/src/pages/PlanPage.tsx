@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { api, type DnsResult, type MonitorState, type System } from "../lib/api";
+import { api, type DnsResult, type MonitorState, type SpeedtestResult, type System } from "../lib/api";
 import { useAuth } from "../App";
 import { KindIcon } from "../lib/icons";
 
@@ -27,6 +27,7 @@ export default function PlanPage() {
   const [systems, setSystems] = useState<System[]>([]);
   const [monitor, setMonitor] = useState<MonitorState | null>(null);
   const [dns, setDns] = useState<DnsResult | null>(null);
+  const [speed, setSpeed] = useState<SpeedtestResult | null>(null);
   const [checking, setChecking] = useState("");
   const [error, setError] = useState("");
   const timer = useRef<number | null>(null);
@@ -91,13 +92,31 @@ export default function PlanPage() {
     }
   }
 
-  // Hosts with containers/VMs are drawn once, marked `data-expand`, and get their children one
-  // click away instead of nested boxes -- see topology.py for why (forty container boxes is not
-  // a picture anyone reads).
+  async function runSpeedtest() {
+    setChecking("speedtest");
+    try {
+      setSpeed((await api.speedtest()).result);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setChecking("");
+    }
+  }
+
+  // Every named box in the plan links to its own device page -- except a host with containers/VMs
+  // nested in it (marked `data-expand`), which opens the filtered device list of its children
+  // instead, since that box represents several systems, not just itself (see topology.py for why
+  // those are drawn as one box rather than forty).
   function handlePlanClick(e: React.MouseEvent<HTMLDivElement>) {
-    const target = (e.target as Element).closest('[data-expand="1"]');
+    const expandTarget = (e.target as Element).closest('[data-expand="1"]');
+    if (expandTarget) {
+      const id = expandTarget.getAttribute("data-system-id");
+      if (id) navigate(`/geraete?parentId=${id}`);
+      return;
+    }
+    const target = (e.target as Element).closest("[data-system-id]");
     const id = target?.getAttribute("data-system-id");
-    if (id) navigate(`/geraete?parentId=${id}`);
+    if (id) navigate(`/geraete/${id}`);
   }
 
   async function runMonitorNow() {
@@ -161,10 +180,14 @@ export default function PlanPage() {
           {planView === "layer3" ? (
             <>
               Alle Geräte mit bekannter Adresse, gruppiert nach IP-Subnetz (/24) — nützlich, sobald
-              mehr als ein Netz/VLAN im Einsatz ist (z. B. Gäste- oder IoT-Netz). Ein per
-              Zugangsdaten ausgelesener Router erscheint in jedem Subnetz, in dem er selbst eine
-              Adresse trägt (aus den Schnittstellen-IPs, nicht nur der einen hinterlegten Adresse)
-              — für alle anderen Geräte zählt weiterhin nur die eine bekannte IP.
+              mehr als ein Netz/VLAN im Einsatz ist (z. B. Gäste- oder IoT-Netz). Netze mit weniger
+              als 3 Geräten werden zur Übersichtlichkeit ausgeblendet, ebenso Router, deren Adresse
+              nicht auf .1 oder .254 endet (die üblichen Gateway-Adressen). Ein Router hinter einem
+              anderen (z. B. ein per Zugangsdaten ausgelesener zweiter Router an der FritzBox)
+              erscheint verkettet an seiner tatsächlichen Stelle — Internet → erster Router →
+              zweiter Router → seine eigenen Netze — statt als eigenständiger Kasten direkt am
+              Internet; ist die VLAN-ID einer Schnittstelle bekannt, steht sie mit in der
+              Netz-Beschriftung.
             </>
           ) : (
             <>
@@ -292,6 +315,45 @@ export default function PlanPage() {
                 </tbody>
               </table>
             </div>
+          </>
+        )}
+      </div>
+
+      <div className="card">
+        <h2>Internet-Speedtest</h2>
+        <p className="muted" style={{ marginTop: -6 }}>
+          Misst die tatsächliche Download-/Upload-Geschwindigkeit und Latenz gegen Cloudflares
+          öffentlichen Speedtest-Dienst — dafür werden kurz einige Megabyte hoch- und
+          heruntergeladen.
+        </p>
+        {!speed ? (
+          <button onClick={() => void runSpeedtest()} disabled={checking !== ""}>
+            {checking === "speedtest" ? "Messe…" : "Jetzt testen"}
+          </button>
+        ) : (
+          <>
+            <div className={`notice ${speed.ok ? "ok" : "error"}`}>
+              {speed.ok ? speed.explanation : speed.error}
+            </div>
+            {speed.ok && (
+              <div className="row" style={{ gap: 28, flexWrap: "wrap", marginBottom: 14 }}>
+                <div>
+                  <div className="muted" style={{ fontSize: "0.8rem" }}>Download</div>
+                  <strong style={{ fontSize: "1.4rem" }}>{speed.downloadMbps} Mbit/s</strong>
+                </div>
+                <div>
+                  <div className="muted" style={{ fontSize: "0.8rem" }}>Upload</div>
+                  <strong style={{ fontSize: "1.4rem" }}>{speed.uploadMbps} Mbit/s</strong>
+                </div>
+                <div>
+                  <div className="muted" style={{ fontSize: "0.8rem" }}>Latenz</div>
+                  <strong style={{ fontSize: "1.4rem" }}>{speed.pingMs} ms</strong>
+                </div>
+              </div>
+            )}
+            <button className="secondary" onClick={() => void runSpeedtest()} disabled={checking !== ""}>
+              {checking === "speedtest" ? "Messe…" : "Erneut testen"}
+            </button>
           </>
         )}
       </div>
