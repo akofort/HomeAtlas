@@ -223,7 +223,7 @@ def _device_table(systems: list[dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _device_details(systems: list[dict]) -> str:
+def _device_details(systems: list[dict], by_id: dict[str, dict], children_by_parent: dict[str, list[dict]]) -> str:
     parts: list[str] = []
     for s in systems:
         parts.append(f"### {s['name']}\n")
@@ -244,10 +244,15 @@ def _device_details(systems: list[dict]) -> str:
             facts.append(f"- **Standort:** {_escape(s['location'])}")
         if s["importance"] != "normal":
             facts.append(f"- **Bedeutung:** {IMPORTANCE_LABELS.get(s['importance'], s['importance'])}")
+        parent = by_id.get(s.get("parentId") or "")
+        if parent:
+            facts.append(f"- **Läuft auf:** {_escape(parent['name'])}")
         if s["url"]:
             facts.append(f"- **Weboberfläche:** [{s['url']}]({s['url']})")
         if s.get("docUrl"):
             facts.append(f"- **Hersteller-Dokumentation:** [{s['docUrl']}]({s['docUrl']})")
+        if s.get("docLink"):
+            facts.append(f"- **Eigene Dokumentation:** [{s['docLink']}]({s['docLink']})")
         facts.append(f"- **Zuletzt gesehen:** {_fmt_date(s['lastSeen'])}")
         parts.append("\n".join(facts) + "\n")
 
@@ -278,6 +283,30 @@ def _device_details(systems: list[dict]) -> str:
             if docker.get("volumes"):
                 docker_facts.append(f"- **Datenablagen (Volumes):** `{', '.join(docker['volumes'][:6])}`")
             parts.append("\n".join(docker_facts) + "\n")
+
+        proxmox = (s.get("extra") or {}).get("proxmox") or {}
+        if proxmox:
+            proxmox_facts = [f"- **Proxmox-Node:** {_escape(str(proxmox.get('node', '')))}"]
+            if proxmox.get("vmid"):
+                proxmox_facts.append(f"- **VM-/Container-ID:** {proxmox['vmid']}")
+            if proxmox.get("cpuCores"):
+                proxmox_facts.append(f"- **CPU-Kerne:** {proxmox['cpuCores']}")
+            if proxmox.get("memoryMb"):
+                proxmox_facts.append(f"- **Arbeitsspeicher:** {proxmox['memoryMb']} MB")
+            parts.append("\n".join(proxmox_facts) + "\n")
+
+        children = sorted(children_by_parent.get(s["id"], []), key=lambda c: c["name"])
+        if children:
+            parts.append("**Läuft auf diesem Gerät**\n")
+            child_rows = ["| Name | Art | Zustand | Funktion | Weboberfläche |", "| --- | --- | --- | --- | --- |"]
+            for c in children:
+                link = f"[öffnen]({c['url']})" if c.get("url") else "-"
+                child_rows.append(
+                    f"| **{_escape(c['name'])}** | {KIND_LABELS.get(c['kind'], c['kind'])} "
+                    f"| {STATUS_LABELS.get(c['status'], c['status'])} "
+                    f"| {_escape(describe_device(c))[:140] or '-'} | {link} |"
+                )
+            parts.append("\n".join(child_rows) + "\n")
 
         services = s.get("services") or []
         if services:
@@ -429,6 +458,12 @@ def _systems_for(topic: Topic, all_systems: list[dict]) -> list[dict]:
 async def generate(settings: dict, use_llm: bool = True, log=None) -> list[str]:
     """Regenerates every chapter. Returns the slugs written."""
     all_systems = db.list_systems()
+    by_id = {s["id"]: s for s in all_systems}
+    children_by_parent: dict[str, list[dict]] = {}
+    for s in all_systems:
+        parent_id = s.get("parentId")
+        if parent_id:
+            children_by_parent.setdefault(parent_id, []).append(s)
     context = {
         "counts": {k: sum(1 for s in all_systems if s["kind"] == k) for k in {s["kind"] for s in all_systems}},
         "router": next((s for s in all_systems if s["kind"] == "router"), None),
@@ -462,7 +497,7 @@ async def generate(settings: dict, use_llm: bool = True, log=None) -> list[str]:
                 sections.append(_device_table(systems))
                 if systems:
                     sections.append("\n## Die Geräte im Einzelnen\n")
-                    sections.append(_device_details(systems))
+                    sections.append(_device_details(systems, by_id, children_by_parent))
             body = "\n".join(sections)
             intro = topic.intro_hint
 

@@ -822,6 +822,7 @@ export default function SystemDetailPage() {
        *  group-assigned account can't drive this card either. */}
       {isAdmin && (directAccounts.some(sshEligible) || directAccounts.some((a) => a.category === "proxmox")) && (
         <RemoteContainersCard
+          key={id}
           systemId={id}
           sshAccounts={directAccounts.filter(sshEligible)}
           isProxmoxHost={directAccounts.some((a) => a.category === "proxmox")}
@@ -845,9 +846,11 @@ function proxmoxConsoleUrl(baseUrl: string, node: string, kind: RemoteContainer[
 
 /** Docker containers (or, on a Proxmox host, its VMs/LXC containers) on a host reached over
  *  SSH/API -- for a host system (server/NAS/Proxmox-node/etc.) that isn't itself modeled as a
- *  container, unlike the local "Container-Details" card above. Needs an explicit "Laden" click
- *  rather than fetching on mount: unlike everything else on this page, listing here means either
- *  opening a real SSH connection to the device or calling its own management API.
+ *  container, unlike the local "Container-Details" card above. Loads automatically once an
+ *  account is available (mount-time only, see the effect below) so opening the device page
+ *  immediately shows what's running there instead of requiring a manual "Laden" click; a "Neu
+ *  laden" click still re-fetches on demand afterwards. The parent keys this component by
+ *  `systemId` so switching devices remounts it instead of reusing stale state/results.
  *
  *  A Proxmox host never runs a `docker` command -- it has no Docker CLI at all ("bash: line 1:
  *  docker: command not found" is the bug this branch exists to fix). `isProxmoxHost` (a
@@ -871,6 +874,14 @@ function RemoteContainersCard(
   const [logsLoading, setLogsLoading] = useState(false);
   const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (isProxmoxHost || accountId) void load();
+    // Mount-time only: `key={id}` on this component in the parent makes "mount" mean "device
+    // page opened", not "some unrelated prop changed" -- re-running on every accountId change
+    // would re-fetch mid-edit while switching the SSH-account dropdown for no reason.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function load() {
     setLoading(true);
