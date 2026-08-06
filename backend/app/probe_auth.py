@@ -12,8 +12,13 @@ things enforce it:
    configurable would turn this into a remote-execution feature with a nice UI, which is
    precisely what it must not be.
 2. **Every command is read-only** and non-interactive: no package manager, no service control, no
-   redirect, no `sudo`, no RouterOS/ArubaOS/IOS config-mode command, no `/export show-sensitive`,
-   no `enable`.
+   redirect, no `sudo`, no RouterOS/ArubaOS/IOS *config*-mode command, no `/export show-sensitive`.
+   The one narrow exception is classic ArubaOS-Switch's own `enable` (see
+   `_ARUBA_ENTER_PRIVILEGED_EXEC` below): on that CLI an SSH session always lands in restricted
+   Operator context regardless of the account's own privilege, and Operator context can't run
+   `show running-config` at all -- `enable` there only raises the ceiling on which *read* commands
+   are visible, it does not open configuration mode (`configure terminal` stays just as banned as
+   everywhere else), and nothing after it in the allowlist is anything but another `show`.
    Failures are expected and swallowed (`2>/dev/null`) so a missing binary never turns into a
    retry with something more aggressive.
 3. **HTTP is GET-only**, TR-064 uses only `GetInfo`-style SOAP actions -- the `Set*` half of that
@@ -127,7 +132,25 @@ _SSH_COMMANDS_MIKROTIK: tuple[tuple[str, str, str], ...] = (
 # time the next channel opens. Without this, "show running-config" on a switch with more than one
 # screen of config either hangs until _SSH_TIMEOUT kills the channel, losing the whole backup, or
 # comes back truncated at the first page.
-_ARUBA_DISABLE_PAGING = "no page\n"
+#
+# An SSH session on this CLI always starts in restricted Operator context ("Switch>"), even for an
+# account whose own credentials carry Manager rights -- unlike Telnet/console, SSH never skips the
+# Operator step. Operator context can only run a handful of basic show commands and does not
+# include "show running-config" (or several of the other facts below) at all, so without "enable"
+# first the config backup silently comes back empty -- not truncated, not an error, just missing --
+# which is easy to mistake for the paging bug above instead of a separate privilege issue. "enable"
+# does not open configuration mode and does not need its own answered password prompt: on the vast
+# majority of home/small-office ArubaOS-Switch setups there is exactly one local password, already
+# supplied at SSH login, and the CLI re-uses that same authenticated identity to grant Manager
+# context without asking again (confirmed against real hardware, not assumed). Where a switch *is*
+# configured with a distinct Operator/Manager password split, "enable" here still won't get a
+# password typed at it -- the next queued line ("no page") is read as the answer, "enable" then
+# fails, and every command in this platform's set simply keeps returning what Operator context
+# already allowed, exactly the same as before this constant existed. Folded into the very same
+# exec string as the pager-disable for the same one-shot-channel reason as everything else here --
+# see module docstring point 2 for why "enable" specifically is allowlisted only on this platform.
+_ARUBA_ENTER_PRIVILEGED_EXEC = "enable\n"
+_ARUBA_DISABLE_PAGING = _ARUBA_ENTER_PRIVILEGED_EXEC + "no page\n"
 
 _SSH_COMMANDS_ARUBA: tuple[tuple[str, str, str], ...] = (
     ("system", "System", _ARUBA_DISABLE_PAGING + "show system-information"),

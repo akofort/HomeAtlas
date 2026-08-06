@@ -15,14 +15,15 @@ def _command_for(commands, key: str) -> str:
     return next(command for k, _label, command in commands if k == key)
 
 
-def test_aruba_config_export_disables_paging_before_running_config():
+def test_aruba_config_export_enters_privileged_exec_then_disables_paging():
     command = _command_for(probe_auth._SSH_COMMANDS_ARUBA, "config_export")
-    assert command == "no page\nshow running-config"
+    assert command == "enable\nno page\nshow running-config"
 
 
-def test_every_aruba_command_disables_paging_first():
+def test_every_aruba_command_enters_privileged_exec_and_disables_paging_first():
     for key, _label, command in probe_auth._SSH_COMMANDS_ARUBA:
-        assert command.startswith("no page\n"), f"{key!r} does not disable paging first: {command!r}"
+        assert command.startswith("enable\nno page\n"), \
+            f"{key!r} does not enter privileged exec and disable paging first: {command!r}"
 
 
 def test_arubacx_uses_no_paging_not_no_page():
@@ -92,7 +93,7 @@ def _account() -> dict:
     return {"category": "login", "username": "admin", "secretEnc": "", "port": 22}
 
 
-def test_probe_ssh_sends_no_page_before_running_config_over_a_mocked_session(monkeypatch):
+def test_probe_ssh_enters_privileged_exec_and_disables_paging_before_running_config(monkeypatch):
     connection = _FakeConnection({
         "show running-config": "hostname SW1\ninterface 1\n   name Uplink\n",
         "show system-information": "System Name: SW1",
@@ -104,9 +105,11 @@ def test_probe_ssh_sends_no_page_before_running_config_over_a_mocked_session(mon
 
     assert result["ok"]
     assert result["facts"]["config_export"]["value"] == "hostname SW1\ninterface 1\n   name Uplink"
-    # Every command sent to the switch had paging disabled first, in the same exec call.
+    # Every command sent to the switch entered privileged exec and had paging disabled first, in
+    # the same exec call -- an SSH session on this CLI otherwise stays in Operator context, which
+    # can't run "show running-config" at all.
     config_commands = [c for c in connection.commands if "show running-config" in c]
-    assert config_commands == ["no page\nshow running-config"]
+    assert config_commands == ["enable\nno page\nshow running-config"]
 
 
 def test_probe_ssh_arubacx_uses_no_paging_over_a_mocked_session(monkeypatch):
