@@ -823,6 +823,48 @@ async def probe_homeassistant(url: str, account: dict) -> dict:
     return {"ok": True, "error": "", "facts": facts}
 
 
+async def list_ha_switchables(url: str, account: dict) -> dict:
+    """Lists every `switch.*`/`light.*` entity Home Assistant knows about, for resolving a name
+    like "Wohnzimmerlicht" to the exact entity_id `switch_admin.ha_set_switch` needs. Read-only --
+    one `GET /api/states` call, same as `probe_homeassistant` already makes, just filtered and
+    projected differently. Scope matches `switch_admin._HA_ALLOWED_DOMAINS`: only the two domains
+    that can actually be flipped stay in the result, so a caller never has to separately learn
+    which entities are off-limits."""
+    token, _ = _decode_secret(account)
+    base_url = (url or "").rstrip("/")
+    if not base_url:
+        return {"ok": False, "error": "Keine Adresse für Home Assistant hinterlegt.", "entities": []}
+    if not token:
+        return {"ok": False, "error": "Kein Zugriffstoken hinterlegt.", "entities": []}
+
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        async with httpx.AsyncClient(timeout=_HA_TIMEOUT, verify=False, headers=headers) as client:
+            self_check_error = await _ha_self_check(client, base_url)
+            if self_check_error:
+                return {"ok": False, "error": self_check_error, "entities": []}
+            response = await client.get(f"{base_url}/api/states")
+            if response.status_code in (401, 403):
+                return {"ok": False, "entities": [], "error": (
+                    f"Home Assistant hat das Zugriffstoken abgelehnt (HTTP {response.status_code}) "
+                    "beim Abruf der Zustände."
+                )}
+            response.raise_for_status()
+            states = response.json()
+            if not isinstance(states, list):
+                raise ValueError("Unerwartete Antwort (keine Liste).")
+    except (httpx.HTTPError, ValueError) as exc:
+        return {"ok": False, "error": f"Home Assistant unter {base_url} nicht erreichbar: {exc}", "entities": []}
+
+    entities = [
+        {"entityId": s["entity_id"], "name": (s.get("attributes") or {}).get("friendly_name") or s["entity_id"],
+         "state": s.get("state", "")}
+        for s in states
+        if isinstance(s, dict) and s.get("entity_id", "").split(".", 1)[0] in ("switch", "light")
+    ]
+    return {"ok": True, "error": "", "entities": entities}
+
+
 # ---------------------------------------------------------------------------------------------
 # SNMP (v2c community string only), for switches that have no SSH management at all
 # ---------------------------------------------------------------------------------------------

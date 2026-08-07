@@ -2,20 +2,30 @@
 
 Two rules shape what is exposed here:
 
-* **Read-only, plus bounded live measurements.** The model can look things up and run the
-  diagnostics in `diagnostics.py`; it cannot edit the inventory, rewrite documentation, or change
-  a device. Anything that modifies state stays behind the UI, where a human clicks it.
+* **Read-only, plus bounded live measurements -- with one explicit exception.** The model can look
+  things up and run the diagnostics in `diagnostics.py`; it cannot edit the inventory, rewrite
+  documentation, touch a container, or reboot a device -- all of that stays behind the UI, where a
+  human clicks it. The one deliberate exception is `set_switch`: turning a Shelly relay or a Home
+  Assistant `switch`/`light` entity on or off, on request, no confirmation step. That was an
+  explicit product decision (every role, and every external MCP client, gets this -- not just
+  admins, see `main.py`'s module docstring), traded off against the read-only rule because
+  flipping a light/plug is judged low-risk and easily reversible, unlike anything else this module
+  could reach. See `switch_admin.py`'s module docstring for the write side and its own, narrower
+  scope (on/off only, `switch`/`light` domains only).
 * **Stored secrets never reach the model.** `list_accounts` returns labels, usernames and notes so
   the assistant can say *where* a login is filed, and strips the password. That holds even though
   the model is "trusted" -- credentials in a prompt end up in the provider's logs, in the chat
-  history, and in any future context window.
+  history, and in any future context window. `set_switch` does not break this: it resolves a
+  target device/entity server-side from an id the model got out of `list_switches`, and a Home
+  Assistant token is decrypted and used inside `switch_admin.ha_set_switch`, never handed to the
+  model.
 """
 from __future__ import annotations
 
 import json
 import time
 
-from . import crypto, db, diagnostics, docker_probe, llm_providers, prompts
+from . import crypto, db, diagnostics, docker_probe, llm_providers, probe_auth, prompts, switch_admin
 from datetime import datetime, timezone
 
 # A tool result is fed straight back into the context window; an unbounded one (a /24 inventory, a
@@ -85,6 +95,33 @@ TOOL_DEFINITIONS: list[dict] = [
         "name": "list_containers",
         "description": "Listet die Docker-Container auf dem Server: Image, Status, veröffentlichte Ports, Volumes.",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "list_switches",
+        "description": ("Listet schaltbare Shelly-Geräte und Home-Assistant-Entities (nur switch/light) mit den "
+                        "IDs, die set_switch braucht. Immer zuerst aufrufen, um einen umgangssprachlichen Namen "
+                        "wie 'das Wohnzimmerlicht' einem konkreten Ziel zuzuordnen, bevor geschaltet wird."),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "set_switch",
+        "description": ("Schaltet ein Shelly-Relais oder eine Home-Assistant-switch/light-Entity ein oder aus. "
+                        "Vorher list_switches aufrufen, um die passende ID zu finden. Wird sofort ausgeführt, "
+                        "ohne Rückfrage -- nur für Ein/Aus-Schalten, nicht für Schlösser, Rollläden, Heizung "
+                        "oder Alarmanlage (die bietet dieses Werkzeug gar nicht erst an)."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["shelly", "ha"],
+                         "description": "'shelly' für ein Shelly-Gerät, 'ha' für eine Home-Assistant-Entity."},
+                "systemId": {"type": "string", "description": "Für kind='shelly': die systemId aus list_switches."},
+                "accountId": {"type": "string", "description": "Für kind='ha': die accountId aus list_switches."},
+                "entityId": {"type": "string", "description": "Für kind='ha': die entityId aus list_switches, "
+                                                              "z. B. switch.wohnzimmer_stecker."},
+                "on": {"type": "boolean", "description": "true = einschalten, false = ausschalten."},
+            },
+            "required": ["kind", "on"],
+        },
     },
     {
         "name": "internet_check",
@@ -292,6 +329,59 @@ async def _dispatch(name: str, args: dict) -> object:
                 if k in ("state", "status", "composeProject", "portMappings", "volumes", "networks")}}
             for s in systems
         ]}
+
+    if name == "list_switches":
+        shellies = [
+            {"systemId": s["id"], "name": s["name"], "ip": s["ip"], "status": s["status"]}
+            for s in db.list_systems()
+            if s.get("vendor") == "Shelly" or "shelly" in (s.get("model") or "").lower()
+        ]
+        ha_entities: list[dict] = []
+        for account in db.list_accounts(None):
+            if account.get("category") != "homeassistant":
+                continue
+            system = db.get_system(account.get("systemId") or "") or {}
+            result = await probe_auth.list_ha_switchables(account.get("url") or system.get("url") or "", account)
+            if result["ok"]:
+                ha_entities.extend({"accountId": account["id"], **e} for e in result["entities"])
+        return {"shellyCount": len(shellies), "shellies": shellies,
+                "haEntityCount": len(ha_entities), "haEntities": ha_entities[:200]}
+
+    if name == "set_switch":
+        # The one write action this module exposes -- see module docstring for why. `kind`,
+        # `systemId`/`accountId`+`entityId` are always re-resolved against the database here, never
+        # trusted as a free-form host/URL from the model, so the blast radius stays "a device
+        # already in the inventory", not "whatever address the model was talked into naming".
+        on = bool(args.get("on"))
+        state_label = "ein" if on else "aus"
+        kind = args.get("kind")
+        if kind == "shelly":
+            system = db.get_system(args.get("systemId") or "")
+            if system is None:
+                return {"error": "Kein Shelly-Gerät mit dieser systemId gefunden -- vorher list_switches aufrufen."}
+            host = (system.get("ip") or system.get("hostname") or "").strip()
+            if not host:
+                return {"error": f"Für „{system['name']}“ ist keine Adresse hinterlegt."}
+            result = await switch_admin.shelly_set_switch(host, on)
+            db.log_access("switch.assistant", detail=f"{system['name']} -> {state_label}", ok=result["ok"])
+            if not result["ok"]:
+                return {"error": result["error"]}
+            return {"ok": True, "device": system["name"], "state": state_label}
+        if kind == "ha":
+            account = db.get_account(args.get("accountId") or "")
+            entity_id = args.get("entityId") or ""
+            if account is None or account.get("category") != "homeassistant":
+                return {"error": "Kein Home-Assistant-Zugang mit dieser accountId gefunden -- vorher list_switches "
+                                 "aufrufen."}
+            system = db.get_system(account.get("systemId") or "") or {}
+            token = crypto.decrypt(account.get("secretEnc") or "")
+            result = await switch_admin.ha_set_switch(account.get("url") or system.get("url") or "", token,
+                                                       entity_id, on)
+            db.log_access("switch.assistant", detail=f"{entity_id} -> {state_label}", ok=result["ok"])
+            if not result["ok"]:
+                return {"error": result["error"]}
+            return {"ok": True, "entity": entity_id, "state": state_label}
+        return {"error": f"Unbekannte Art '{kind}', erwartet 'shelly' oder 'ha'."}
 
     if name == "internet_check":
         return await diagnostics.internet_check()

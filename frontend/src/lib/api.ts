@@ -250,6 +250,12 @@ export interface RemoteContainer {
   kind?: "vm" | "container";
 }
 
+export interface HaEntity {
+  entityId: string;
+  name: string;
+  state: string;
+}
+
 export interface ApiToken {
   id: string;
   label: string;
@@ -483,6 +489,15 @@ export const api = {
 
   rebootSystem: (systemId: string, accountId: string) =>
     post<{ ok: boolean }>(`/systems/${systemId}/reboot?accountId=${accountId}`),
+
+  shellySwitch: (systemId: string, action: "on" | "off", channel = 0) =>
+    post<{ ok: boolean }>(`/systems/${systemId}/shelly-switch/${action}?channel=${channel}`),
+  listHaSwitchables: (systemId: string, accountId: string) =>
+    get<{ entities: HaEntity[] }>(`/systems/${systemId}/ha-switchables?accountId=${accountId}`),
+  haSwitch: (systemId: string, action: "on" | "off", accountId: string, entityId: string) =>
+    post<{ ok: boolean }>(
+      `/systems/${systemId}/ha-switch/${action}?accountId=${accountId}&entityId=${encodeURIComponent(entityId)}`,
+    ),
 
   listDocs: () => get<{ pages: Omit<DocPage, "bodyMd">[] }>("/docs"),
   getDoc: (slug: string) => get<{ page: DocPage }>(`/docs/${slug}`),

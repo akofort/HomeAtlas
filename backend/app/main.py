@@ -8,7 +8,11 @@ Two cross-cutting rules the routes below implement consistently:
   bulk-returns plaintext, so an over-broad frontend fetch can't leak the credential store.
 * **MEMBER is a real read-only role.** It exists so the household can look things up and use the
   troubleshooting chat without also getting the router password; `require_admin` guards every
-  mutating and every secret-revealing route.
+  mutating and every secret-revealing route -- with one deliberate exception: the chat assistant's
+  `set_switch` tool (see `tools.py`) lets any authenticated role, and any external MCP client, turn
+  a known switch/light on or off. That's a scoped, explicit product decision (see `switch_admin.py`
+  and `tools.py`'s module docstrings), not an oversight -- the direct REST routes below
+  (`/shelly-switch`, `/ha-switch`) stay admin-gated like everything else.
 """
 from __future__ import annotations
 
@@ -26,7 +30,7 @@ from pydantic import BaseModel, Field
 
 from . import (auth, crypto, db, diagnostics, docker_admin, docker_probe, docs, llm_providers,
                mcp_server, model_catalog, monitor as monitor_module, oui, pipeline, probe_auth,
-               proxmox_admin, proxmox_probe, remote_admin, security, topology, tools)
+               proxmox_admin, proxmox_probe, remote_admin, security, switch_admin, topology, tools)
 
 logger = logging.getLogger("homeatlas")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -1114,6 +1118,63 @@ async def reboot_system(system_id: str, accountId: str, request: Request,
 
     ip, agent = _client(request)
     db.log_access("system.reboot", user=user, ip=ip, user_agent=agent, ok=result["ok"], detail=system["name"])
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------------------------
+# Smart-Home-Schalten (Shelly-Relais direkt, Home-Assistant-Entities über deren REST-API) -- see
+# switch_admin.py's module docstring for why this write module, unlike every other one, is also
+# reachable from the chat assistant (tools.py's `set_switch`), not just these UI-triggered routes.
+# ---------------------------------------------------------------------------------------------
+
+@app.post("/api/systems/{system_id}/shelly-switch/{action}")
+async def shelly_switch(system_id: str, action: str, request: Request, channel: int = 0,
+                        user: dict = Depends(require_admin)) -> dict:
+    if action not in ("on", "off"):
+        raise HTTPException(status_code=404, detail="Unbekannte Aktion.")
+    system = db.get_system(system_id)
+    if system is None:
+        raise HTTPException(status_code=404, detail="Gerät nicht gefunden.")
+    host = (system.get("ip") or system.get("hostname") or "").strip()
+    if not host:
+        raise HTTPException(status_code=400, detail="Für dieses Gerät ist keine Adresse hinterlegt.")
+
+    result = await switch_admin.shelly_set_switch(host, action == "on", channel)
+    ip, agent = _client(request)
+    db.log_access("switch.shelly", user=user, ip=ip, user_agent=agent, ok=result["ok"],
+                  detail=f"{system['name']} -> {action}")
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return {"ok": True}
+
+
+@app.get("/api/systems/{system_id}/ha-switchables")
+async def ha_switchables(system_id: str, accountId: str, _: dict = Depends(require_admin)) -> dict:
+    system, account = db.get_system(system_id), db.get_account(accountId)
+    if system is None or account is None or account.get("systemId") != system_id or account.get("category") != "homeassistant":
+        raise HTTPException(status_code=404, detail="Gerät oder Home-Assistant-Zugang nicht gefunden.")
+    result = await probe_auth.list_ha_switchables(account.get("url") or system.get("url") or "", account)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return {"entities": result["entities"]}
+
+
+@app.post("/api/systems/{system_id}/ha-switch/{action}")
+async def ha_switch(system_id: str, action: str, accountId: str, entityId: str, request: Request,
+                    user: dict = Depends(require_admin)) -> dict:
+    if action not in ("on", "off"):
+        raise HTTPException(status_code=404, detail="Unbekannte Aktion.")
+    system, account = db.get_system(system_id), db.get_account(accountId)
+    if system is None or account is None or account.get("systemId") != system_id or account.get("category") != "homeassistant":
+        raise HTTPException(status_code=404, detail="Gerät oder Home-Assistant-Zugang nicht gefunden.")
+
+    token = crypto.decrypt(account.get("secretEnc") or "")
+    result = await switch_admin.ha_set_switch(account.get("url") or system.get("url") or "", token, entityId, action == "on")
+    ip, agent = _client(request)
+    db.log_access("switch.ha", user=user, ip=ip, user_agent=agent, ok=result["ok"],
+                  detail=f"{entityId} -> {action}")
     if not result["ok"]:
         raise HTTPException(status_code=400, detail=result["error"])
     return {"ok": True}

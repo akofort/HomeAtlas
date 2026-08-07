@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
-  api, type Account, type ConfigVersion, type DeviceErrorEvent, type ProbeResult,
+  api, type Account, type ConfigVersion, type DeviceErrorEvent, type HaEntity, type ProbeResult,
   type RemoteContainer, type System,
 } from "../lib/api";
 import { useAuth } from "../App";
@@ -51,6 +51,9 @@ export default function SystemDetailPage() {
   const logsAbortRef = useRef<AbortController | null>(null);
   const [rebootBusy, setRebootBusy] = useState(false);
   const [rebootNotice, setRebootNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
+  const [switchBusy, setSwitchBusy] = useState("");
+  const [switchNotice, setSwitchNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
+  const [haEntities, setHaEntities] = useState<HaEntity[] | null>(null);
 
   useEffect(() => {
     api
@@ -70,6 +73,15 @@ export default function SystemDetailPage() {
       })
       .catch((e) => setError(e.message));
   }, [id]);
+
+  useEffect(() => {
+    const account = accounts.find((a) => !a.viaAssignment && a.category === "homeassistant");
+    if (!isAdmin || !account) {
+      setHaEntities(null);
+      return;
+    }
+    api.listHaSwitchables(id, account.id).then((r) => setHaEntities(r.entities)).catch(() => setHaEntities([]));
+  }, [id, accounts, isAdmin]);
 
   async function showConfigVersion(version: ConfigVersion) {
     if (configPreview?.id === version.id) {
@@ -221,6 +233,34 @@ export default function SystemDetailPage() {
     }
   }
 
+  async function runShellySwitch(action: "on" | "off") {
+    setSwitchBusy(`shelly-${action}`);
+    setSwitchNotice(null);
+    try {
+      await api.shellySwitch(id, action);
+      setSwitchNotice({ kind: "ok", text: `Geschaltet: ${action === "on" ? "ein" : "aus"}.` });
+    } catch (e) {
+      setSwitchNotice({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setSwitchBusy("");
+    }
+  }
+
+  async function runHaSwitch(accountId: string, entityId: string, action: "on" | "off") {
+    setSwitchBusy(`${entityId}-${action}`);
+    setSwitchNotice(null);
+    try {
+      await api.haSwitch(id, action, accountId, entityId);
+      setSwitchNotice({ kind: "ok", text: `${entityId}: ${action === "on" ? "eingeschaltet" : "ausgeschaltet"}.` });
+      const { entities } = await api.listHaSwitchables(id, accountId);
+      setHaEntities(entities);
+    } catch (e) {
+      setSwitchNotice({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setSwitchBusy("");
+    }
+  }
+
   async function generateKeyForThisDevice() {
     setKeyGenBusy(true);
     setKeyGenNotice(null);
@@ -260,6 +300,8 @@ export default function SystemDetailPage() {
   const rebootAccount = looksLikeFritzbox || system.kind === "router"
     ? directAccounts.find((a) => a.category === "login" || a.category === "router")
     : directAccounts.find(sshEligible);
+  const isShelly = [system.vendor, system.model].join(" ").toLowerCase().includes("shelly");
+  const haAccount = directAccounts.find((a) => a.category === "homeassistant");
 
   return (
     <>
@@ -585,6 +627,64 @@ export default function SystemDetailPage() {
               <p className="muted" style={{ marginTop: 12, marginBottom: 0 }}>
                 Steuerung braucht die Container-ID aus einem neueren Scan — bitte einmal erneut scannen.
               </p>
+            )
+          )}
+        </div>
+      )}
+
+      {isAdmin && (isShelly || haAccount) && (
+        <div className="card">
+          <h2>Schalten</h2>
+          {switchNotice && <div className={`notice ${switchNotice.kind}`}>{switchNotice.text}</div>}
+
+          {isShelly && (
+            <div className="row" style={{ marginTop: haAccount ? 0 : 12, marginBottom: haAccount ? 12 : 0 }}>
+              <button className="secondary" disabled={switchBusy !== ""} onClick={() => void runShellySwitch("on")}>
+                {switchBusy === "shelly-on" ? "Schalte ein…" : "Einschalten"}
+              </button>
+              <button className="secondary" disabled={switchBusy !== ""} onClick={() => void runShellySwitch("off")}>
+                {switchBusy === "shelly-off" ? "Schalte aus…" : "Ausschalten"}
+              </button>
+            </div>
+          )}
+
+          {haAccount && (
+            haEntities === null ? (
+              <p className="muted" style={{ marginTop: 12, marginBottom: 0 }}>Lade schaltbare Entities…</p>
+            ) : haEntities.length === 0 ? (
+              <p className="muted" style={{ marginTop: 12, marginBottom: 0 }}>
+                Keine schaltbaren switch/light-Entities in Home Assistant gefunden.
+              </p>
+            ) : (
+              <div className="table-wrap" style={{ marginTop: 12 }}>
+                <table>
+                  <tbody>
+                    {haEntities.map((entity) => (
+                      <tr key={entity.entityId}>
+                        <th>{entity.name}</th>
+                        <td className="mono muted">{entity.entityId}</td>
+                        <td>
+                          <span className={`badge ${entity.state === "on" ? "ok" : ""}`}>
+                            {entity.state === "on" ? "ein" : entity.state === "off" ? "aus" : entity.state}
+                          </span>
+                        </td>
+                        <td>
+                          <div className="row">
+                            <button className="secondary" disabled={switchBusy !== ""}
+                                    onClick={() => void runHaSwitch(haAccount.id, entity.entityId, "on")}>
+                              {switchBusy === `${entity.entityId}-on` ? "…" : "Ein"}
+                            </button>
+                            <button className="secondary" disabled={switchBusy !== ""}
+                                    onClick={() => void runHaSwitch(haAccount.id, entity.entityId, "off")}>
+                              {switchBusy === `${entity.entityId}-off` ? "…" : "Aus"}
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )
           )}
         </div>

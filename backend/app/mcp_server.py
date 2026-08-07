@@ -1,10 +1,14 @@
 """HomeAtlas as an MCP server -- the household's own tool set, reachable by an external LLM client.
 
-This exposes exactly `tools.TOOL_DEFINITIONS`/`tools.dispatch`: the same read-only, no-secrets
-facts and diagnostics the in-app chat assistant already has (see `tools.py`'s own module
-docstring -- list/read the inventory and documentation, run bounded live measurements, never edit
-anything). Nothing here widens that surface; it only adds a second way to reach it, for clients
-like Claude Desktop that speak the Model Context Protocol instead of HomeAtlas's own chat API.
+This exposes exactly `tools.TOOL_DEFINITIONS`/`tools.dispatch`: the same tools the in-app chat
+assistant already has (see `tools.py`'s own module docstring) -- read-only facts/diagnostics, plus
+the one deliberate write exception, `set_switch` (turn a Shelly relay or a Home Assistant switch/
+light entity on or off). Nothing here widens that surface; it only adds a second way to reach it,
+for clients like Claude Desktop that speak the Model Context Protocol instead of HomeAtlas's own
+chat API -- which also means any holder of an admin-issued Bearer token can flip a switch this
+way, same as any household member already can from in-app chat. `apiTokens` carries no role/scope
+column, so there is no narrower gate available here; that is the explicit trade-off the "every
+role, every client" scope decision made (see `main.py`'s module docstring, `tools.py`'s).
 
 Auth is a flat Bearer token (`apiTokens` in db.py), checked by `_BearerAuth` before a request ever
 reaches the MCP session manager. Deliberately not the MCP SDK's own `TokenVerifier`/`AuthSettings`
