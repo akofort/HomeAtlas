@@ -11,14 +11,16 @@ things enforce it:
    There is no setting, no API parameter and no LLM tool that can add to them. Making it
    configurable would turn this into a remote-execution feature with a nice UI, which is
    precisely what it must not be.
-2. **Every command is read-only** and non-interactive: no package manager, no service control, no
-   redirect, no `sudo`, no RouterOS/ArubaOS/IOS *config*-mode command, no `/export show-sensitive`.
-   The one narrow exception is classic ArubaOS-Switch's own `enable` (see
-   `_ARUBA_ENTER_PRIVILEGED_EXEC` below): on that CLI an SSH session always lands in restricted
-   Operator context regardless of the account's own privilege, and Operator context can't run
-   `show running-config` at all -- `enable` there only raises the ceiling on which *read* commands
-   are visible, it does not open configuration mode (`configure terminal` stays just as banned as
-   everywhere else), and nothing after it in the allowlist is anything but another `show`.
+2. **Every command is read-only**, and every *other* platform's set is non-interactive: no package
+   manager, no service control, no redirect, no `sudo`, no RouterOS/ArubaOS/IOS *config*-mode
+   command, no `/export show-sensitive`. The one narrow exception is classic ArubaOS-Switch's own
+   `enable` (see `probe_ssh_aruba`): on that CLI an SSH session always lands in restricted Operator
+   context regardless of the account's own privilege, and Operator context can't run `show running-
+   config` at all -- `enable` there only raises the ceiling on which *read* commands are visible,
+   it does not open configuration mode (`configure terminal` stays just as banned as everywhere
+   else), and nothing after it in the allowlist is anything but another `show`. It is also never
+   given a password to answer a Manager-credential prompt with -- a switch that challenges it for
+   one is left exactly as it was, not retried with a guessed or reused secret.
    Failures are expected and swallowed (`2>/dev/null`) so a missing binary never turns into a
    retry with something more aggressive.
 3. **HTTP is GET-only**, TR-064 uses only `GetInfo`-style SOAP actions -- the `Set*` half of that
@@ -123,45 +125,41 @@ _SSH_COMMANDS_MIKROTIK: tuple[tuple[str, str, str], ...] = (
     ("config_export", "Vollständige Konfiguration", "/export compact"),
 )
 
-# Classic ArubaOS-Switch (ProCurve-derived) CLI enables its own "-- MORE --" pager by default.
-# "no page" turns it off -- unlike TP-Link's "no clipaging" (see _TPLINK_DISABLE_PAGING below),
-# it needs no config-mode detour, but it is still a per-session setting, and each of probe_ssh's
-# commands opens its own fresh, non-interactive exec channel (see the Cisco comment above -- same
-# limitation, same reason). So it still has to be folded into the same command string as the thing
-# it's protecting rather than sent as its own earlier command, which would already be gone by the
-# time the next channel opens. Without this, "show running-config" on a switch with more than one
-# screen of config either hangs until _SSH_TIMEOUT kills the channel, losing the whole backup, or
-# comes back truncated at the first page.
+# Classic ArubaOS-Switch (ProCurve-derived) CLI. Two things make it unable to use the same
+# one-exec-channel-per-command model every other platform in this file uses (see the Cisco
+# comment below for what that model is):
 #
-# An SSH session on this CLI always starts in restricted Operator context ("Switch>"), even for an
-# account whose own credentials carry Manager rights -- unlike Telnet/console, SSH never skips the
-# Operator step. Operator context can only run a handful of basic show commands and does not
-# include "show running-config" (or several of the other facts below) at all, so without "enable"
-# first the config backup silently comes back empty -- not truncated, not an error, just missing --
-# which is easy to mistake for the paging bug above instead of a separate privilege issue. "enable"
-# does not open configuration mode and does not need its own answered password prompt: on the vast
-# majority of home/small-office ArubaOS-Switch setups there is exactly one local password, already
-# supplied at SSH login, and the CLI re-uses that same authenticated identity to grant Manager
-# context without asking again (confirmed against real hardware, not assumed). Where a switch *is*
-# configured with a distinct Operator/Manager password split, "enable" here still won't get a
-# password typed at it -- the next queued line ("no page") is read as the answer, "enable" then
-# fails, and every command in this platform's set simply keeps returning what Operator context
-# already allowed, exactly the same as before this constant existed. Folded into the very same
-# exec string as the pager-disable for the same one-shot-channel reason as everything else here --
-# see module docstring point 2 for why "enable" specifically is allowlisted only on this platform.
-_ARUBA_ENTER_PRIVILEGED_EXEC = "enable\n"
-_ARUBA_DISABLE_PAGING = _ARUBA_ENTER_PRIVILEGED_EXEC + "no page\n"
-
+# 1. Every new session -- exec or shell alike -- opens with a mandatory HPE copyright banner
+#    ending in "Press any key to continue", which the switch will not go past without an actual
+#    keystroke on the channel. `connection.run(command)` hands `command` to the switch as one
+#    opaque exec request rather than paced keystrokes typed at a live prompt, so that keypress
+#    never actually arrives and the switch closes the channel having processed nothing else in
+#    it -- confirmed against real hardware: the banner text itself came back *as* a fact's
+#    captured output, meaning none of the folded commands ran, not just the pager-sensitive one.
+# 2. Even past the banner, an SSH session on this CLI starts in restricted Operator context
+#    ("Switch>"), which can't run "show running-config" (or several of the other facts below) at
+#    all -- "enable" is required first, and on a switch with AAA/RADIUS or a separate Manager
+#    password configured, that "enable" itself prompts for its own Username/Password apart from
+#    the SSH login (confirmed against real hardware) that this module has no business answering:
+#    it isn't given a stored Manager credential to answer with (see module docstring point 2), and
+#    guessing or reusing the SSH login secret as a manager password would mean silently attempting
+#    authentication with a credential the human never authorised for that purpose. So the intended
+#    setup is a dedicated SSH login account that already carries Manager rights: `enable` is only
+#    even attempted (see `probe_ssh_aruba` below) when the session is still at the Operator prompt
+#    after login, without ever supplying a password of its own, and if the switch challenges it for
+#    one anyway, that specific fact is skipped with a clear warning rather than typing anything at
+#    it. "no page" (paging is on by default here) is sent once per session as well, since -- like
+#    "enable" -- it's a per-session setting that doesn't apply to the exec-per-command model either.
 _SSH_COMMANDS_ARUBA: tuple[tuple[str, str, str], ...] = (
-    ("system", "System", _ARUBA_DISABLE_PAGING + "show system-information"),
-    ("vlan", "VLANs", _ARUBA_DISABLE_PAGING + "show vlan"),
-    ("vlan_ports", "VLAN-Port-Zuordnung", _ARUBA_DISABLE_PAGING + "show vlan ports all detail"),
-    ("neighbors", "Nachbargeräte (LLDP)", _ARUBA_DISABLE_PAGING + "show lldp info remote-device"),
-    ("interfaces", "Schnittstellen", _ARUBA_DISABLE_PAGING + "show interfaces brief"),
+    ("system", "System", "show system-information"),
+    ("vlan", "VLANs", "show vlan"),
+    ("vlan_ports", "VLAN-Port-Zuordnung", "show vlan ports all detail"),
+    ("neighbors", "Nachbargeräte (LLDP)", "show lldp info remote-device"),
+    ("interfaces", "Schnittstellen", "show interfaces brief"),
     # Same reasoning as Mikrotik's "ip_addresses" above -- which subnet(s) this device routes for.
-    ("ip_addresses", "IP-Adressen je VLAN", _ARUBA_DISABLE_PAGING + "show ip"),
-    ("arp_table", "ARP-Tabelle", _ARUBA_DISABLE_PAGING + "show arp"),
-    ("config_export", "Vollständige Konfiguration", _ARUBA_DISABLE_PAGING + "show running-config"),
+    ("ip_addresses", "IP-Adressen je VLAN", "show ip"),
+    ("arp_table", "ARP-Tabelle", "show arp"),
+    ("config_export", "Vollständige Konfiguration", "show running-config"),
 )
 
 # ArubaOS-CX (the newer, REST-first line: 6300/6400/8320/8325/8400 and similar) is a different NOS
@@ -225,15 +223,17 @@ _SSH_COMMANDS_TPLINK: tuple[tuple[str, str, str], ...] = (
     ("config_export", "Vollständige Konfiguration", _TPLINK_DISABLE_PAGING + "show running-config"),
 )
 
-# Embedded switch CLIs (ArubaOS-Switch/-CX, Cisco IOS, TP-Link JetStream) commonly only run their
-# vendor command parser -- and, critically, only honour the pager-disable command folded into the
-# same exec payload above -- when the SSH session actually has a pseudo-terminal attached; without
-# one, some vendors' sshd either returns nothing at all for these commands or still paginates
-# "show running-config" despite "no page"/"no clipaging" having been sent, since paging state is
-# itself tied to the (non-existent) tty. RouterOS/Mikrotik is deliberately excluded: it disables
-# paging per-command via its own "without-paging" flag rather than a stateful session command, so
-# it never needed a pty in the first place, and the plain Linux command set doesn't either.
-_PTY_PLATFORMS = {"aruba", "arubacx", "cisco", "tplink"}
+# Embedded switch CLIs (ArubaOS-CX, Cisco IOS, TP-Link JetStream) commonly only run their vendor
+# command parser -- and, critically, only honour the pager-disable command folded into the same
+# exec payload above -- when the SSH session actually has a pseudo-terminal attached; without one,
+# some vendors' sshd either returns nothing at all for these commands or still paginates "show
+# running-config" despite "no page"/"no clipaging" having been sent, since paging state is itself
+# tied to the (non-existent) tty. RouterOS/Mikrotik is deliberately excluded: it disables paging
+# per-command via its own "without-paging" flag rather than a stateful session command, so it never
+# needed a pty in the first place, and the plain Linux command set doesn't either. Classic Aruba
+# ("aruba") is also excluded -- it never goes through this exec-per-command loop at all, see
+# probe_ssh_aruba below, which requests its own pty directly.
+_PTY_PLATFORMS = {"arubacx", "cisco", "tplink"}
 
 # Facts holding a full device config export -- picked up by `extract_config_backups` below and
 # fed into deviceConfigVersions. Kept separate from the general truncation limit (see probe_ssh)
@@ -248,6 +248,24 @@ _CONFIG_BACKUP_KEYS = {"config_export", "omada_backup"}
 # silently doesn't restore.
 _BINARY_BACKUP_KEYS = {"omada_backup"}
 _BINARY_BACKUP_LIMIT = 4_000_000
+
+
+def _bounded_fact(key_name: str, output: str) -> str | None:
+    """Truncates one command's output before it's stored as a fact (or, for a binary backup
+    that's already past saving, drops it entirely) -- shared by probe_ssh's per-platform exec loop
+    and probe_ssh_aruba's interactive session below, so the two never drift on what "too long"
+    means for the same fact keys."""
+    if not output:
+        return None
+    if key_name in _BINARY_BACKUP_KEYS:
+        if len(output) >= _BINARY_BACKUP_LIMIT:
+            return None  # would decode to garbage -- see _BINARY_BACKUP_LIMIT's own comment
+        return output[:_BINARY_BACKUP_LIMIT]
+    if key_name in _CONFIG_BACKUP_KEYS:
+        # A full device config export is the point of collecting it, not a side note -- give it a
+        # much wider bound than the other, single-fact commands.
+        return output[:60000]
+    return output[:1200]
 
 
 def _detect_platform(system: dict) -> str:
@@ -298,6 +316,120 @@ def _decode_secret(account: dict) -> tuple[str, str]:
 # SSH
 # ---------------------------------------------------------------------------------------------
 
+# How long a read may wait for the next chunk before an ArubaOS-Switch command is considered
+# finished -- stands in for a prompt regex, since the real prompt text is hostname-dependent and
+# not known in advance. Kept short: on an interactive pty, output for one command genuinely does
+# go quiet the moment the switch is done and waiting for the next line.
+_ARUBA_IDLE_READ_SECONDS = 0.6
+# Ceiling for the *whole* Aruba session (banner + enable + every command below), not per command --
+# one slow/hanging step can only ever cost what's left of this budget, not the full idle window
+# again for every fact after it.
+_ARUBA_SESSION_TIMEOUT = 45.0
+# A short, single-word line ending in '>' or '#' -- ArubaOS-Switch's Operator/Manager prompts.
+# Hostnames can't contain spaces; 32 characters covers any realistic device name.
+_ARUBA_PROMPT_RE = re.compile(r"^\S{1,32}[>#]\s*$")
+_ARUBA_CREDENTIAL_PROMPT_RE = re.compile(r"(username|password)\s*:?\s*$", re.IGNORECASE)
+
+
+async def _aruba_read_idle(stream, deadline: float) -> str:
+    """Reads whatever the switch sends until output goes quiet for `_ARUBA_IDLE_READ_SECONDS`,
+    bounded by the absolute `deadline` (a `loop.time()` value) for the whole session."""
+    loop = asyncio.get_event_loop()
+    chunks: list[str] = []
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        try:
+            chunk = await asyncio.wait_for(stream.read(65536), timeout=min(_ARUBA_IDLE_READ_SECONDS, remaining))
+        except asyncio.TimeoutError:
+            break
+        if not chunk:  # remote closed the stream
+            break
+        chunks.append(chunk)
+    return "".join(chunks)
+
+
+def _aruba_last_line(text: str) -> str:
+    lines = [line.strip() for line in text.replace("\r", "").split("\n") if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def _strip_aruba_echo_and_prompt(raw: str, sent_command: str) -> str:
+    """A pty session echoes back whatever was typed, and the switch's own prompt reappears once a
+    command finishes -- neither belongs in the stored fact. Only strips a leading line that's an
+    exact echo of what we sent and a trailing prompt-shaped line, so anything the switch itself
+    prints is left alone even if it doesn't match either shape."""
+    lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if lines and lines[0].strip() == sent_command.strip():
+        lines = lines[1:]
+    while lines and _ARUBA_PROMPT_RE.match(lines[-1].strip()):
+        lines.pop()
+    return "\n".join(lines).strip()
+
+
+async def probe_ssh_aruba(connection, warnings: list[str]) -> dict[str, dict]:
+    """Runs `_SSH_COMMANDS_ARUBA` over one persistent interactive shell instead of the one-exec-
+    channel-per-command model `probe_ssh` uses for every other platform -- see that constant's own
+    comment for why classic ArubaOS-Switch needs this. Never raises: any failure here just means
+    fewer (or no) facts, exactly like a failed command does in the generic loop."""
+    facts: dict[str, dict] = {}
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + _ARUBA_SESSION_TIMEOUT
+    try:
+        process = await connection.create_process(term_type="vt100")
+    except Exception as exc:  # noqa: BLE001 -- channel setup failing must not abort the whole probe
+        warnings.append(f"Interaktive Sitzung ließ sich nicht öffnen: {exc}")
+        return facts
+
+    async with process:
+        try:
+            # Dismiss the mandatory copyright banner's "Press any key to continue" -- any byte
+            # does, so a bare newline is enough.
+            await _aruba_read_idle(process.stdout, deadline)
+            process.stdin.write("\n")
+            await process.stdin.drain()
+            greeting = await _aruba_read_idle(process.stdout, deadline)
+
+            if _aruba_last_line(greeting).endswith(">"):
+                # Still at the Operator prompt -- try "enable" once, but never answer a credential
+                # prompt with anything: this module is never handed a Manager password to answer
+                # with (see module docstring point 2 and _SSH_COMMANDS_ARUBA's own comment), so a
+                # switch that challenges "enable" for one is left exactly as it was, with a clear
+                # reason logged instead of a silently empty config backup.
+                process.stdin.write("enable\n")
+                await process.stdin.drain()
+                reply = await _aruba_read_idle(process.stdout, deadline)
+                if _ARUBA_CREDENTIAL_PROMPT_RE.search(_aruba_last_line(reply)):
+                    warnings.append(
+                        "„enable“ verlangt eigene Manager-Zugangsdaten, die dieser Zugang nicht "
+                        "mitbringt -- auf diesem Switch reicht der hinterlegte Zugang allein nicht "
+                        "für „show running-config“ & Co. Ein SSH-Zugang, der schon mit Manager-"
+                        "Rechten anmeldet, löst das ohne „enable“."
+                    )
+                    return facts
+
+            process.stdin.write("no page\n")
+            await process.stdin.drain()
+            await _aruba_read_idle(process.stdout, deadline)
+
+            for key_name, label, command in _SSH_COMMANDS_ARUBA:
+                if loop.time() >= deadline:
+                    warnings.append(f"„{label}“ wurde wegen Zeitüberschreitung der Sitzung übersprungen.")
+                    continue
+                process.stdin.write(command + "\n")
+                await process.stdin.drain()
+                raw = await _aruba_read_idle(process.stdout, deadline)
+                output = _strip_aruba_echo_and_prompt(raw, command)
+                bounded = _bounded_fact(key_name, output)
+                if bounded is not None:
+                    facts[key_name] = {"label": label, "value": bounded}
+        except Exception as exc:  # noqa: BLE001 -- a broken session must still return what we have
+            warnings.append(f"Interaktive Sitzung abgebrochen: {exc}")
+
+    return facts
+
+
 async def probe_ssh(host: str, account: dict, platform: str = "") -> dict:
     """Runs the fixed read-only command set over SSH. Returns {"ok", "facts", "error"}.
 
@@ -335,7 +467,7 @@ async def probe_ssh(host: str, account: dict, platform: str = "") -> dict:
         return {"ok": False, "error": f"Der hinterlegte SSH-Schlüssel ließ sich nicht lesen: {exc}", "facts": {}}
 
     commands = {
-        "mikrotik": _SSH_COMMANDS_MIKROTIK, "aruba": _SSH_COMMANDS_ARUBA,
+        "mikrotik": _SSH_COMMANDS_MIKROTIK,
         "arubacx": _SSH_COMMANDS_ARUBA_CX, "cisco": _SSH_COMMANDS_CISCO,
         "tplink": _SSH_COMMANDS_TPLINK,
     }.get(platform, _SSH_COMMANDS)
@@ -351,33 +483,28 @@ async def probe_ssh(host: str, account: dict, platform: str = "") -> dict:
     warnings: list[str] = []
     try:
         async with asyncssh.connect(**connect_args) as connection:
-            for key_name, label, command in commands:
-                try:
-                    result = await asyncio.wait_for(
-                        connection.run(command, check=False, term_type=term_type), timeout=_SSH_TIMEOUT
-                    )
-                except asyncio.TimeoutError:
-                    warnings.append(
-                        f"„{label}“ hat innerhalb von {_SSH_TIMEOUT:.0f} Sekunden nicht geantwortet "
-                        "(SSH-Prompt hängt vermutlich an einer Pager- oder Bestätigungsabfrage)."
-                    )
-                    continue
-                except Exception:  # noqa: BLE001 -- one command failing (missing binary, no
-                    # permission) must not abort the probe; the rest is still worth having.
-                    continue
-                output = (result.stdout or "").strip()
-                if output:
-                    if key_name in _BINARY_BACKUP_KEYS:
-                        if len(output) >= _BINARY_BACKUP_LIMIT:
-                            continue  # would decode to garbage -- see _BINARY_BACKUP_LIMIT's docstring
-                        limit = _BINARY_BACKUP_LIMIT
-                    elif key_name in _CONFIG_BACKUP_KEYS:
-                        # A full device config export is the point of collecting it, not a side
-                        # note -- give it a much wider bound than the other, single-fact commands.
-                        limit = 60000
-                    else:
-                        limit = 1200
-                    facts[key_name] = {"label": label, "value": output[:limit]}
+            # Classic ArubaOS-Switch never goes through the exec-per-command loop below at all --
+            # see _SSH_COMMANDS_ARUBA's own comment for why it needs its own interactive session.
+            if platform == "aruba":
+                facts = await probe_ssh_aruba(connection, warnings)
+            else:
+                for key_name, label, command in commands:
+                    try:
+                        result = await asyncio.wait_for(
+                            connection.run(command, check=False, term_type=term_type), timeout=_SSH_TIMEOUT
+                        )
+                    except asyncio.TimeoutError:
+                        warnings.append(
+                            f"„{label}“ hat innerhalb von {_SSH_TIMEOUT:.0f} Sekunden nicht geantwortet "
+                            "(SSH-Prompt hängt vermutlich an einer Pager- oder Bestätigungsabfrage)."
+                        )
+                        continue
+                    except Exception:  # noqa: BLE001 -- one command failing (missing binary, no
+                        # permission) must not abort the probe; the rest is still worth having.
+                        continue
+                    bounded = _bounded_fact(key_name, (result.stdout or "").strip())
+                    if bounded is not None:
+                        facts[key_name] = {"label": label, "value": bounded}
     except Exception as exc:  # noqa: BLE001 -- asyncssh raises a wide family of connection errors
         return {"ok": False, "error": f"SSH-Verbindung zu {host}:{port} fehlgeschlagen: {exc}", "facts": {}}
 
